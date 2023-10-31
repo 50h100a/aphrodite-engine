@@ -330,7 +330,6 @@ class Worker:
         for grp in seq_group_metadata_list:
             persistent_data.update(grp.persistent_data)
 
-
         input_metadata = InputMetadata(
             seq_groups=seq_groups,
             seq_data=seq_data,

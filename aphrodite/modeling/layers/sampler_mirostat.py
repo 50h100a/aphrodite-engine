@@ -4,6 +4,7 @@ from torch import Tensor
 
 from aphrodite.modeling.metadata import OutputMetadata, InputMetadata
 
+
 def _fetch_args(
     input_metadata: InputMetadata
 ) -> tuple[list[int], list[int], list[float], list[float], list[float]]:

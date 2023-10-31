@@ -85,10 +85,11 @@ class Sampler(nn.Module):
         banned_tokens = _get_custom_token_bans(input_metadata)
         assert len(banned_tokens) == logits.shape[0]
         logits = _apply_token_bans(logits, banned_tokens)
-        
+
         # push_logit_hist("rep_pen", logits_at, logits)
 
-        logits = _apply_logits_processors(input_metadata, output_metadata, logits, output_tokens)
+        logits = _apply_logits_processors(input_metadata, logits,
+                                          output_tokens)
 
         # Apply Mirostat
         # Note that we apply mirostat before temperature, not after like it maybe should be
@@ -96,7 +97,6 @@ class Sampler(nn.Module):
         if sampler_mirostat.is_applicable(input_metadata):
             sampler_mirostat.apply(logits, input_metadata, output_metadata)
 
-        
         # Apply Eta sampling, as described in https://arxiv.org/abs/2210.15191
         eta_cutoffs = _get_eta_cutoffs(input_metadata)
         assert len(eta_cutoffs) == logits.shape[0]
@@ -161,7 +161,8 @@ class Sampler(nn.Module):
         prompt_logprobs, sample_logprobs = _get_logprobs(
             logprobs, input_metadata, sample_results)
         return _build_sampler_output(sample_results, input_metadata,
-                                     prompt_logprobs, sample_logprobs)
+                                     prompt_logprobs, sample_logprobs,
+                                     output_metadata)
 
 
 def _get_logits(hidden_states: torch.Tensor, embedding: torch.Tensor,
