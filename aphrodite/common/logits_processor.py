@@ -69,6 +69,45 @@ class BanTokens(LogitsProcessor):
         logits[:, self._banned_token_ids] = -float("inf")
 
 
+class DynamicTemperature(LogitsProcessor):
+    def __init__(self, tmin:float, tmax:float):
+        self._tmin = tmin
+        self._tvar = tmax - tmin
+
+    def __call__(self, logits: torch.Tensor, output_tokens: list[list[int]]) -> None:
+        probs = logits.softmax(dim=-1)
+        entropy = (probs * probs.clamp(min=1e-7).log()).sum(dim=-1).neg_() # why the hell are there NaNs?
+        norm_term = torch.count_nonzero(probs, dim=-1).float().log()
+        norm_entropy = entropy / norm_term
+        dyn_temps = self._tmin + self._tvar * norm_entropy
+        
+        # print(f"Geh.\n{entropy.tolist()}\n{norm_term.tolist()}\n{norm_entropy.tolist()}\n{dyn_temps.tolist()}")
+        logits /= dyn_temps.clamp(min=1e-2) # multinomials are containing inf, NaN, or negative later on. What the hell?
+
+
+class TopPolynomial(LogitsProcessor):  # Can be min_p, linear_a, or top_a depending on exponent provided
+    def __init__(self, p:float, exp:float):
+        self._p = p
+        self._exp = exp
+
+    def __call__(self, logits: torch.Tensor, output_tokens: list[list[int]]) -> None:
+        logits_sort, logits_idx = logits.sort(dim=-1, descending=True)
+        
+        probs_sort = logits_sort.softmax(dim=-1)
+        top_thresholds = torch.pow(probs_sort[:, 0], self._exp) * self._p
+        top_mask = (probs_sort < top_thresholds.unsqueeze(1))  # Cull logits below the top-a threshold
+        top_mask[:, 0] = False  # Guarantee at least one token is pickable
+        logits_sort[top_mask] = -float("inf")
+
+        # Put the masked logits back where they came from
+        torch.gather(logits_sort, dim=-1,
+                     index=torch.argsort(logits_idx, dim=-1),
+                     out=logits)
+
+
+
+
+
 class NGramPenaltyProcessor(LogitsProcessor):
     """Use ngrams to apply repetition penalties to token sequences."""
     def __init__(self, penalty:float, prompt:list[int],
