@@ -135,14 +135,14 @@ class Sampler(nn.Module):
         # push_logit_hist("temps", logits_at, logits)
 
         # Apply top-p, top-k, and top-a truncation.
-        top_ps, top_ks, top_as = _get_top_a_top_p_top_k(
+        top_as, top_ps, top_ks = _get_top_a_top_p_top_k(
             input_metadata, self.vocab_size)
         assert len(top_ps) == len(top_ks) == logits.shape[0]
         do_top_p = any(p < 1.0 - _SAMPLING_EPS for p in top_ps)
         do_top_k = any(k != self.vocab_size for k in top_ks)
         do_top_a = any(a > _SAMPLING_EPS for a in top_as)
         if do_top_p or do_top_k or do_top_a:
-            logits = _apply_top_a_top_p_top_k(logits, top_ps, top_ks, top_as)
+            logits = _apply_top_a_top_p_top_k(logits, top_as, top_ps, top_ks)
 
         # push_logit_hist("top_x", logits_at, logits)
 
@@ -353,7 +353,7 @@ def _get_temperatures(input_metadata: InputMetadata) -> List[float]:
     return temperatures
 
 
-def _get_top_p_top_k_top_a(
+def _get_top_a_top_p_top_k(
     input_metadata: InputMetadata,
     vocab_size: int,
 ) -> Tuple[List[float], List[int], List[float]]:
@@ -376,7 +376,7 @@ def _get_top_p_top_k_top_a(
         top_ks += [top_k] * len(seq_ids)
         top_as += [sampling_params.top_a] * len(seq_ids)
 
-    return top_ps, top_ks, top_as
+    return top_as, top_ps, top_ks
 
 
 def _get_tfs(input_metadata: InputMetadata) -> List[float]:
@@ -433,13 +433,13 @@ def _get_typical_ps(input_metadata: InputMetadata) -> List[float]:
 
 def _apply_top_a_top_p_top_k(
     logits: torch.Tensor,
-    top_ps: List[float],
-    top_ks: List[int],
     top_as: List[float],
+    top_ps: List[int],
+    top_ks: List[float],
 ) -> torch.Tensor:
+    ts_a = torch.tensor(top_as, dtype=logits.dtype, device=logits.device)
     ts_p = torch.tensor(top_ps, dtype=logits.dtype, device=logits.device)
     ts_k = torch.tensor(top_ks, dtype=torch.int, device=logits.device)
-    ts_a = torch.tensor(top_as, dtype=logits.dtype, device=logits.device)
     logits_sort, logits_idx = logits.sort(dim=-1, descending=True)
 
     # Apply top-p and top-a.
