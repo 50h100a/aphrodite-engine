@@ -110,30 +110,33 @@ class TopPolynomial(LogitsProcessor):  # Can be min_p, linear_a, or top_a depend
 
 class NGramPenaltyProcessor(LogitsProcessor):
     """Use ngrams to apply repetition penalties to token sequences."""
-    def __init__(self, penalty:float, prompt:list[int],
+    def __init__(self, pres_pen:float, freq_pen:float,prompt:list[int],
                  immune_sequences:list[list[int]] = [],
                  n_min:int=2, n_max:int=4, tokenizer=None):
-        self._penalty = penalty
+        self._pres_pen = pres_pen
+        self._freq_pen = freq_pen
         self._n_min = n_min
         self._n_max = n_max
         self._tail = prompt[-n_max:]
 
         # What if, instead, I use word ngrams? That seems slightly insane.
         
-        prompt_mask = [True] * len(prompt)  # If False, token is part of an ignored sequence, and should not be included in any penalties?
+        can_penalize = [True] * len(prompt)  # If False, token is part of an ignored sequence, and should not be penalized.
         for seq in immune_sequences:
-            sidx = 0
-            i = 0
-            while i < len(prompt):
-                if seq[sidx] == prompt[i]:
-                    sidx += 1
-                    if sidx == len(seq):
-                        prompt_mask[i-len(seq):i] = False
-                        i -= len(seq)  # Rewind so we can catch self-overlapping sequences.
-                        sidx = 0
+            iseq = 0
+            iprompt = 0
+            while iprompt < len(prompt):
+                if seq[iseq] == prompt[iprompt]:
+                    iseq += 1
+                    if iseq == len(seq):
+                        can_penalize[iprompt-len(seq)+1:iprompt+1] = [False] * len(seq)
+                        iprompt -= len(seq)-1  # Rewind so we can catch self-overlapping sequences.
+                        # print(f"Found {repr(seq)} at {iprompt}, rewinding {len(seq)} ")
+                        iseq = 0
                 else:
-                    sidx = 0
-                i += 1
+                    iseq = 0
+                iprompt += 1
+        # print(f"Masked out {len(can_penalize) - sum(can_penalize)} tokens")
 
         # I'm not sure that's what we want. We DO want penalties for starting every reply the exact same way.
         # What we DON'T want is penalties on the instruct sequence _itself_.
@@ -146,12 +149,13 @@ class NGramPenaltyProcessor(LogitsProcessor):
         for ng in range(n_min,n_max):
             for i in range(ng, len(prompt)):
                 geh = tuple(prompt[i-ng:i])
-                if prompt_mask[i]:
+                if can_penalize[i]:
                     penalties[geh].update([prompt[i]])
                     top.update([tuple(prompt[i-ng:i+1])])
+
         # print(f"created {len(penalties)} ngrams jfc, {top.total()} instances")
-        # print(f"Immunes:", immune_sequences)
-        # print('\n'.join([f"{tokenizer.convert_ids_to_tokens(x[0])}: {x[1]} ({self._penalty ** (x[1] / (self._n_max - self._n_min)):.02f})" for x in top.most_common()[:10]]))
+        # print(f"Immunes (tok):", [tokenizer.convert_ids_to_tokens(x) for x in immune_sequences])
+        # print('\n'.join([f"{tokenizer.convert_ids_to_tokens(x[0])}: {x[1]} ({self._pres_pen + self._freq_pen * (x[1] / (self._n_max - self._n_min)):.02f})" for x in top.most_common()[:10]]))
         self._penalties = dict(penalties)
 
     def __call__(self, logits: torch.Tensor, output_tokens: list[list[int]]) -> None:
@@ -161,8 +165,9 @@ class NGramPenaltyProcessor(LogitsProcessor):
                 key = tuple(tail[-n:])
                 if key in self._penalties:
                     for tok,pen in self._penalties[key].items():
-                        pval = self._penalty ** (pen / (self._n_max - self._n_min))
-                        logits[i,tok] /= pval if logits[i,tok] > 0 else 1/pval
+                        # pval = self._penalty ** (pen / (self._n_max - self._n_min))
+                        # logits[i,tok] /= pval if logits[i,tok] > 0 else 1/pval
+                        logits[i,tok] -= self._pres_pen + self._freq_pen * (pen / (self._n_max - self._n_min))
 
 
 
