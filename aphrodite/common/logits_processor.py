@@ -149,14 +149,13 @@ class NGramPenaltyProcessor(LogitsProcessor):
                 if prompt_mask[i]:
                     penalties[geh].update([prompt[i]])
                     top.update([tuple(prompt[i-ng:i+1])])
-        print(f"created {len(penalties)} ngrams jfc, {top.total()} instances")
-        print(f"Immunes:", immune_sequences)
-        print('\n'.join([f"{tokenizer.convert_ids_to_tokens(x[0])}: {x[1]} ({self._penalty ** (x[1] / (self._n_max - self._n_min)):.02f})" for x in top.most_common()[:10]]))
+        # print(f"created {len(penalties)} ngrams jfc, {top.total()} instances")
+        # print(f"Immunes:", immune_sequences)
+        # print('\n'.join([f"{tokenizer.convert_ids_to_tokens(x[0])}: {x[1]} ({self._penalty ** (x[1] / (self._n_max - self._n_min)):.02f})" for x in top.most_common()[:10]]))
         self._penalties = dict(penalties)
 
     def __call__(self, logits: torch.Tensor, output_tokens: list[list[int]]) -> None:
         for i,outputs in enumerate(output_tokens):
-            # print("b4", logits.sort(dim=1, descending=True)[0][0,:10].tolist())
             tail = (self._tail + outputs)[-self._n_max:]
             for n in range(self._n_min, self._n_max):
                 key = tuple(tail[-n:])
@@ -164,8 +163,6 @@ class NGramPenaltyProcessor(LogitsProcessor):
                     for tok,pen in self._penalties[key].items():
                         pval = self._penalty ** (pen / (self._n_max - self._n_min))
                         logits[i,tok] /= pval if logits[i,tok] > 0 else 1/pval
-            # print("AF", logits.sort(dim=1, descending=True)[0][0,:10].tolist())
-        # logits[:, self._banned_token_ids] = -float("inf")
 
 
 
