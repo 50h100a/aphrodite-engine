@@ -10,7 +10,7 @@ from typing import AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import fastapi
 import uvicorn
-from fastapi import Request
+from fastapi import Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -30,7 +30,6 @@ from aphrodite.common.outputs import RequestOutput
 from aphrodite.common.sampling_params import SamplingParams
 from aphrodite.transformers_utils.tokenizer import get_tokenizer
 from aphrodite.common.utils import random_uuid
-from aphrodite.common.logits import BiasLogitsProcessor
 
 try:
     import fastchat
@@ -146,6 +145,12 @@ async def check_length(
         return input_ids, None
 
 
+@app.get("/health")
+async def health() -> Response:
+    """Health check route for K8s"""
+    return Response(status_code=200)
+
+
 @app.get("/v1/models")
 async def show_available_models():
     """Show available models. Right now we only have one model."""
@@ -198,14 +203,6 @@ async def create_chat_completion(request: ChatCompletionRequest,
     if error_check_ret is not None:
         return error_check_ret
 
-    if not request.logit_bias:
-        logit_processors = []
-    else:
-        biases = dict(
-            map(lambda bias: (int(bias[0]), bias[1]),
-                request.logit_bias.items()))
-        logit_processors = [BiasLogitsProcessor(biases)]
-
     prompt = await get_gen_prompt(request)
     token_ids, error_check_ret = await check_length(request, prompt=prompt)
     if error_check_ret is not None:
@@ -219,8 +216,11 @@ async def create_chat_completion(request: ChatCompletionRequest,
             n=request.n,
             presence_penalty=request.presence_penalty,
             frequency_penalty=request.frequency_penalty,
+            repetition_penalty=request.repetition_penalty,
             temperature=request.temperature,
             top_p=request.top_p,
+            top_k=request.top_k,
+            top_a=request.top_a,
             tfs=request.tfs,
             eta_cutoff=request.eta_cutoff,
             epsilon_cutoff=request.epsilon_cutoff,
@@ -229,11 +229,14 @@ async def create_chat_completion(request: ChatCompletionRequest,
             stop_token_ids=request.stop_token_ids,
             max_tokens=request.max_tokens,
             best_of=request.best_of,
-            top_k=request.top_k,
             ignore_eos=request.ignore_eos,
             use_beam_search=request.use_beam_search,
             skip_special_tokens=request.skip_special_tokens,
-            logits_processors=logit_processors,
+            spaces_between_special_tokens=request.
+            spaces_between_special_tokens,  # pylint: disable=line-too-long
+            custom_token_bans=request.custom_token_bans,
+            logprobs=request.logprobs,
+            prompt_logprobs=request.prompt_logprobs,
         )
     except ValueError as e:
         return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
@@ -383,14 +386,6 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         return create_error_response(HTTPStatus.BAD_REQUEST,
                                      "suffix is not currently supported")
 
-    if not request.logit_bias:
-        logit_processors = []
-    else:
-        logit_bias = dict(
-            map(lambda logit: (int(logit[0]), logit[1]),
-                request.logit_bias.items()))
-        logit_processors = [BiasLogitsProcessor(logit_bias)]
-
     model_name = request.model
     request_id = f"cmpl-{random_uuid()}"
 
@@ -425,21 +420,29 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     try:
         sampling_params = SamplingParams(
             n=request.n,
-            best_of=request.best_of,
             presence_penalty=request.presence_penalty,
             frequency_penalty=request.frequency_penalty,
+            repetition_penalty=request.repetition_penalty,
             temperature=request.temperature,
             top_p=request.top_p,
-            tfs=request.tfs,
             top_k=request.top_k,
+            top_a=request.top_a,
+            tfs=request.tfs,
+            eta_cutoff=request.eta_cutoff,
+            epsilon_cutoff=request.epsilon_cutoff,
+            typical_p=request.typical_p,
             stop=request.stop,
             stop_token_ids=request.stop_token_ids,
-            ignore_eos=request.ignore_eos,
             max_tokens=request.max_tokens,
-            logprobs=request.logprobs,
+            best_of=request.best_of,
+            ignore_eos=request.ignore_eos,
             use_beam_search=request.use_beam_search,
             skip_special_tokens=request.skip_special_tokens,
-            logits_processors=logit_processors,
+            spaces_between_special_tokens=request.
+            spaces_between_special_tokens,  # pylint: disable=line-too-long
+            custom_token_bans=request.custom_token_bans,
+            logprobs=request.logprobs,
+            prompt_logprobs=request.prompt_logprobs,
         )
     except ValueError as e:
         return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
@@ -617,7 +620,7 @@ if __name__ == "__main__":
         allow_headers=args.allowed_headers,
     )
 
-    logger.info(f"args: {args}")
+    logger.debug(f"args: {args}")
 
     if args.served_model_name is not None:
         served_model = args.served_model_name

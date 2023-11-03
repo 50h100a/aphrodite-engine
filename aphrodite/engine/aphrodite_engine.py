@@ -71,18 +71,19 @@ class AphroditeEngine:
         log_stats: bool,
     ) -> None:
         logger.info(
-            "Initializing an LLM engine with config: "
-            f"model={model_config.model!r}, "
-            f"tokenizer={model_config.tokenizer!r}, "
-            f"tokenizer_mode={model_config.tokenizer_mode}, "
-            f"revision={model_config.revision}, "
-            f"trust_remote_code={model_config.trust_remote_code}, "
-            f"dtype={model_config.dtype}, "
-            f"download_dir={model_config.download_dir!r}, "
-            f"load_format={model_config.load_format}, "
-            f"tensor_parallel_size={parallel_config.tensor_parallel_size}, "
-            f"quantization={model_config.quantization}, "
-            f"seed={model_config.seed})")
+            "Initializing the Aphrodite Engine with the following config:\n"
+            f"Model = {model_config.model!r}\n"
+            f"Tokenizer = {model_config.tokenizer!r}\n"
+            f"tokenizer_mode = {model_config.tokenizer_mode}\n"
+            f"revision = {model_config.revision}\n"
+            f"trust_remote_code = {model_config.trust_remote_code}\n"
+            f"DataType = {model_config.dtype}\n"
+            f"Download Directory = {model_config.download_dir!r}\n"
+            f"Model Load Format = {model_config.load_format}\n"
+            f"Number of GPUs = {parallel_config.tensor_parallel_size}\n"
+            f"Quantization Format = {model_config.quantization}\n"
+            f"Sampler Seed = {model_config.seed}\n"
+            f"Context Length = {model_config.max_model_len}")
         # TODO: Print more configs in debug mode.
 
         self.model_config = model_config
@@ -631,8 +632,7 @@ class AphroditeEngine:
                     f"CPU KV cache usage: {cpu_cache_usage * 100:.1f}%")
         self.last_logging_time = now
 
-    def _decode_sequence(self, seq: Sequence,
-                         sampling_params: SamplingParams) -> None:
+    def _decode_sequence(self, seq: Sequence, prms: SamplingParams) -> None:
         """Decodes the new token for a sequence."""
         (new_tokens, new_output_text, prefix_offset,
          read_offset) = detokenize_incrementally(
@@ -641,8 +641,8 @@ class AphroditeEngine:
              prev_tokens=seq.tokens,
              prefix_offset=seq.prefix_offset,
              read_offset=seq.read_offset,
-             skip_special_tokens=sampling_params.skip_special_tokens,
-         )
+             skip_special_tokens=prms.skip_special_tokens,
+             spaces_between_special_tokens=prms.spaces_between_special_tokens)
         if seq.tokens is None:
             seq.tokens = new_tokens
         else:

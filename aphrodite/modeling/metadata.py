@@ -7,15 +7,17 @@ from aphrodite.common.sequence import SequenceData
 
 
 class PersistentMetadata:
-    def __init__(self):
-        self._metadata:dict[int,dict] = {}
 
-    def get(self, seq_id:int) -> dict:
+    def __init__(self):
+        self._metadata: dict[int, dict] = {}
+
+    def get(self, seq_id: int) -> dict:
         return self._metadata.get(seq_id, {})
 
 
 class OutputMetadata(PersistentMetadata):
-    def add(self, seq_id:int, key, val) -> None:
+
+    def add(self, seq_id: int, key, val) -> None:
         if seq_id not in self._metadata:
             self._metadata[seq_id] = {}
         self._metadata[seq_id][key] = val
@@ -95,7 +97,8 @@ class InputMetadata:
                 f'prompt_lens={self.prompt_lens}, '
                 f'num_generation_tokens={self.num_generation_tokens}, '
                 f'context_lens={self.context_lens}, '
-                f'max_context_len={self.max_context_len}), '
+                f'max_context_len={self.max_context_len}, '
                 f'max_num_blocks_per_seq={self.max_num_blocks_per_seq}, '
-                f'block_tables={self.block_tables}), '
-                f'slot_mapping={self.slot_mapping}')
+                f'block_tables={self.block_tables}, '
+                f'slot_mapping={self.slot_mapping}, '
+                f'persistent_data={self.persistent_data})')

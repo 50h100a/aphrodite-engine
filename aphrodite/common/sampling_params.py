@@ -64,8 +64,10 @@ class SamplingParams:
             closest in surprise to the expected surprise to consider.
             Must be in (0, 1]. Set to 1 to disable.
         mirostat_mode: Can either be 0 (disabled) or 2 (Mirostat v2).
-        mirostat_tau: Target "surprisal" that mirostat works towards. Range [0, inf).
-        mirostat_eta: Rate at which mirostat updates its internal surprisal value. Range [0, inf).
+        mirostat_tau: Target "surprisal" that mirostat works towards.
+            Range [0, inf).
+        mirostat_eta: Rate at which mirostat updates its internal surprisal
+            value. Range [0, inf).
         use_beam_search: Whether to use beam search instead of sampling.
         length_penalty: Float that penalizes sequences based on their length.
             Used in beam search.
@@ -94,6 +96,8 @@ class SamplingParams:
         custom_token_bans: List of token IDs to ban from generating
         skip_special_tokens: Whether to skip special tokens in the output.
             defaults to true.
+        spaces_between_special_tokens: Whether to add spaces between special
+            tokens in the output. Defaults to True.
         logits_processors: List of LogitsProcessors to change the probability
             of token prediction at runtime.
     """
@@ -128,6 +132,7 @@ class SamplingParams:
         prompt_logprobs: Optional[int] = None,
         custom_token_bans: Optional[List[int]] = None,
         skip_special_tokens: bool = True,
+        spaces_between_special_tokens: bool = True,
         logits_processors: List[LogitsProcessor] = None,
     ) -> None:
         self.n = n
@@ -166,6 +171,7 @@ class SamplingParams:
         self.prompt_logprobs = prompt_logprobs
         self.custom_token_bans = custom_token_bans or []
         self.skip_special_tokens = skip_special_tokens
+        self.spaces_between_special_tokens = spaces_between_special_tokens
         self.logits_processors = logits_processors or []
 
         self._verify_args()
@@ -215,13 +221,14 @@ class SamplingParams:
             raise ValueError(
                 f"typical_p must be in (0, 1], got {self.typical_p}.")
         if self.mirostat_mode:
-            if not (self.mirostat_mode == 2):
+            if not self.mirostat_mode == 2:
                 raise ValueError(
-                    f"Only Mirostat v2 (2) and disabled (0) supported, got {self.mirostat_mode}")
-            if not (self.mirostat_eta >= 0):
+                    "Only Mirostat v2 (2) and disabled (0) supported, "
+                    f"got {self.mirostat_mode}")
+            if not self.mirostat_eta >= 0:
                 raise ValueError(
                     f"mirostat_eta must be positive, got {self.mirostat_eta}")
-            if not (self.mirostat_tau >= 0):
+            if not self.mirostat_tau >= 0:
                 raise ValueError(
                     f"mirostat_tau must be positive, got {self.mirostat_tau}")
         if self.max_tokens < 1:
@@ -290,6 +297,9 @@ class SamplingParams:
                 f"eta_cutoff={self.eta_cutoff}, "
                 f"epsilon_cutoff={self.epsilon_cutoff}, "
                 f"typical_p={self.typical_p}, "
+                f"mirostat_mode={self.mirostat_mode}, "
+                f"mirostat_tau={self.mirostat_tau}, "
+                f"mirostat_eta={self.mirostat_eta}, "
                 f"use_beam_search={self.use_beam_search}, "
                 f"length_penalty={self.length_penalty}, "
                 f"early_stopping={self.early_stopping}, "
@@ -299,4 +309,6 @@ class SamplingParams:
                 f"custom_token_bans={self.custom_token_bans}, "
                 f"logprobs={self.logprobs}, "
                 f"prompt_logprobs={self.prompt_logprobs}, "
-                f"skip_special_tokens={self.skip_special_tokens})")
+                f"skip_special_tokens={self.skip_special_tokens}, "
+                f"spaces_between_special_tokens="
+                f"{self.spaces_between_special_tokens})")
