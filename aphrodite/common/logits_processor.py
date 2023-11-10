@@ -80,6 +80,7 @@ class DynamicTemperature(LogitsProcessor):
         norm_term = torch.count_nonzero(probs, dim=-1).float().log()
         norm_entropy = entropy / norm_term
         dyn_temps = self._tmin + self._tvar * norm_entropy
+        dyn_temps[dyn_temps.isnan()] = 1.0
         
         # print(f"Geh.\n{entropy.tolist()}\n{norm_term.tolist()}\n{norm_entropy.tolist()}\n{dyn_temps.tolist()}")
         logits /= dyn_temps.clamp(min=1e-2) # multinomials are containing inf, NaN, or negative later on. What the hell?
