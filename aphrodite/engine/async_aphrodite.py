@@ -226,6 +226,26 @@ class _AsyncAphrodite(AphroditeEngine):
         for other_output in all_outputs[1:]:
             assert output == other_output
         return output
+    
+    async def _run_worker_async(
+        self,
+        worker_index: int,
+        function,
+        *args,
+        **kwargs,
+    ) -> Any:
+        """Runs the given function on specified worker."""
+        all_outputs = []
+        self.workers[worker_index]
+
+        if self.parallel_config.worker_use_ray:
+            function = partial(self.workers[worker_index].execute_function.remote, function)
+
+        output = function(*args, **kwargs)
+        if self.parallel_config.worker_use_ray:
+            output = await asyncio.gather(output)
+
+        return output
 
 
 class AsyncAphrodite:

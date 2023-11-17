@@ -31,6 +31,10 @@ try:
         def execute_method(self, method, *args, **kwargs):
             executor = getattr(self, method)
             return executor(*args, **kwargs)
+        
+        def execute_function(self, func, *args, **kwargs):
+            return func(*args, **kwargs)
+
 
 except ImportError as e:
     logger.warning(f"Failed to import Ray with {e!r}. "
