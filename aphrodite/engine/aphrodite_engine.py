@@ -205,6 +205,7 @@ class AphroditeEngine:
         # FIXME: Change to debug log.
         logger.info(f"# GPU blocks: {num_gpu_blocks}, "
                     f"# CPU blocks: {num_cpu_blocks}")
+        logger.info(f"Expected concurrency: {num_gpu_blocks * self.cache_config.block_size / self.scheduler_config.max_model_len:.02f}x")
 
         if num_gpu_blocks <= 0:
             raise ValueError("No available memory for the cache blocks. "
