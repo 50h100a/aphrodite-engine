@@ -1,6 +1,8 @@
 #!/bin/bash
 
-wget -qO- https://micromamba.snakepit.net/api/micromamba/linux-64/latest | tar -xvj bin/micromamba
+if [ ! -f "bin/micromamba" ]; then
+ wget -qO- https://micromamba.snakepit.net/api/micromamba/linux-64/latest | tar -xvj bin/micromamba
+fi
 if [ ! -f "conda/envs/aphrodite-runtime/bin/python" ]; then
  bin/micromamba create --no-shortcuts -r conda -n aphrodite-runtime -f environment.yaml -y
 fi
