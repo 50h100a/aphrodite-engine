@@ -456,7 +456,6 @@ def _get_typical_ps(input_metadata: InputMetadata) -> List[float]:
         typical_ps += [typical_p] * len(seq_ids)
     return typical_ps
 
-
 def _apply_alphabet_soup(
     logits: torch.Tensor,
     top_ps: List[float],
@@ -464,33 +463,33 @@ def _apply_alphabet_soup(
     top_as: List[float],
     min_ps: List[float],
 ) -> torch.Tensor:
-    ts_a = torch.tensor(top_as, dtype=logits.dtype, device=logits.device)
     ts_p = torch.tensor(top_ps, dtype=logits.dtype, device=logits.device)
-    ts_k = torch.tensor(top_ks, dtype=torch.int, device=logits.device)
+    ts_a = torch.tensor(top_as, dtype=logits.dtype, device=logits.device)
     ms_p = torch.tensor(min_ps, dtype=logits.dtype, device=logits.device)
     logits_sort, logits_idx = logits.sort(dim=-1, descending=True)
 
-    # Apply top-p, min-p and top-a.
     probs_sort = logits_sort.softmax(dim=-1)
     probs_sum = probs_sort.cumsum(dim=-1)
+
+    # Combine top_a and min_p (linear_a) thresholds
     min_p_thresholds = probs_sort[:, 0] * ms_p
     top_a_thresholds = torch.pow(probs_sort[:, 0], 2) * ts_a
-    treshold = torch.maximum(min_p_thresholds, top_a_thresholds)
-    mask = (probs_sort < treshold.unsqueeze(1)
-            )  # Cull logits below the top-a threshold
-    mask.logical_or_(probs_sum > ts_p.unsqueeze(
-        dim=1))  # Cull logits above the top-p summation threshold
-    mask[:, 0] = False  # Guarantee at least one token is pickable
-    logits_sort[mask] = -float("inf")
+    threshold = torch.maximum(min_p_thresholds, top_a_thresholds)
 
-    # Apply top-k.
-    # Create a mask for the top-k elements.
-    top_k_mask = torch.arange(logits_idx.shape[-1], device=logits_idx.device)
-    top_k_mask = top_k_mask.expand(logits_idx.shape[0], -1)
-    top_k_mask = top_k_mask >= ts_k.unsqueeze(dim=1)
-    logits_sort[top_k_mask] = -float("inf")
+    # Construct a combined mask of top_p, top_a, and min_p.
+    # Create mask with top_p
+    mask = probs_sum > ts_p.unsqueeze(dim=1)
+    # Add top_a/min_p to mask
+    mask.logical_or_(probs_sort < threshold.unsqueeze(dim=1))
+    mask[:, 0] = False # Guarantee at least one token is pickable
+    logits_sort[mask] = -float("inf") # Mask the logits
 
-    # Re-sort the probabilities.
+    # top_k can direct-assign its values.
+    # At this point, top_k must be [1, N-1].
+    for i,k in enumerate(top_ks):
+        logits_sort[i, k:] = -float("inf")
+
+    # Distribute new logits back into vocab order
     logits = torch.gather(logits_sort,
                           dim=-1,
                           index=torch.argsort(logits_idx, dim=-1))
