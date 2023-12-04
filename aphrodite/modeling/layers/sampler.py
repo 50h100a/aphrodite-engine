@@ -379,7 +379,7 @@ def _get_temperatures(input_metadata: InputMetadata) -> List[float]:
 def _get_alphabet_soup(
     input_metadata: InputMetadata,
     vocab_size: int,
-) -> Tuple[List[float], List[int], List[float]]:
+) -> Tuple[List[float], List[int], List[float], List[float]]:
     top_ps: List[float] = []
     top_ks: List[int] = []
     top_as: List[float] = []
@@ -459,9 +459,9 @@ def _get_typical_ps(input_metadata: InputMetadata) -> List[float]:
 
 def _apply_alphabet_soup(
     logits: torch.Tensor,
+    top_ps: List[float],
+    top_ks: List[int],
     top_as: List[float],
-    top_ps: List[int],
-    top_ks: List[float],
     min_ps: List[float],
 ) -> torch.Tensor:
     ts_a = torch.tensor(top_as, dtype=logits.dtype, device=logits.device)
