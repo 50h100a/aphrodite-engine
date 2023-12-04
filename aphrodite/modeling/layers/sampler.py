@@ -16,6 +16,21 @@ import aphrodite.modeling.layers.sampler_mirostat as sampler_mirostat
 
 _SAMPLING_EPS = 1e-5
 
+# import json
+# def push_logit_hist(name, logit_hist, logit_matrix:torch.Tensor):
+#     ltop, ltopidx = logit_matrix.sort(descending=True)
+#     maxidxs = (ltop != -float("inf")).long().count_nonzero(dim=-1)
+#     for seq in range(len(logit_matrix)):
+#         maxidx = maxidxs[seq].item()
+#         logit_hist[seq].append({
+#             "name": name,
+#             "top_logs": [ltop[seq][i].item() for i in range(10)],
+#             "top_toks": [ltopidx[seq][i].item() for i in range(10)],
+#             "min_log": ltop[seq][maxidx-1].item(),
+#             "count": maxidx
+#         })
+
+
 
 class Sampler(nn.Module):
     """Samples the next tokens from the model's outputs.
@@ -52,6 +67,9 @@ class Sampler(nn.Module):
 
         output_metadata = OutputMetadata()
 
+        # logits_at = [[] for _ in logits]
+        # push_logit_hist("new", logits_at, logits)
+
         # Apply presence and frequency penalties.
         output_tokens = _get_output_tokens(input_metadata)
         assert len(output_tokens) == logits.shape[0]
@@ -59,13 +77,16 @@ class Sampler(nn.Module):
          repetition_penalties] = _get_penalties(input_metadata)
         assert len(presence_penalties) == logits.shape[0]
         assert len(frequency_penalties) == logits.shape[0]
+        immune_tokens = [params.immune_tokens for _,params in input_metadata.seq_groups]
         logits = _apply_penalties(logits, output_tokens, presence_penalties,
                                   frequency_penalties, repetition_penalties,
-                                  self.vocab_size)
-
+                                  self.vocab_size, immune_tokens)
+        
         banned_tokens = _get_custom_token_bans(input_metadata)
         assert len(banned_tokens) == logits.shape[0]
         logits = _apply_token_bans(logits, banned_tokens)
+
+        # push_logit_hist("rep_pen", logits_at, logits)
 
         logits = _apply_logits_processors(input_metadata, logits,
                                           output_tokens)
@@ -112,6 +133,8 @@ class Sampler(nn.Module):
             # Use in-place division to avoid creating a new tensor.
             logits.div_(t.unsqueeze(dim=1))
 
+        # push_logit_hist("temps", logits_at, logits)
+
         # Apply top-p, top-k, and top-a truncation.
         top_ps, top_ks, top_as, min_ps = _get_alphabet_soup(
             input_metadata, self.vocab_size)
@@ -131,6 +154,8 @@ class Sampler(nn.Module):
         # Compute the log probabilities.
         # Use log_softmax to ensure numerical stability.
         logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
+
+        # print(json.dumps(logits_at, indent=2))
 
         # Sample the next tokens.
         sample_results = _sample(probs, logprobs, input_metadata)
@@ -206,7 +231,7 @@ def _get_penalties(
     return presence_penalties, frequency_penalties, repetition_penalties
 
 
-def _get_output_tokens(input_metadata: InputMetadata) -> List[List[int]]:
+def _get_output_tokens(input_metadata: InputMetadata) -> Tuple[List[List[int]], List[List[int]]]:
     output_tokens: List[List[int]] = []
     for i, seq_group in enumerate(input_metadata.seq_groups):
         seq_ids, sampling_params = seq_group
@@ -219,6 +244,7 @@ def _get_output_tokens(input_metadata: InputMetadata) -> List[List[int]]:
         for seq_id in seq_ids:
             seq_data = input_metadata.seq_data[seq_id]
             output_tokens.append(seq_data.output_token_ids)
+
     return output_tokens
 
 
@@ -258,6 +284,7 @@ def _apply_penalties(
     frequency_penalties: List[float],
     repetition_penalties: List[float],
     vocab_size: int,
+    immune_tokens: List[List[int]],
 ) -> torch.Tensor:
     num_seqs, vocab_size = logits.shape
     for i in range(num_seqs):
@@ -272,10 +299,10 @@ def _apply_penalties(
         # Return early if all sequences have zero penalties.
         return logits
 
-    max_output_len = max(len(tokens) for tokens in output_tokens)
+    max_output_len = max(len(out) for out in output_tokens)
     padded_output_tokens = [
-        tokens + [vocab_size] * (max_output_len - len(tokens))
-        for tokens in output_tokens
+        out + [vocab_size] * (max_output_len - len(out))
+        for out in output_tokens
     ]
     output_tokens_tensor = torch.tensor(padded_output_tokens,
                                         dtype=torch.long,
@@ -289,6 +316,10 @@ def _apply_penalties(
     bin_counts.scatter_add_(1, output_tokens_tensor,
                             torch.ones_like(output_tokens_tensor))
     bin_counts = bin_counts[:, :vocab_size]  # Remove the padding bin.
+    for i,imms in enumerate(immune_tokens):
+        for t in imms:
+            bin_counts[i][t] = 0
+    # bin_counts.scatter_(1, torch.tensor(immune_tokens, device=bin_counts.device), 0)
 
     frequency_penalties = torch.tensor(frequency_penalties,
                                        dtype=logits.dtype,
@@ -428,14 +459,14 @@ def _get_typical_ps(input_metadata: InputMetadata) -> List[float]:
 
 def _apply_alphabet_soup(
     logits: torch.Tensor,
-    top_ps: List[float],
-    top_ks: List[int],
     top_as: List[float],
+    top_ps: List[int],
+    top_ks: List[float],
     min_ps: List[float],
 ) -> torch.Tensor:
+    ts_a = torch.tensor(top_as, dtype=logits.dtype, device=logits.device)
     ts_p = torch.tensor(top_ps, dtype=logits.dtype, device=logits.device)
     ts_k = torch.tensor(top_ks, dtype=torch.int, device=logits.device)
-    ts_a = torch.tensor(top_as, dtype=logits.dtype, device=logits.device)
     ms_p = torch.tensor(min_ps, dtype=logits.dtype, device=logits.device)
     logits_sort, logits_idx = logits.sort(dim=-1, descending=True)
 

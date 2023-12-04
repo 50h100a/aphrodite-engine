@@ -1,6 +1,5 @@
-"""Ray for distributed multi-node inference:
-https://github.com/ray-project/ray"""
-import socket
+"""Ray for distributed multi-node inference: https://github.com/ray-project/ray"""
+import socket, os
 from typing import Optional, Tuple, TYPE_CHECKING
 
 from aphrodite.common.config import ParallelConfig
@@ -32,6 +31,10 @@ try:
         def execute_method(self, method, *args, **kwargs):
             executor = getattr(self, method)
             return executor(*args, **kwargs)
+        
+        def execute_function(self, func, *args, **kwargs):
+            return func(*args, **kwargs)
+
 
 except ImportError as e:
     logger.warning(f"Failed to import Ray with {e!r}. "
@@ -77,6 +80,8 @@ def initialize_cluster(
                 "Ray is not installed. Please install Ray to use distributed "
                 "serving.")
         # Connect to a ray cluster.
+        os.environ["RAY_DEDUP_LOGS"] = "0"
+        os.environ["RAY_memory_monitor_refresh_ms"] = "0"
         ray.init(address=ray_address, ignore_reinit_error=True)
 
     if not parallel_config.worker_use_ray:

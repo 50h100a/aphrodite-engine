@@ -14,7 +14,7 @@ ROOT_DIR = os.path.dirname(__file__)
 
 # Supported NVIDIA GPU architectures.
 SUPPORTED_ARCHS = {
-    "6.0", "6.1", "6.5", "7.0", "7.5", "8.0", "8.6", "8.9", "9.0"
+    "7.0", "7.5", "8.0", "8.6", "8.9", "9.0"
 }
 
 # Compiler flags.

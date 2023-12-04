@@ -190,6 +190,7 @@ def main(args: argparse.Namespace):  # pylint: disable=redefined-outer-name
           f"Output tokens/s: {total_output_tokens / elapsed_time:.2f}")
 
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark the throughput.")
     parser.add_argument("--backend",

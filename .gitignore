@@ -9,6 +9,7 @@ build
 *.json
 dist*
 .VSCodeCounter
+.venv
 conda/
 umamba.exe
 bin/
@@ -193,3 +194,5 @@ _build/
 # vim swap files
 *.swo
 *.swp
+
+keys/

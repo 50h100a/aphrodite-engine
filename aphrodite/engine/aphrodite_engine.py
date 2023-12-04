@@ -205,6 +205,7 @@ class AphroditeEngine:
         # FIXME: Change to debug log.
         logger.info(f"# GPU blocks: {num_gpu_blocks}, "
                     f"# CPU blocks: {num_cpu_blocks}")
+        logger.info(f"Expected concurrency: {num_gpu_blocks * self.cache_config.block_size / self.scheduler_config.max_model_len:.02f}x")
 
         if num_gpu_blocks <= 0:
             raise ValueError("No available memory for the cache blocks. "
@@ -371,8 +372,7 @@ class AphroditeEngine:
 
         # Process the child samples for each parent sequence
         for parent in parent_seqs:
-            child_samples: List[SequenceOutputs] = parent_child_dict[
-                parent.seq_id]
+            child_samples: List[SequenceOutputs] = parent_child_dict[parent.seq_id]
             if len(child_samples) == 0:
                 # This parent sequence has no children samples. Remove
                 # the parent sequence from the sequence group since it will
@@ -655,13 +655,10 @@ class AphroditeEngine:
     def _check_stop(self, seq: Sequence,
                     sampling_params: SamplingParams) -> None:
         """Stop the finished sequences."""
-        for stop_str in sampling_params.stop:
-            if seq.output_text.endswith(stop_str):
-                # Truncate the output text so that the stop string is
-                # not included in the output.
-                seq.output_text = seq.output_text[:-len(stop_str)]
-                seq.status = SequenceStatus.FINISHED_STOPPED
-                return
+        if any(seq.output_text.endswith(stop_str) for stop_str in sampling_params.stop):
+            seq.status = SequenceStatus.FINISHED_STOPPED
+            return
+        
         if seq.get_last_token_id() in sampling_params.stop_token_ids:
             seq.status = SequenceStatus.FINISHED_STOPPED
             return
@@ -710,4 +707,24 @@ class AphroditeEngine:
         output = all_outputs[0]
         for other_output in all_outputs[1:]:
             assert output == other_output
+        return output
+    
+    def _run_worker(
+        self,
+        worker_index: int,
+        function,
+        *args,
+        **kwargs,
+    ) -> Any:
+        """Runs the given function on specified worker."""
+        all_outputs = []
+        self.workers[worker_index]
+
+        if self.parallel_config.worker_use_ray:
+            function = partial(self.workers[worker_index].execute_function.remote, function)
+
+        output = function(*args, **kwargs)
+        if self.parallel_config.worker_use_ray:
+            output = ray.get(output)
+
         return output
