@@ -75,13 +75,12 @@ class Sampler(nn.Module):
         assert len(output_tokens) == logits.shape[0]
 
         def _fetchpen(x:SamplingParams):
-            return (x.presence_penalty, x.frequency_penalty, x.repetition_penalty,)
-        pres_pens, freq_pens, rep_pens = zip(*_fetch_params_split(input_metadata, _fetchpen, lambda x: (0,0,0,)))
+            return (x.presence_penalty, x.frequency_penalty, x.repetition_penalty, x.immune_tokens,)
+        pres_pens, freq_pens, rep_pens, immunes = zip(*_fetch_params_split(input_metadata, _fetchpen, lambda x: (0,0,0,None)))
         
-        immune_tokens = [params.immune_tokens for _,params in input_metadata.seq_groups]
         logits = _apply_penalties(logits, output_tokens, pres_pens,
                                   freq_pens, rep_pens,
-                                  self.vocab_size, immune_tokens)
+                                  self.vocab_size, immunes)
         
         banned_tokens = _fetch_params(input_metadata, lambda x: x.custom_token_bans)
         if any(bt for bt in banned_tokens):
