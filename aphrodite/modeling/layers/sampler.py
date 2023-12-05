@@ -337,26 +337,13 @@ def do_the_soup(
     metadata: InputMetadata,
     vocab_size: int,
 ):
-    top_ps: List[float] = []
-    top_ks: List[int] = []
-    top_as: List[float] = []
-    min_ps: List[float] = []
-
     # It is possible to skip sequences that do not have p/k/a/p, but
     # the overwhelming majority of reqs have one or more anyway.
-    for i, (seq_ids, params) in enumerate(metadata.seq_groups):
-        nseqs = len(seq_ids)
-        if (i < metadata.num_prompts and params.prompt_logprobs):
-            nseqs += metadata.prompt_lens[i] - 1
-
-        # top_k <= vocab_size, k=-1 means no truncation.
-        top_k = min(params.top_k, vocab_size)
+    def _gimme(x:SamplingParams) -> tuple[float, int, float, float]:
+        top_k = min(x.top_k, vocab_size)
         top_k = vocab_size if top_k == -1 else top_k
-
-        top_ps += [params.top_p] * nseqs
-        top_ks += [top_k] * nseqs
-        top_as += [params.top_a] * nseqs
-        min_ps += [params.min_p] * nseqs
+        return (x.top_p, top_k, x.top_a, x.min_p)
+    top_ps, top_ks, top_as, min_ps = zip(*_fetch_params(metadata, _gimme))
 
     ts_top_p = torch.tensor(top_ps, dtype=logits.dtype, device=logits.device)
     ts_top_a = torch.tensor(top_as, dtype=logits.dtype, device=logits.device)
