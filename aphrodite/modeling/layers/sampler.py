@@ -73,18 +73,19 @@ class Sampler(nn.Module):
         # Apply presence and frequency penalties.
         output_tokens = _get_output_tokens(input_metadata)
         assert len(output_tokens) == logits.shape[0]
-        [presence_penalties, frequency_penalties,
-         repetition_penalties] = _get_penalties(input_metadata)
-        assert len(presence_penalties) == logits.shape[0]
-        assert len(frequency_penalties) == logits.shape[0]
+
+        def _fetchpen(x:SamplingParams):
+            return (x.presence_penalty, x.frequency_penalty, x.repetition_penalty,)
+        pres_pens, freq_pens, rep_pens = zip(*_fetch_params_split(input_metadata, _fetchpen, lambda x: (0,0,0,)))
+        
         immune_tokens = [params.immune_tokens for _,params in input_metadata.seq_groups]
-        logits = _apply_penalties(logits, output_tokens, presence_penalties,
-                                  frequency_penalties, repetition_penalties,
+        logits = _apply_penalties(logits, output_tokens, pres_pens,
+                                  freq_pens, rep_pens,
                                   self.vocab_size, immune_tokens)
         
-        banned_tokens = _get_custom_token_bans(input_metadata)
-        assert len(banned_tokens) == logits.shape[0]
-        logits = _apply_token_bans(logits, banned_tokens)
+        banned_tokens = _fetch_params(input_metadata, lambda x: x.custom_token_bans)
+        if any(bt for bt in banned_tokens):
+            logits = _apply_token_bans(logits, banned_tokens)
 
         # push_logit_hist("rep_pen", logits_at, logits)
 
@@ -99,33 +100,30 @@ class Sampler(nn.Module):
             sampler_mirostat.apply(logits, input_metadata, output_metadata)
 
         # Apply Eta sampling, as described in https://arxiv.org/abs/2210.15191
-        eta_cutoffs = _get_eta_cutoffs(input_metadata)
-        assert len(eta_cutoffs) == logits.shape[0]
+        eta_cutoffs = _fetch_params(input_metadata, lambda x: x.eta_cutoff)
         if any(eta > _SAMPLING_EPS for eta in eta_cutoffs):
             logits = _apply_eta_cutoff(logits, eta_cutoffs)
 
         # Apply Locally typical sampling, as described in
         # https://arxiv.org/abs/2202.00666
-        typical_ps = _get_typical_ps(input_metadata)
-        assert len(typical_ps) == logits.shape[0]
+        typical_ps = _fetch_params(input_metadata, lambda x: x.typical_p)
         if any(typ_p < 1.0 - _SAMPLING_EPS for typ_p in typical_ps):
             logits = _apply_typical_sampling(logits, typical_ps)
 
         # Apply Tail Free Sampling, as described in
         # https://www.trentonbricken.com/Tail-Free-Sampling/
-        tfss = _get_tfs(input_metadata)
-        assert len(tfss) == logits.shape[0]
+        tfss = _fetch_params(input_metadata, lambda x: x.tfs)
         if any(z < 1.0 - _SAMPLING_EPS for z in tfss):
             logits = _apply_tfs(logits, tfss)
 
-        epsilon_cutoffs = _get_epsilon_cutoffs(input_metadata)
-        assert len(epsilon_cutoffs) == logits.shape[0]
+        epsilon_cutoffs = _fetch_params(input_metadata, lambda x: x.epsilon_cutoff)
         if any(epsilon > _SAMPLING_EPS for epsilon in epsilon_cutoffs):
             logits = _apply_epsilon_cutoff(logits, epsilon_cutoffs)
 
         # Apply temperature scaling.
-        temperatures = _get_temperatures(input_metadata)
-        assert len(temperatures) == logits.shape[0]
+        # NOTE: Zero temperature means deterministic sampling.
+        #       Set the temperature to 1 to avoid division by zero.
+        temperatures = _fetch_params(input_metadata, lambda x: (x.temperature or 1.0))
         if any(t != 1.0 for t in temperatures):
             t = torch.tensor(temperatures,
                              dtype=logits.dtype,
@@ -199,28 +197,6 @@ def _prune_hidden_states(
     return hidden_states.index_select(0, selected_token_indices)
 
 
-def _get_penalties(
-        input_metadata: InputMetadata) -> Tuple[List[float], List[float]]:
-    # Collect the presence and frequency penalties.
-    presence_penalties: List[float] = []
-    frequency_penalties: List[float] = []
-    repetition_penalties: List[float] = []
-    for i, seq_group in enumerate(input_metadata.seq_groups):
-        seq_ids, sampling_params = seq_group
-        if (i < input_metadata.num_prompts
-                and sampling_params.prompt_logprobs is not None):
-            prompt_len = input_metadata.prompt_lens[i]
-            presence_penalties += [0] * (prompt_len - 1)
-            frequency_penalties += [0] * (prompt_len - 1)
-            repetition_penalties += [0] * (prompt_len - 1)
-        presence_penalties += [sampling_params.presence_penalty] * len(seq_ids)
-        frequency_penalties += [sampling_params.frequency_penalty
-                                ] * len(seq_ids)
-        repetition_penalties += [sampling_params.repetition_penalty
-                                 ] * len(seq_ids)
-    return presence_penalties, frequency_penalties, repetition_penalties
-
-
 def _get_output_tokens(input_metadata: InputMetadata) -> Tuple[List[List[int]], List[List[int]]]:
     output_tokens: List[List[int]] = []
     for i, seq_group in enumerate(input_metadata.seq_groups):
@@ -238,17 +214,26 @@ def _get_output_tokens(input_metadata: InputMetadata) -> Tuple[List[List[int]], 
     return output_tokens
 
 
-def _get_custom_token_bans(input_metadata: InputMetadata) -> List[List[int]]:
-    banned_tokens: List[List[int]] = []
-    for i, seq_group in enumerate(input_metadata.seq_groups):
-        seq_ids, sampling_params = seq_group
-        custom_token_bans = sampling_params.custom_token_bans
-        if (i < input_metadata.num_prompts
-                and sampling_params.prompt_logprobs is not None):
-            prompt_len = input_metadata.prompt_lens[i]
-            banned_tokens += [custom_token_bans] * (prompt_len - 1)
-        banned_tokens += [custom_token_bans] * len(seq_ids)
-    return banned_tokens
+from typing import Callable, TypeVar
+T = TypeVar('T')
+
+def _fetch_params(metadata: InputMetadata, fetcher: Callable[[SamplingParams], T]) -> list[T]:
+    fetched = []
+    for i, (seq_ids, params) in enumerate(metadata.seq_groups):
+        nseqs = len(seq_ids)
+        if (i < metadata.num_prompts and params.prompt_logprobs):
+            nseqs += metadata.prompt_lens[i] - 1
+        fetched += [fetcher(params)] * nseqs
+    return fetched
+
+def _fetch_params_split(metadata: InputMetadata, fetcher: Callable[[SamplingParams], T], fetcher_prompt: Callable[[SamplingParams], T]) -> list[T]:
+    fetched = []
+    for i, (seq_ids, params) in enumerate(metadata.seq_groups):
+        if (i < metadata.num_prompts and params.prompt_logprobs):
+            fetched += [fetcher_prompt(params)] * (metadata.prompt_lens[i] - 1)
+        fetched += [fetcher(params)] * len(seq_ids)
+    return fetched
+
 
 
 def _apply_logits_processors(input_metadata: InputMetadata,
@@ -345,79 +330,6 @@ def _apply_token_bans(logits: torch.Tensor,
             continue
         logits[i, banned_token_ids] = -float("inf")
     return logits
-
-
-def _get_temperatures(input_metadata: InputMetadata) -> List[float]:
-    # Collect the temperatures for the logits.
-    temperatures: List[float] = []
-    for i, seq_group in enumerate(input_metadata.seq_groups):
-        seq_ids, sampling_params = seq_group
-        temperature = sampling_params.temperature
-        if temperature < _SAMPLING_EPS:
-            # NOTE: Zero temperature means deterministic sampling
-            # (i.e., greedy sampling or beam search).
-            # Set the temperature to 1 to avoid division by zero.
-            temperature = 1.0
-        if (i < input_metadata.num_prompts
-                and sampling_params.prompt_logprobs is not None):
-            prompt_len = input_metadata.prompt_lens[i]
-            temperatures += [temperature] * (prompt_len - 1)
-        temperatures += [temperature] * len(seq_ids)
-    return temperatures
-
-
-
-
-def _get_tfs(input_metadata: InputMetadata) -> List[float]:
-    tfss: List[float] = []
-    for i, seq_group in enumerate(input_metadata.seq_groups):
-        seq_ids, sampling_params = seq_group
-        z = sampling_params.tfs
-        if (i < input_metadata.num_prompts
-                and sampling_params.prompt_logprobs is not None):
-            prompt_len = input_metadata.prompt_lens[i]
-            tfss += [z] * (prompt_len - 1)
-        tfss += [z] * len(seq_ids)
-    return tfss
-
-
-def _get_eta_cutoffs(input_metadata: InputMetadata) -> List[float]:
-    eta_cutoffs: List[float] = []
-    for i, seq_group in enumerate(input_metadata.seq_groups):
-        seq_ids, sampling_params = seq_group
-        eta_cutoff = sampling_params.eta_cutoff
-        if (i < input_metadata.num_prompts
-                and sampling_params.prompt_logprobs is not None):
-            prompt_len = input_metadata.prompt_lens[i]
-            eta_cutoffs += [eta_cutoff] * (prompt_len - 1)
-        eta_cutoffs += [eta_cutoff] * len(seq_ids)
-    return eta_cutoffs
-
-
-def _get_epsilon_cutoffs(input_metadata: InputMetadata) -> List[float]:
-    epsilon_cutoffs: List[float] = []
-    for i, seq_group in enumerate(input_metadata.seq_groups):
-        seq_ids, sampling_params = seq_group
-        epsilon_cutoff = sampling_params.epsilon_cutoff
-        if (i < input_metadata.num_prompts
-                and sampling_params.prompt_logprobs is not None):
-            prompt_len = input_metadata.prompt_lens[i]
-            epsilon_cutoffs += [epsilon_cutoff] * (prompt_len - 1)
-        epsilon_cutoffs += [epsilon_cutoff] * len(seq_ids)
-    return epsilon_cutoffs
-
-
-def _get_typical_ps(input_metadata: InputMetadata) -> List[float]:
-    typical_ps: List[float] = []
-    for i, seq_group in enumerate(input_metadata.seq_groups):
-        seq_ids, sampling_params = seq_group
-        typical_p = sampling_params.typical_p
-        if (i < input_metadata.num_prompts
-                and sampling_params.prompt_logprobs is not None):
-            prompt_len = input_metadata.prompt_lens[i]
-            typical_ps += [typical_p] * (prompt_len - 1)
-        typical_ps += [typical_p] * len(seq_ids)
-    return typical_ps
 
 
 def do_the_soup(
