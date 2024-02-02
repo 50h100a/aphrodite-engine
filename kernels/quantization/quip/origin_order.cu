@@ -1,9 +1,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 700
-  #include <mma.h>
-#endif
+#include <mma.h>
 
 #include <ATen/ATen.h>
 #include <ATen/core/Tensor.h>
@@ -105,7 +103,6 @@ static __device__ void store(
     int32_t nTile,
     int32_t laneId,
     const float4& out) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800
 
   // sum.x / sum.y are written at
   // [laneId / 4], [(laneId % 4) * 2, (laneId % 4) * 2 + 1]
@@ -129,7 +126,6 @@ static __device__ void store(
   if (outRow + 8 < m) {
     *reinterpret_cast<half2*>(cPtr + 8 * n) = v23;
   }
-#endif
 }
 };
 
@@ -148,7 +144,6 @@ static __device__ void load(
     int32_t kTileStart,
     int32_t laneId,
     f16x2x2_u32 b[KTilesPerIteration]) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800
   auto Bptr = reinterpret_cast<const uint8_t*>(B);
   #pragma unroll
   for (int i = 0; i < KTilesPerIteration; ++i) {
@@ -156,7 +151,6 @@ static __device__ void load(
        const int col = (kTileStart + i) * kKTileSize / 4 + laneId % 4;
        *(reinterpret_cast<uint64_t*>(b[i].vals)) = CB[Bptr[row * k/4 + col]];
   }
-#endif
 }
 };
 
@@ -175,7 +169,6 @@ static __device__ void load(
     int32_t kTileStart,
     int32_t laneId,
     f16x2x2_u32 b[KTilesPerIteration]) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800
   auto Bptr = reinterpret_cast<const uint32_t*>(B);
   #pragma unroll
   for (int i = 0; i < KTilesPerIteration; ++i) {
@@ -196,7 +189,6 @@ static __device__ void load(
       *(half2*)(b[i].vals) = __hfma2(*((half2*)(&q0)), y16, z16);
       *(half2*)(b[i].vals+1) = __hfma2(*((half2*)(&q1)), y16, z16);
   }
-#endif
 }
 };
 
@@ -207,7 +199,6 @@ __device__ static inline uint64_t decode8weights(
     uint16_t weight_compressed,
     const int64_t *__restrict__ codebook_abs
 ) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800
 
     uint8_t bits_sign = weight_compressed & 0xff;
     uint8_t parity = __popc(bits_sign) & 1;
@@ -224,7 +215,6 @@ __device__ static inline uint64_t decode8weights(
     packed -= parity * 0x0202020202020202;
 
     return packed;
-#endif
 }
 
 __device__ static inline uint32_t decode8weights(
@@ -232,7 +222,6 @@ __device__ static inline uint32_t decode8weights(
     const int64_t *__restrict__ codebook_abs,
     int idx
 ) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800
     uint8_t bits_sign = weight_compressed & 0xff; //__brev(weight_compressed) >> 24;
     const uint32_t magic_nums[2] = {0x08040201ll, 0x80402010ll};
     uint8_t parity = __popc(bits_sign) & 1;
@@ -248,7 +237,6 @@ __device__ static inline uint32_t decode8weights(
     packed |= 0x01010101;
     packed -= parity * 0x02020202;
     return packed;
-#endif
 };
 
 template <int KTilesPerIteration>
@@ -263,7 +251,6 @@ static __device__ void load(
     int32_t kTileStart,
     int32_t laneId,
     f16x2x2_u32 b[KTilesPerIteration]) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800
   auto Bptr = (const uint16_t*) B;
   #pragma unroll
   for (int i = 0; i < KTilesPerIteration; ++i) {
@@ -288,7 +275,6 @@ static __device__ void load(
        //*((half*)(b[i].vals) + 2) = unpacked[1].x;
        //*((half*)(b[i].vals) + 3) = unpacked[1].y;
   }
-#endif
 }
 };
 
@@ -318,7 +304,6 @@ __launch_bounds__(256) void tinygemm_m16n8k16_chunk_kernel(
     int32_t mTiles,
     int32_t nTiles,
     int32_t kTiles) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800
   __shared__ uint64_t CB_[256];
   if (BLayout::use_codebook) {
     CB_[threadIdx.x + threadIdx.y * 32] = CB[threadIdx.x + threadIdx.y * 32];
@@ -459,14 +444,12 @@ __launch_bounds__(256) void tinygemm_m16n8k16_chunk_kernel(
         laneId,
         sum_f32);
   }
-#endif
 }
 
 at::Tensor d4_mm_origorder(
     const at::Tensor& A,
     const at::Tensor& B,
     const at::Tensor& CB) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800
   c10::cuda::CUDAGuard g(A.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -505,14 +488,12 @@ at::Tensor d4_mm_origorder(
       kTiles);
 
   return C_final;
-#endif
 }
 
 at::Tensor e8p_mm_origorder(
     const at::Tensor& A,
     const at::Tensor& B,
     const at::Tensor& CB) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800
   c10::cuda::CUDAGuard g(A.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -550,13 +531,11 @@ at::Tensor e8p_mm_origorder(
       kTiles);
 
   return C_final;
-#endif
 }
 
 at::Tensor hi_mm_origorder(
     const at::Tensor& A,
     const at::Tensor& B) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800
   c10::cuda::CUDAGuard g(A.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -594,7 +573,6 @@ at::Tensor hi_mm_origorder(
       kTiles);
 
   return C_final;
-#endif
 }
 
 #define DECOMPRESS_D4_BLOCK_SIZE 256
@@ -604,14 +582,12 @@ __global__ void cuda_decompress_d4_origorder_kernel(
     const c10::Half* __restrict__ CB,           // 256 x 4
     c10::Half* __restrict__ Y             // m x n
 ) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800
   const long i = threadIdx.x + DECOMPRESS_D4_BLOCK_SIZE * blockIdx.x;
 
   for(long r = 0; r < 4; r++) {
     uint8_t yidx = ((uint8_t*)YIs)[i*4 + r];
     ((uint64_t*)Y)[i*4 + r] = ((uint64_t*)CB)[yidx & 255];
   }
-#endif
 }
 
 
@@ -620,7 +596,6 @@ void decompress_d4_origorder(
     torch::Tensor CB,       // 256 x 4
     torch::Tensor Y         // m x n
 ) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800
   size_t m = Y.sizes()[0];
   size_t n = Y.sizes()[1];
 
@@ -640,7 +615,6 @@ void decompress_d4_origorder(
     CB.data_ptr<c10::Half>(),
     Y.data_ptr<c10::Half>()
   );
-#endif
 }
 
 #define DECOMPRESS_E8P_BLOCK_SIZE 256
@@ -650,7 +624,6 @@ __global__ void cuda_decompress_e8p_origorder_kernel(
     const int64_t* __restrict__ CB, // 256 x 8
     c10::Half* __restrict__ Y             // m x n
 ) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800
   const long i = threadIdx.x + DECOMPRESS_E8P_BLOCK_SIZE * blockIdx.x;
   uint16_t yidx = ((uint16_t*)YIs)[i];
   uint64_t decoded =  BLayout_E8::decode8weights(yidx, CB);
@@ -670,7 +643,6 @@ __global__ void cuda_decompress_e8p_origorder_kernel(
   ((__half2*)Y)[i*4+2] = __hadd2(unpacked[0][1], adjust); // 45
   ((__half2*)Y)[i*4+1] = __hadd2(unpacked[1][0], adjust); // 23
   ((__half2*)Y)[i*4+3] = __hadd2(unpacked[1][1], adjust); // 67
-#endif
 }
 
 
@@ -679,7 +651,6 @@ void decompress_e8p_origorder(
     torch::Tensor CB,       // 256 x 8
     torch::Tensor &Y         // m x n
 ) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800
   size_t m = Y.sizes()[0];
   size_t n = Y.sizes()[1];
 
@@ -699,7 +670,6 @@ void decompress_e8p_origorder(
     CB.data_ptr<int64_t>(),
     Y.data_ptr<c10::Half>()
   );
-#endif
 }
 
 #define DECOMPRESS_HI_BLOCK_SIZE 256
@@ -708,7 +678,6 @@ __global__ void cuda_decompress_hi_origorder_kernel(
     const uint32_t* __restrict__ YIs,	  // m x (n/8)
     c10::Half* __restrict__ Y             // m x n
 ) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800
   const long i = threadIdx.x + DECOMPRESS_HI_BLOCK_SIZE * blockIdx.x;
   uint32_t qa = YIs[i];
 
@@ -728,14 +697,12 @@ __global__ void cuda_decompress_hi_origorder_kernel(
   ((__half2*)Y)[i*4+1] = __hfma2(*((half2*)(&q1)), y16, z16);
   ((__half2*)Y)[i*4+2] = __hfma2(*((half2*)(&q2)), y16, z16);
   ((__half2*)Y)[i*4+3] = __hfma2(*((half2*)(&q3)), y16, z16);
-#endif
 }
 
 void decompress_hi_origorder(
     torch::Tensor YIs,      // m x (n/8)
     torch::Tensor Y         // m x n
 ){
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800
   size_t m = Y.sizes()[0];
   size_t n = Y.sizes()[1];
 
@@ -752,5 +719,4 @@ void decompress_hi_origorder(
     (uint32_t*)YIs.data_ptr<int32_t>(),
     Y.data_ptr<c10::Half>()
   );
-#endif
 }

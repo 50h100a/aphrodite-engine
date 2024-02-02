@@ -80,7 +80,6 @@ class ChatCompletionRequest(BaseModel):
     mirostat_eta: Optional[float] = 0.0
     dynatemp_range: Optional[float] = 0.0
     dynatemp_exponent: Optional[float] = 1.0
-    smoothing_factor: Optional[float] = 0.0
     ignore_eos: Optional[bool] = False
     use_beam_search: Optional[bool] = False
     logprobs: Optional[int] = None
@@ -125,7 +124,6 @@ class CompletionRequest(BaseModel):
     mirostat_eta: Optional[float] = 0.0
     dynatemp_range: Optional[float] = 0.0
     dynatemp_exponent: Optional[float] = 1.0
-    smoothing_factor: Optional[float] = 0.0
     ignore_eos: Optional[bool] = False
     use_beam_search: Optional[bool] = False
     logprobs: Optional[int] = None

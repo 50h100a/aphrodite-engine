@@ -42,7 +42,7 @@ class GGUFConfig(QuantizationConfig):
         return [torch.half]
 
     def get_min_capability(self) -> int:
-        return 61
+        return 70
 
     @staticmethod
     def get_config_filenames() -> List[str]:
