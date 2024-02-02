@@ -325,6 +325,7 @@ class AphroditeEngine:
         # FIXME: Change to debug log.
         logger.info(f"# GPU blocks: {num_gpu_blocks}, "
                     f"# CPU blocks: {num_cpu_blocks}")
+        logger.info(f"Expected concurrency: {num_gpu_blocks * self.cache_config.block_size / self.scheduler_config.max_model_len:.02f}x")
 
         if num_gpu_blocks <= 0:
             raise ValueError("No available memory for the cache blocks. "
@@ -914,14 +915,10 @@ class AphroditeEngine:
     def _check_stop(self, seq: Sequence,
                     sampling_params: SamplingParams) -> None:
         """Stop the finished sequences."""
-        for stop_str in sampling_params.stop:
-            if seq.output_text.endswith(stop_str):
-                if not sampling_params.include_stop_str_in_output:
-                    # Truncate the output text so that the stop string is
-                    # not included in the output.
-                    seq.output_text = seq.output_text[:-len(stop_str)]
-                seq.status = SequenceStatus.FINISHED_STOPPED
-                return
+        if any(seq.output_text.endswith(stop_str) for stop_str in sampling_params.stop):
+            seq.status = SequenceStatus.FINISHED_STOPPED
+            return
+        
         if seq.get_last_token_id() in sampling_params.stop_token_ids:
             seq.status = SequenceStatus.FINISHED_STOPPED
             return
