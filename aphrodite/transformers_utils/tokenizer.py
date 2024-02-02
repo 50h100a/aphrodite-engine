@@ -184,6 +184,10 @@ def _convert_tokens_to_string_with_added_encoders(
         return "".join(sub_texts)
 
 
+
+
+HORRIBLE_TOKENIZER_HACK_SPECIAL_IDS = None
+
 # Based on
 # https://github.com/huggingface/text-generation-inference/blob/v0.9.4/server/text_generation_server/models/model.py#L62C9-L62C15
 # under Apache 2.0 license
@@ -196,25 +200,33 @@ def detokenize_incrementally(
     skip_special_tokens: bool = False,
     spaces_between_special_tokens: bool = True,
 ) -> Tuple[List[str], str, int, int]:
+    global HORRIBLE_TOKENIZER_HACK_SPECIAL_IDS
+    if HORRIBLE_TOKENIZER_HACK_SPECIAL_IDS is None:
+        HORRIBLE_TOKENIZER_HACK_SPECIAL_IDS = set(tokenizer.all_special_ids)
+
     new_token_id = all_input_ids[-1]
     # This is the first iteration for this sequence
     if prev_tokens is None:
-        new_tokens = tokenizer.convert_ids_to_tokens(
-            all_input_ids, skip_special_tokens=skip_special_tokens)
+        if skip_special_tokens:
+            new_tokens = [tokenizer._tokenizer.id_to_token(index)
+                          for index in all_input_ids
+                          if index not in HORRIBLE_TOKENIZER_HACK_SPECIAL_IDS]
+        else:
+            new_tokens = [tokenizer._tokenizer.id_to_token(index)
+                          for index in all_input_ids]
         output_tokens = new_tokens
         # 5 is an arbitrary value that should work for all
         # tokenizers (bigger = more conservative).
         # Subtract 1 extra to account for the generated token.
         prefix_offset = max(len(output_tokens) - 6, 0)
         # If the first new token is a special token we can't skip 1 extra token
-        if skip_special_tokens and new_token_id in tokenizer.all_special_ids:
+        if skip_special_tokens and new_token_id in HORRIBLE_TOKENIZER_HACK_SPECIAL_IDS:
             read_offset = max(len(output_tokens), 0)
         else:
             read_offset = max(len(output_tokens) - 1, 0)
     else:
         # Put new_token_id in a list so skip_special_tokens is respected
-        new_tokens = tokenizer.convert_ids_to_tokens(
-            [new_token_id], skip_special_tokens=skip_special_tokens)
+        new_tokens = [] if (skip_special_tokens and new_token_id in HORRIBLE_TOKENIZER_HACK_SPECIAL_IDS) else [tokenizer._tokenizer.id_to_token(new_token_id)]
         output_tokens = prev_tokens + new_tokens
 
     # The prefix text is necessary only to defeat cleanup algorithms in
