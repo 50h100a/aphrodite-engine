@@ -1,3 +1,4 @@
+import os
 from typing import Optional, List, Tuple, TYPE_CHECKING
 
 from aphrodite.common.config import ParallelConfig
@@ -77,6 +78,8 @@ def initialize_cluster(
                 "Ray is not installed. Please install Ray to use distributed "
                 "serving.")
         # Connect to a ray cluster.
+        os.environ["RAY_DEDUP_LOGS"] = "0"
+        os.environ["RAY_memory_monitor_refresh_ms"] = "0"
         if is_hip():
             ray.init(address=ray_address,
                      ignore_reinit_error=True,
