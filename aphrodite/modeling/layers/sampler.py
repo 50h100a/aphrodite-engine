@@ -206,7 +206,8 @@ def _apply_logits_processors(
         seq_end = seq_offset + seq_size
 
         if sampling_params.logits_processors:
-            output_tokens.extend(metadata.seq_data[sid].output_token_ids for sid in seq_ids)
+            output_tokens.extend(metadata.seq_data[sid].output_token_ids
+                                 for sid in seq_ids)
             for proc in sampling_params.logits_processors:
                 proc(logits[seq_offset:seq_end], output_tokens)
 
@@ -410,6 +411,22 @@ def _apply_temperature(
     return logits
 
 
+def _apply_quadratic_sampling(
+    logits: torch.Tensor,
+    smoothing_factors: torch.Tensor,
+) -> torch.Tensor:
+    """Applies a quadratic transformation to the logits based on the
+    provided smoothing factor. The transformation is centered around
+    the maximum logit value in the batch.
+
+    Credits: @kalomaze
+    """
+    max_logits = logits.max(dim=-1, keepdim=True).values
+    transformed_logits = -(smoothing_factors.unsqueeze_(dim=1) *
+                           (logits - max_logits).pow(2)) + max_logits
+    return transformed_logits
+
+
 def _greedy_sample(
     selected_seq_groups: List[Tuple[List[int], SamplingParams]],
     samples: torch.Tensor,
@@ -548,7 +565,7 @@ def _sample(
     # Counterintuitively, having two loops here is actually faster.
     # The first loop can run without waiting on GPU<->CPU sync.
     for sampling_type, sample_indices in categorized_sample_indices.items():
-        if not len(sample_indices):
+        if len(sample_indices) == 0:
             continue
         seq_group_ids = categorized_seq_group_ids[sampling_type]
         seq_groups = [sampling_metadata.seq_groups[i] for i in seq_group_ids]
