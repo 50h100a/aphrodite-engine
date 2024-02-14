@@ -96,7 +96,8 @@ class Sampler(nn.Module):
         # Prepare sampling tensors with pinned memory to avoid blocking.
         (sampling_tensors, do_temperatures, do_penalties, do_topks, do_topps,
          do_topas, do_minps, do_tfss, do_eta_cutoffs, do_epsilon_cutoffs,
-         do_typical_ps, do_mirostat) = (SamplingTensors.from_sampling_metadata(
+         do_typical_ps, do_quadratic,
+         do_mirostat) = (SamplingTensors.from_sampling_metadata(
              sampling_metadata, vocab_size, logits.device, logits.dtype))
 
         if do_penalties:
@@ -126,6 +127,9 @@ class Sampler(nn.Module):
         if do_typical_ps:
             logits = _apply_typical_sampling(logits,
                                              sampling_tensors.typical_ps)
+        if do_quadratic:
+            logits = _apply_quadratic_sampling(
+                logits, sampling_tensors.smoothing_factors)
 
         banned_tokens = _get_custom_token_bans(sampling_metadata)
         assert len(banned_tokens) == logits.shape[0]

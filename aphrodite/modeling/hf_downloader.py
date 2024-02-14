@@ -12,6 +12,7 @@ from huggingface_hub import snapshot_download, HfFileSystem
 import numpy as np
 from safetensors.torch import load_file, save_file, safe_open
 import torch
+from transformers import PretrainedConfig
 from tqdm.auto import tqdm
 from rich.progress import Progress
 
