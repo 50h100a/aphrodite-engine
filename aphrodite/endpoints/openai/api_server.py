@@ -33,8 +33,7 @@ from aphrodite.common.sampling_params import SamplingParams
 from aphrodite.transformers_utils.tokenizer import get_tokenizer
 from aphrodite.common.utils import random_uuid
 from aphrodite.common.logits_processor import BiasLogitsProcessor
-from aphrodite.common.grammar import (GrammarLogitsProcessor,
-                                      RayRemoteGrammarLogitsProcessor)
+from aphrodite.common.grammar import GrammarLogitsProcessor
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds
 
@@ -344,6 +343,7 @@ async def create_chat_completion(
             smoothing_factor=request.smoothing_factor,
             stop=request.stop,
             stop_token_ids=request.stop_token_ids,
+            seed=request.seed,
             include_stop_str_in_output=request.include_stop_str_in_output,
             max_tokens=request.max_tokens,
             best_of=request.best_of,
@@ -551,12 +551,8 @@ async def create_completion(
         logit_processors = [BiasLogitsProcessor(biases)]
 
     if request.grammar:
-        if engine.worker_use_ray:
-            grammar_logits_processor = RayRemoteGrammarLogitsProcessor(
-                tokenizer=tokenizer, grammar=request.grammar)
-        else:
-            grammar_logits_processor = GrammarLogitsProcessor(
-                tokenizer=tokenizer, grammar=request.grammar)
+        grammar_logits_processor = GrammarLogitsProcessor(
+            tokenizer=tokenizer, grammar=request.grammar)
         logit_processors = [grammar_logits_processor]
     else:
         logit_processors = []
@@ -629,6 +625,7 @@ async def create_completion(
             smoothing_factor=request.smoothing_factor,
             stop=request.stop,
             stop_token_ids=request.stop_token_ids,
+            seed=request.seed,
             include_stop_str_in_output=request.include_stop_str_in_output,
             max_tokens=request.max_tokens
             if not echo_without_generation else 1,
