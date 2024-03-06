@@ -76,6 +76,7 @@ class ModelConfig:
         quantization: Optional[str] = None,
         enforce_eager: bool = False,
         max_context_len_to_capture: Optional[int] = None,
+        max_log_probs: int = 10,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -89,6 +90,7 @@ class ModelConfig:
         self.quantization = quantization
         self.enforce_eager = enforce_eager
         self.max_context_len_to_capture = max_context_len_to_capture
+        self.max_log_probs = max_log_probs
 
         if os.environ.get("APHRODITE_USE_MODELSCOPE",
                           "False").lower() == "true":
@@ -148,7 +150,9 @@ class ModelConfig:
         self.tokenizer_mode = tokenizer_mode
 
     def _verify_quantization(self) -> None:
-        supported_quantization = ["awq", "gguf", "gptq", "quip", "squeezellm"]
+        supported_quantization = [
+            "awq", "gguf", "gptq", "quip", "squeezellm", "marlin"
+        ]
         rocm_not_supported_quantization = ["awq", "quip"]
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
@@ -164,6 +168,11 @@ class ModelConfig:
         hf_quant_config = getattr(self.hf_config, "quantization_config", None)
         if hf_quant_config is not None:
             hf_quant_method = str(hf_quant_config["quant_method"]).lower()
+            # If the GPTQ model is serialized in marlin format, use marlin.
+            if (hf_quant_method == "gptq"
+                    and "is_marlin_format" in hf_quant_config
+                    and hf_quant_config["is_marlin_format"]):
+                hf_quant_method = "marlin"
             if self.quantization is None:
                 self.quantization = hf_quant_method
             elif self.quantization != hf_quant_method:
@@ -183,9 +192,11 @@ class ModelConfig:
                 raise ValueError(
                     f"{self.quantization} quantization is currently not "
                     "supported in ROCm.")
-            logger.warning(f"{self.quantization} quantization is not fully "
-                           "optimized yet. The speed can be slower than "
-                           "non-quantized models.")
+            if self.quantization != "marlin":
+                logger.warning(
+                    f"{self.quantization} quantization is not fully "
+                    "optimized yet. The speed can be slower than "
+                    "non-quantized models.")
 
     def _verify_cuda_graph(self) -> None:
         if self.max_context_len_to_capture is None:
