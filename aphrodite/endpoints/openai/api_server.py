@@ -14,7 +14,9 @@ from http import HTTPStatus
 from fastapi import Request, APIRouter, Header
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse, Response, HTMLResponse
+from fastapi.responses import (JSONResponse, StreamingResponse, Response,
+                               HTMLResponse)
+from loguru import logger
 
 import aphrodite
 from aphrodite.engine.args_tools import AsyncEngineArgs
@@ -22,12 +24,13 @@ from aphrodite.engine.async_aphrodite import AsyncAphrodite
 from aphrodite.endpoints.openai.protocol import (CompletionRequest,
                                                  ChatCompletionRequest,
                                                  ErrorResponse, Prompt)
-from aphrodite.common.logger import init_logger
+from aphrodite.common.logger import UVICORN_LOG_CONFIG
 from aphrodite.common.outputs import RequestOutput
 from aphrodite.common.sampling_params import SamplingParams, _SAMPLING_EPS
 from aphrodite.common.utils import random_uuid
 from aphrodite.endpoints.openai.serving_chat import OpenAIServingChat
-from aphrodite.endpoints.openai.serving_completions import OpenAIServingCompletion
+from aphrodite.endpoints.openai.serving_completions import (
+    OpenAIServingCompletion)
 from aphrodite.endpoints.openai.protocol import KAIGenerationInputSchema
 from aphrodite.endpoints.openai.serving_engine import LoRA
 from aphrodite.transformers_utils.tokenizer import get_tokenizer
@@ -36,10 +39,10 @@ TIMEOUT_KEEP_ALIVE = 5  # seconds
 
 openai_serving_chat: OpenAIServingChat = None
 openai_serving_completion: OpenAIServingCompletion = None
-logger = init_logger(__name__)
 kai_api = APIRouter()
 extra_api = APIRouter()
 kobold_lite_ui = ""
+sampler_json = ""
 gen_cache: dict = {}
 
 
@@ -99,8 +102,8 @@ def parse_args():
         type=str,
         default=None,
         help=
-        "If provided, the server will require this key to be presented in the header."
-    )
+        "If provided, the server will require this key to be presented in the "
+        "header.")
     parser.add_argument(
         "--launch-kobold-api",
         action="store_true",
@@ -124,8 +127,8 @@ def parse_args():
         nargs='+',
         action=LoRAParserAction,
         help=
-        "LoRA module configurations in the format name=path. Multiple modules can be specified."
-    )
+        "LoRA module configurations in the format name=path. Multiple modules "
+        "can be specified.")
     parser.add_argument("--chat-template",
                         type=str,
                         default=None,
@@ -158,9 +161,10 @@ def parse_args():
         help="Additional ASGI middleware to apply to the app. "
         "We accept multiple --middleware arguments. "
         "The value should be an import path. "
-        "If a function is provided, Aphrodite will add it to the server using @app.middleware('http'). "
-        "If a class is provided, Aphrodite will add it to the server using app.add_middleware(). "
-    )
+        "If a function is provided, Aphrodite will add it to the server using "
+        "@app.middleware('http'). "
+        "If a class is provided, Aphrodite will add it to the server using "
+        "app.add_middleware(). ")
 
     parser = AsyncEngineArgs.add_cli_args(parser)
     return parser.parse_args()
@@ -211,6 +215,22 @@ async def detokenize(request: Request,
 async def show_version(x_api_key: Optional[str] = Header(None)):
     ver = {"version": aphrodite.__version__}
     return JSONResponse(content=ver)
+
+
+@app.get("/v1/samplers")
+async def show_samplers(x_api_key: Optional[str] = Header(None)):
+    """Get the available samplers."""
+    global sampler_json
+    if not sampler_json:
+        jsonpath = os.path.dirname(os.path.abspath(__file__))
+        samplerpath = os.path.join(jsonpath, "./samplers.json")
+        samplerpath = os.path.normpath(samplerpath)  # Normalize the path
+        if os.path.exists(samplerpath):
+            with open(samplerpath, "r") as f:
+                sampler_json = json.load(f)
+        else:
+            logger.error("Sampler JSON not found at " + samplerpath)
+    return sampler_json
 
 
 @app.post("/v1/chat/completions")
@@ -458,7 +478,7 @@ async def get_preloaded_story() -> JSONResponse:
 @extra_api.get("/version")
 async def get_extra_version():
     """Impersonate KoboldCpp"""
-    return JSONResponse({"result": "KoboldCpp", "version": "1.55.1"})
+    return JSONResponse({"result": "KoboldCpp", "version": "1.60.1"})
 
 
 @app.get("/")
@@ -483,7 +503,7 @@ async def get_kobold_lite_ui():
 if __name__ == "__main__":
     args = parse_args()
 
-    if '--launch-kobold-api' in args:
+    if args.launch_kobold_api:
         logger.warning("Launching Kobold API server in addition to OpenAI. "
                        "Keep in mind that the Kobold API routes are NOT "
                        "protected via the API key.")
@@ -529,9 +549,8 @@ if __name__ == "__main__":
         elif inspect.iscoroutinefunction(imported):
             app.middleware("http")(imported)
         else:
-            raise ValueError(
-                f"Invalid middleware {middleware}. Must be a function or a class."
-            )
+            raise ValueError(f"Invalid middleware {middleware}. Must be a "
+                             "function or a class.")
 
     logger.debug(f"args: {args}")
 
@@ -542,6 +561,16 @@ if __name__ == "__main__":
 
     engine_args = AsyncEngineArgs.from_cli_args(args)
     engine = AsyncAphrodite.from_engine_args(engine_args)
+    tokenizer = get_tokenizer(
+        engine_args.tokenizer,
+        tokenizer_mode=engine_args.tokenizer_mode,
+        trust_remote_code=engine_args.trust_remote_code,
+    )
+
+    chat_template = args.chat_template
+    if chat_template is None and tokenizer.chat_template is not None:
+        chat_template = tokenizer.chat_template
+
     openai_serving_chat = OpenAIServingChat(engine, served_model,
                                             args.response_role,
                                             args.lora_modules,
@@ -549,13 +578,8 @@ if __name__ == "__main__":
     openai_serving_completion = OpenAIServingCompletion(
         engine, served_model, args.lora_modules)
     engine_model_config = asyncio.run(engine.get_model_config())
-    tokenizer = get_tokenizer(
-        engine_args.tokenizer,
-        tokenizer_mode=engine_args.tokenizer_mode,
-        trust_remote_code=engine_args.trust_remote_code,
-    )
 
-    if 'launch_kobold_api' in args:
+    if args.launch_kobold_api:
         _set_badwords(tokenizer, engine_model_config.hf_config)
 
     app.root_path = args.root_path
@@ -565,4 +589,5 @@ if __name__ == "__main__":
                 log_level="info",
                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
                 ssl_keyfile=args.ssl_keyfile,
-                ssl_certfile=args.ssl_certfile)
+                ssl_certfile=args.ssl_certfile,
+                log_config=UVICORN_LOG_CONFIG)

@@ -1,12 +1,10 @@
 import importlib
 from typing import List, Optional, Type
+from loguru import logger
 
 import torch.nn as nn
 
-from aphrodite.common.logger import init_logger
 from aphrodite.common.utils import is_hip
-
-logger = init_logger(__name__)
 
 # Architecture -> (module, class).
 _MODELS = {
@@ -43,6 +41,7 @@ _MODELS = {
     "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
     "RWForCausalLM": ("falcon", "FalconForCausalLM"),
     "StableLMEpochForCausalLM": ("stablelm", "StablelmForCausalLM"),
+    "StableLmForCausalLM": ("stablelm", "StablelmForCausalLM"),
 }
 
 # Models not supported by ROCm.

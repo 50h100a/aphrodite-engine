@@ -4,6 +4,7 @@ import os
 import time
 from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple,
                     Union)
+from loguru import logger
 
 import aphrodite
 from aphrodite.lora.request import LoRARequest
@@ -12,8 +13,9 @@ from aphrodite.common.config import (CacheConfig, ModelConfig, ParallelConfig,
 from aphrodite.processing.scheduler import Scheduler, SchedulerOutputs
 from aphrodite.engine.args_tools import EngineArgs
 from aphrodite.engine.metrics import StatLogger, Stats
-from aphrodite.engine.ray_tools import RayWorkerAphrodite, initialize_cluster, ray
-from aphrodite.common.logger import init_logger
+from aphrodite.engine.ray_tools import (RayWorkerAphrodite, initialize_cluster,
+                                        ray)
+from aphrodite.common.logger import setup_logger
 from aphrodite.common.outputs import RequestOutput
 from aphrodite.common.sampling_params import SamplingParams
 from aphrodite.common.sequence import (SamplerOutput, Sequence, SequenceGroup,
@@ -29,8 +31,6 @@ if ray:
 
 if TYPE_CHECKING:
     from ray.util.placement_group import PlacementGroup
-
-logger = init_logger(__name__)
 
 _LOCAL_LOGGING_INTERVAL_SEC = 5
 
@@ -76,25 +76,20 @@ class AphroditeEngine:
         log_stats: bool,
     ) -> None:
         logger.info(
-            f"Initializing the Aphrodite Engine (v{aphrodite.__version__}) with the following config:\n"
+            f"Initializing the Aphrodite Engine (v{aphrodite.__version__}) "
+            "with the following config:\n"
             f"Model = {model_config.model!r}\n"
-            f"Tokenizer = {model_config.tokenizer!r}\n"
-            f"tokenizer_mode = {model_config.tokenizer_mode}\n"
-            f"revision = {model_config.revision}\n"
-            f"trust_remote_code = {model_config.trust_remote_code}\n"
             f"DataType = {model_config.dtype}\n"
-            f"Download Directory = {model_config.download_dir!r}\n"
             f"Model Load Format = {model_config.load_format}\n"
             f"Number of GPUs = {parallel_config.tensor_parallel_size}\n"
             f"Disable Custom All-Reduce = "
             f"{parallel_config.disable_custom_all_reduce}\n"
             f"Quantization Format = {model_config.quantization}\n"
-            f"Sampler Seed = {model_config.seed}\n"
             f"Context Length = {model_config.max_model_len}\n"
             f"Enforce Eager Mode = {model_config.enforce_eager}\n"
             f"KV Cache Data Type = {cache_config.cache_dtype}\n"
-            f"Device = {device_config.device}\n"
-            f"Seed = {model_config.seed}")
+            f"KV Cache Params Path = {cache_config.cache_quant_params_path}\n"
+            f"Device = {device_config.device}")
         # TODO: Print more configs in debug mode.
 
         self.model_config = model_config
@@ -155,6 +150,7 @@ class AphroditeEngine:
             distributed_init_method=distributed_init_method,
             lora_config=self.lora_config,
             kv_cache_dtype=self.cache_config.cache_dtype,
+            kv_quant_params_path=(self.cache_config.cache_quant_params_path),
             is_driver_worker=True,
         )
         self._run_workers("init_model")
@@ -263,6 +259,8 @@ class AphroditeEngine:
                     distributed_init_method,
                     lora_config=self.lora_config,
                     kv_cache_dtype=self.cache_config.cache_dtype,
+                    kv_quant_params_path=
+                    (self.cache_config.cache_quant_params_path),
                 ))
 
         driver_rank = 0
@@ -277,6 +275,7 @@ class AphroditeEngine:
             distributed_init_method,
             lora_config=self.lora_config,
             kv_cache_dtype=self.cache_config.cache_dtype,
+            kv_quant_params_path=(self.cache_config.cache_quant_params_path),
             is_driver_worker=True,
         )
 
@@ -296,6 +295,7 @@ class AphroditeEngine:
                 self.scheduler_config)
 
     def _init_cache(self) -> None:
+        # ruff: noqa: E501
         """Profiles the memory usage and initializes the KV cache.
 
         The engine will first conduct a profiling of the existing memory usage.
@@ -336,11 +336,17 @@ class AphroditeEngine:
                     f"# CPU blocks: {num_cpu_blocks}")
         logger.info(f"Expected concurrency: {num_gpu_blocks * self.cache_config.block_size / self.scheduler_config.max_model_len:.02f}x")
 
+        logger.info(
+            f"Minimum concurrency: {num_gpu_blocks * self.cache_config.block_size / self.scheduler_config.max_model_len:.2f}x"
+        )
+
         if num_gpu_blocks <= 0:
             raise ValueError("No available memory for the cache blocks. "
                              "Try increasing `gpu_memory_utilization` when "
                              "initializing the engine.")
         max_seq_len = self.cache_config.block_size * num_gpu_blocks
+        logger.info(f"Maximum sequence length allowed in the cache: "
+                    f"{max_seq_len}")
         if self.model_config.max_model_len > max_seq_len:
             raise ValueError(
                 f"The model's max seq len ({self.model_config.max_model_len}) "
@@ -394,7 +400,6 @@ class AphroditeEngine:
         prompt_token_ids: Optional[List[int]] = None,
         arrival_time: Optional[float] = None,
         lora_request: Optional[LoRARequest] = None,
-        prefix_pos: Optional[int] = None,
     ) -> None:
         """Add a request to the engine's request pool.
 
@@ -411,11 +416,6 @@ class AphroditeEngine:
                 use the tokenizer to convert the prompts to token IDs.
             arrival_time: The arrival time of the request. If None, we use
                 the current monotonic time.
-            prefix_pos: If not None, we use the given position as the prefix
-                position for each prompt. We will cache the prefix's KV
-                cache and reuse it for the next request with the same prefix.
-                This is an experimental feature, and may be replaced with
-                automatic prefix caching in the future.
 
         Details:
             - Set arrival_time to the current time if it is None.
@@ -465,14 +465,9 @@ class AphroditeEngine:
         seq = Sequence(seq_id, prompt, prompt_token_ids, block_size,
                        lora_request)
 
-        # Check whether the input specifies prefix
-        prefix = self.scheduler.prefix_pool.add_or_get_prefix(
-            prompt_token_ids[:prefix_pos], lora_request.lora_int_id
-            if lora_request else 0) if prefix_pos is not None else None
-
         # Create the sequence group.
         seq_group = SequenceGroup(request_id, [seq], sampling_params,
-                                  arrival_time, lora_request, prefix)
+                                  arrival_time, lora_request)
 
         # Add the sequence group to the scheduler.
         self.scheduler.add_seq_group(seq_group)
@@ -734,6 +729,11 @@ class AphroditeEngine:
             scheduler_outputs: SchedulerOutputs) -> List[RequestOutput]:
         # Update the scheduled sequence groups with the model outputs.
         scheduled_seq_groups = scheduler_outputs.scheduled_seq_groups
+        # If prefix caching is enabled, mark all blocks in the sequence groups
+        # as completed so that future requests don't attempt to recompute them
+        if self.cache_config.context_shift:
+            for seq_group in scheduled_seq_groups:
+                self.scheduler.mark_blocks_as_computed(seq_group)
         for seq_group, outputs in zip(scheduled_seq_groups, output):
             self._process_sequence_group_outputs(seq_group, outputs)
 
@@ -748,12 +748,6 @@ class AphroditeEngine:
         for seq_group in scheduler_outputs.ignored_seq_groups:
             request_output = RequestOutput.from_seq_group(seq_group)
             request_outputs.append(request_output)
-
-        # Update prefix state, now all the uncomputed prefixes are computed.
-        for seq_group in scheduled_seq_groups:
-            if (seq_group.prefix is not None and seq_group.prefix.allocated
-                    and not seq_group.prefix.computed):
-                seq_group.prefix.computed = True
 
         # Log stats.
         if self.log_stats:
@@ -869,18 +863,24 @@ class AphroditeEngine:
 
             # Number of Tokens.
             if prompt_run:
-                num_prompt_tokens = scheduler_outputs.num_batched_tokens
+                num_prompt_tokens = sum(
+                    len(seq_group.prompt_token_ids)
+                    for seq_group in scheduler_outputs.scheduled_seq_groups)
+                num_generation_tokens = sum(
+                    seq_group.num_seqs()
+                    for seq_group in scheduler_outputs.scheduled_seq_groups)
             else:
                 num_generation_tokens = scheduler_outputs.num_batched_tokens
 
             # Latency Timings.
             time_last_iters = []
             for seq_group in scheduler_outputs.scheduled_seq_groups:
-                # Time since last token. (n.b. updates seq_group.last_token_time)
+                # Time since last token. (n.b. updates seq_group.metrics.last_token_time)
                 time_last_iters.append(seq_group.get_last_latency(now))
                 # Time since arrival for all finished requests.
                 if seq_group.is_finished():
-                    time_e2e_requests.append(now - seq_group.arrival_time)
+                    time_e2e_requests.append(now -
+                                             seq_group.metrics.arrival_time)
 
             time_to_first_tokens = time_last_iters if prompt_run else []
             time_per_output_tokens = [] if prompt_run else time_last_iters
@@ -1034,3 +1034,26 @@ class AphroditeEngine:
             ray_worker_outputs = ray.get(ray_worker_outputs)
 
         return [driver_worker_output] + ray_worker_outputs
+
+    def check_health(self) -> None:
+        """Raises an error if engine is unhealthy."""
+        self._check_if_any_actor_is_dead()
+
+    def _check_if_any_actor_is_dead(self):
+        if not self.parallel_config.worker_use_ray:
+            return
+
+        if not self.workers:
+            return
+
+        dead_actors = []
+        for actor in self.workers:
+            actor_state = ray.state.actors(actor._ray_actor_id.hex())
+            if actor_state["State"] == "DEAD":
+                dead_actors.append(actor)
+        if dead_actors:
+            raise RuntimeError("At least one Worker is dead. "
+                               f"Dead workers: {dead_actors}")
+
+
+setup_logger()

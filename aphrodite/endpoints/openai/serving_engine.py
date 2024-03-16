@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Dict, List, Optional, Union
 
-from aphrodite.common.logger import init_logger
 from aphrodite.transformers_utils.tokenizer import get_tokenizer
 from aphrodite.engine.async_aphrodite import AsyncAphrodite
 from aphrodite.endpoints.openai.protocol import (CompletionRequest,
@@ -14,8 +13,6 @@ from aphrodite.endpoints.openai.protocol import (CompletionRequest,
                                                  ModelPermission, Prompt)
 from aphrodite.lora.request import LoRARequest
 from aphrodite.common.sequence import Logprob
-
-logger = init_logger(__name__)
 
 
 @dataclass
@@ -52,7 +49,8 @@ class OpenAIServing:
             event_loop = None
 
         if event_loop is not None and event_loop.is_running(
-        ):  # If the current is instanced by Ray Serve, there is already a running event loop
+        ):  # If the current is instanced by Ray Serve, there is already
+            # a running event loop
             event_loop.create_task(self._post_init())
         else:  # When using single Aphrodite without engine_use_ray
             asyncio.run(self._post_init())
@@ -128,6 +126,12 @@ class OpenAIServing:
                     p.decoded_token: p.logprob
                     for i, p in step_top_logprobs.items()
                 } if step_top_logprobs else None)
+
+        logprobs.top_logprobs = [{
+            k: v if v > -1000 else -1000
+            for k, v in top_logprob.items()
+        } for top_logprob in logprobs.top_logprobs if top_logprob is not None]
+
         return logprobs
 
     def create_error_response(
@@ -191,9 +195,10 @@ class OpenAIServing:
 
         if token_num + request.max_tokens > self.max_model_len:
             raise ValueError(
-                f"This model's maximum context length is {self.max_model_len} tokens. "
-                f"However, you requested {request.max_tokens + token_num} tokens "
-                f"({token_num} in the messages, "
+                f"This model's maximum context length is {self.max_model_len} "
+                "tokens. "
+                f"However, you requested {request.max_tokens + token_num} "
+                f"tokens ({token_num} in the messages, "
                 f"{request.max_tokens} in the completion). "
                 f"Please reduce the length of the messages or completion.", )
         else:
