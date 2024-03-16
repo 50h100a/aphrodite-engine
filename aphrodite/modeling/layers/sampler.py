@@ -288,8 +288,8 @@ def _apply_alphabet_soup(
     logits_sort[mask] = -float("inf")
 
     # Apply top-k.
-    for i,k in enumerate(k):
-        logits_sort[i, k:] = -float("inf")
+    for i,nk in enumerate(k):
+        logits_sort[i, nk:] = -float("inf")
 
     # Re-sort the probabilities.
     src = torch.arange(logits_idx.shape[-1],
@@ -862,7 +862,8 @@ def _mirostat_store_args(
     assert sampling_metadata.seq_groups is not None
     seqid_to_tokens = {}
     seqid_to_indices = {}
-    for (sids, _), (toks, parents) in zip(sampling_metadata.seq_groups, sample_results):
+    for (sids, _), (toks, parents) in zip(sampling_metadata.seq_groups,
+                                          sample_results):
         for idx, (token, parent) in enumerate(zip(toks, parents)):
             seqid_to_tokens.setdefault(sids[parent], []).append(token)
             seqid_to_indices.setdefault(sids[parent], []).append(idx)
