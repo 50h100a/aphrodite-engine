@@ -267,6 +267,10 @@ class LlamaDecoderLayer(nn.Module):
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
+        if config.model_type == "Yi":
+            # Some old Yi finetunes and quants have not been llama-fied
+            self.ln1 = self.input_layernorm
+            self.ln2 = self.post_attention_layernorm
 
     def forward(
         self,

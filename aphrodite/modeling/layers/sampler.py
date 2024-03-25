@@ -80,82 +80,7 @@ class Sampler(nn.Module):
         # Get the logits for the next tokens.
         logits = self._get_logits(hidden_states, embedding, embedding_bias)
 
-        # Only perform sampling in the driver worker.
-        # Note: `_get_logits` is still distributed across TP workers because
-        # the `embedding` weight is distributed across TP workers.
-        # TODO: Change the get_logits part to a separate stage.
-        if not sampling_metadata.perform_sampling:
-            return None
-
-        assert logits is not None
-        _, vocab_size = logits.shape
-
-        output_metadata = OutputMetadata()
-
-        # Apply logits processors (if any)
-        logits = _apply_logits_processors(logits, sampling_metadata)
-
-        # Prepare sampling tensors with pinned memory to avoid blocking.
-        (sampling_tensors, do_temperatures, do_penalties, do_topks, do_topps,
-         do_topas, do_minps, do_tfss, do_eta_cutoffs, do_epsilon_cutoffs,
-         do_typical_ps, do_quadratic,
-         do_mirostat) = (SamplingTensors.from_sampling_metadata(
-             sampling_metadata, vocab_size, logits.device, logits.dtype))
-
-        if do_penalties:
-            logits = _apply_penalties(logits, sampling_tensors.prompt_tokens,
-                                      sampling_tensors.output_tokens,
-                                      sampling_tensors.presence_penalties,
-                                      sampling_tensors.frequency_penalties,
-                                      sampling_tensors.repetition_penalties)
-
-        if do_temperatures:
-            logits = _apply_temperature(logits, sampling_tensors.temperatures,
-                                        sampling_tensors.dynatemp_mins,
-                                        sampling_tensors.dynatemp_maxs,
-                                        sampling_tensors.dynatemp_exps)
-
-        if do_topks or do_topps or do_topas or do_minps:
-            logits = _apply_alphabet_soup(logits, sampling_tensors.top_ps,
-                                          sampling_tensors.top_ks,
-                                          sampling_tensors.top_as,
-                                          sampling_tensors.min_ps)
-        if do_tfss:
-            logits = _apply_tfs(logits, sampling_tensors.tfss)
-        if do_eta_cutoffs:
-            logits = _apply_eta_cutoff(logits, sampling_tensors.eta_cutoffs)
-        if do_epsilon_cutoffs:
-            logits = _apply_epsilon_cutoff(logits,
-                                           sampling_tensors.epsilon_cutoffs)
-        if do_typical_ps:
-            logits = _apply_typical_sampling(logits,
-                                             sampling_tensors.typical_ps)
-        if do_quadratic:
-            logits = _apply_quadratic_sampling(
-                logits, sampling_tensors.smoothing_factors,
-                sampling_tensors.smoothing_curves)
-
-        banned_tokens = _get_custom_token_bans(sampling_metadata)
-        assert len(banned_tokens) == logits.shape[0]
-        logits = _apply_token_bans(logits, banned_tokens)
-        if do_mirostat:
-            logits = _mirostat(logits, sampling_tensors, output_metadata)
-
-        # We use float32 for probabilities and log probabilities.
-        # Compute the probabilities.
-        probs = torch.softmax(logits, dim=-1, dtype=torch.float)
-        # Compute the log probabilities.
-        # Use log_softmax to ensure numerical stability.
-        logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
-
-        # Sample the next tokens.
-        sample_results = _sample(probs, logprobs, sampling_metadata)
-        # Get the logprobs query results.
-        prompt_logprobs, sample_logprobs = _get_logprobs(
-            logprobs, sampling_metadata, sample_results)
-        return _build_sampler_output(sample_results, sampling_metadata,
-                                     prompt_logprobs, sample_logprobs,
-                                     output_metadata)
+        return _perform_sampling(logits, sampling_metadata)
 
 
 # FIXME: This is a hack for the missing GPU blocks. This should be removed
@@ -209,87 +134,93 @@ class QuantSampler(nn.Module):
         if logits is not None:
             logits = logits[:, :self.vocab_size]
 
-        # Only perform sampling in the driver worker.
-        # Note: `_get_logits` is still distributed across TP workers because
-        # the `embedding` weight is distributed across TP workers.
-        # TODO: Change the get_logits part to a separate stage.
-        if not sampling_metadata.perform_sampling:
-            return None
+        return _perform_sampling(logits, sampling_metadata)
 
-        assert logits is not None
-        _, vocab_size = logits.shape
 
-        output_metadata = OutputMetadata()
+def _perform_sampling(
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata) -> Optional[SamplerOutput]:
+    # Only perform sampling in the driver worker.
+    # Note: `_get_logits` is still distributed across TP workers because
+    # the `embedding` weight is distributed across TP workers.
+    # TODO: Change the get_logits part to a separate stage.
+    if not sampling_metadata.perform_sampling:
+        return None
 
-        # Apply logits processors (if any)
-        logits = _apply_logits_processors(logits, sampling_metadata)
+    assert logits is not None
+    _, vocab_size = logits.shape
 
-        # Prepare sampling tensors with pinned memory to avoid blocking.
-        (sampling_tensors, do_temperatures, do_penalties, do_topks, do_topps,
-         do_topas, do_minps, do_tfss, do_eta_cutoffs, do_epsilon_cutoffs,
-         do_typical_ps, do_quadratic,
-         do_mirostat) = (SamplingTensors.from_sampling_metadata(
-             sampling_metadata, vocab_size, logits.device, logits.dtype))
+    output_metadata = OutputMetadata()
 
-        if do_penalties:
-            logits = _apply_penalties(logits, sampling_tensors.prompt_tokens,
-                                      sampling_tensors.output_tokens,
-                                      sampling_tensors.presence_penalties,
-                                      sampling_tensors.frequency_penalties,
-                                      sampling_tensors.repetition_penalties)
+    # Apply logits processors (if any)
+    logits = _apply_logits_processors(logits, sampling_metadata)
 
-        if do_temperatures:
-            logits = _apply_temperature(logits, sampling_tensors.temperatures,
-                                        sampling_tensors.dynatemp_mins,
-                                        sampling_tensors.dynatemp_maxs,
-                                        sampling_tensors.dynatemp_exps)
+    # Prepare sampling tensors with pinned memory to avoid blocking.
+    sampling_tensors = SamplingTensors.from_sampling_metadata(
+        sampling_metadata, vocab_size, logits.device, logits.dtype)
 
-        if do_topks or do_topps or do_topas or do_minps:
-            logits = _apply_alphabet_soup(logits, sampling_tensors.top_ps,
-                                          sampling_tensors.top_ks,
-                                          sampling_tensors.top_as,
-                                          sampling_tensors.min_ps)
-        if do_tfss:
-            logits = _apply_tfs(logits, sampling_tensors.tfss)
-        if do_eta_cutoffs:
-            logits = _apply_eta_cutoff(logits, sampling_tensors.eta_cutoffs)
-        if do_epsilon_cutoffs:
-            logits = _apply_epsilon_cutoff(logits,
-                                           sampling_tensors.epsilon_cutoffs)
-        if do_typical_ps:
-            logits = _apply_typical_sampling(logits,
-                                             sampling_tensors.typical_ps)
-        if do_quadratic:
-            logits = _apply_quadratic_sampling(
-                logits, sampling_tensors.smoothing_factors,
-                sampling_tensors.smoothing_curves)
+    if sampling_tensors.do_penalties:
+        logits = _apply_penalties(logits, sampling_tensors.prompt_tokens,
+                                  sampling_tensors.output_tokens,
+                                  sampling_tensors.pres_penalties,
+                                  sampling_tensors.freq_penalties,
+                                  sampling_tensors.rep_penalties)
 
-        banned_tokens = _get_custom_token_bans(sampling_metadata)
-        assert len(banned_tokens) == logits.shape[0]
-        logits = _apply_token_bans(logits, banned_tokens)
-        if do_mirostat:
-            logits = _apply_mirostat_v2(logits, sampling_tensors)
+    if sampling_tensors.do_temperatures or sampling_tensors.do_dynatemps:
+        logits = _apply_temperature(logits, sampling_tensors.temperatures,
+                                    sampling_tensors.dynatemp_mins,
+                                    sampling_tensors.dynatemp_maxs,
+                                    sampling_tensors.dynatemp_exps)
 
-        # We use float32 for probabilities and log probabilities.
-        # Compute the probabilities.
-        probs = torch.softmax(logits, dim=-1, dtype=torch.float)
-        # Compute the log probabilities.
-        # Use log_softmax to ensure numerical stability.
-        logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
+    if (sampling_tensors.do_top_ks or sampling_tensors.do_top_ps
+            or sampling_tensors.do_top_as or sampling_tensors.do_min_ps):
+        logits = _apply_alphabet_soup(logits, sampling_tensors.top_ps,
+                                      sampling_tensors.top_ks,
+                                      sampling_tensors.top_as,
+                                      sampling_tensors.min_ps)
 
-        # Sample the next tokens.
-        sample_results = _sample(probs, logprobs, sampling_metadata)
+    if sampling_tensors.do_tfss:
+        logits = _apply_tfs(logits, sampling_tensors.tfss)
+    if sampling_tensors.do_eta_cutoffs:
+        logits = _apply_eta_cutoff(logits, sampling_tensors.eta_cutoffs)
+    if sampling_tensors.do_epsilon_cutoffs:
+        logits = _apply_epsilon_cutoff(logits,
+                                       sampling_tensors.epsilon_cutoffs)
+    if sampling_tensors.do_typical_ps:
+        logits = _apply_typical_sampling(logits, sampling_tensors.typical_ps)
 
-        if do_mirostat:
-            _mirostat_store_args(logits, sampling_tensors, sample_results, 
-                                 sampling_metadata, output_metadata)
+    if sampling_tensors.do_quadratic:
+        logits = _apply_quadratic_sampling(logits,
+                                           sampling_tensors.smoothing_indices,
+                                           sampling_tensors.smoothing_factors,
+                                           sampling_tensors.smoothing_curves)
 
-        # Get the logprobs query results.
-        prompt_logprobs, sample_logprobs = _get_logprobs(
-            logprobs, sampling_metadata, sample_results)
-        return _build_sampler_output(sample_results, sampling_metadata,
-                                     prompt_logprobs, sample_logprobs,
-                                     output_metadata)
+    banned_tokens = _get_custom_token_bans(sampling_metadata)
+    assert len(banned_tokens) == logits.shape[0]
+    logits = _apply_token_bans(logits, banned_tokens)
+    if sampling_tensors.do_mirostat:
+        logits = _apply_mirostat_v2(logits, sampling_tensors)
+
+    # We use float32 for probabilities and log probabilities.
+    # Compute the probabilities.
+    probs = torch.softmax(logits, dim=-1, dtype=torch.float)
+    # Compute the log probabilities.
+    # Use log_softmax to ensure numerical stability.
+    logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
+
+    # Sample the next tokens.
+    sample_results = _sample(probs, logprobs, sampling_metadata)
+
+    if sampling_tensors.do_mirostat:
+        _mirostat_store_args(logits, sampling_tensors, sample_results,
+                             sampling_metadata, output_metadata)
+    # Get the logprobs query results.
+    prompt_logprobs, sample_logprobs = _get_logprobs(logprobs,
+                                                     sampling_metadata,
+                                                     sample_results)
+    return _build_sampler_output(sample_results, sampling_metadata,
+                                 prompt_logprobs, sample_logprobs,
+                                 output_metadata)
 
 
 def _prune_hidden_states(
@@ -464,20 +395,19 @@ def _apply_eta_cutoff(
     logits: torch.Tensor,
     eta_cutoff: torch.Tensor,
 ) -> torch.Tensor:
-    eta = torch.tensor(eta_cutoff, dtype=logits.dtype,
-                       device=logits.device) * 1e-4
     shifted_logits = torch.log_softmax(logits, dim=-1)
     probs = shifted_logits.exp()
 
     neg_entropy = (probs * shifted_logits).nansum(dim=-1)
-    eps = torch.min(eta,
-                    torch.sqrt(eta) * torch.exp(neg_entropy)).unsqueeze(dim=1)
+    eps = torch.min(eta_cutoff,
+                    torch.sqrt(eta_cutoff) *
+                    torch.exp(neg_entropy)).unsqueeze(dim=1)
 
     eta_mask = probs < eps
 
-    if torch.all(eta_mask):  # guard against nulling out all the logits
-        topk_prob, _ = torch.max(probs, dim=-1)
-        eta_mask = probs < topk_prob
+    # guard against nulling out all the logits
+    top_idx = torch.argmax(probs, dim=1, keepdim=True)
+    eta_mask.scatter_(dim=1, index=top_idx, value=False)
 
     logits[eta_mask] = -float("inf")
     return logits
@@ -487,16 +417,13 @@ def _apply_epsilon_cutoff(
     logits: torch.Tensor,
     epsilon_cutoff: torch.Tensor,
 ) -> torch.Tensor:
-    eps = torch.tensor(epsilon_cutoff,
-                       dtype=logits.dtype,
-                       device=logits.device).unsqueeze(dim=1)
     probs = logits.softmax(dim=-1)
 
-    eps_mask = probs < (eps * 1e-4)
+    eps_mask = probs < epsilon_cutoff.unsqueeze(dim=1)
 
-    if torch.all(eps_mask):  # guard against nulling out all the logits
-        topk_prob, _ = torch.max(probs, dim=-1)
-        eps_mask = probs < topk_prob
+    # guard against nulling out all the logits
+    top_idx = torch.argmax(probs, dim=1, keepdim=True)
+    eps_mask.scatter_(dim=1, index=top_idx, value=False)
 
     logits[eps_mask] = -float("inf")
     return logits
@@ -506,7 +433,6 @@ def _apply_typical_sampling(
     logits: torch.Tensor,
     typical_p: torch.Tensor,
 ) -> torch.Tensor:
-    typ_p = torch.tensor(typical_p, dtype=logits.dtype, device=logits.device)
     shifted_logits = torch.log_softmax(logits, dim=-1)
     probs = shifted_logits.exp()
 
@@ -515,7 +441,8 @@ def _apply_typical_sampling(
     surprisal_deviations = (neg_entropy - shifted_logits).abs()
     _, indices = torch.sort(surprisal_deviations)
     reordered_probs = probs.gather(-1, indices)
-    typ_mask_sorted = reordered_probs.cumsum(dim=-1) >= typ_p.unsqueeze(dim=1)
+    typ_mask_sorted = reordered_probs.cumsum(dim=-1) >= typical_p.unsqueeze(
+        dim=1)
 
     min_tokens_to_keep = 1
     # Keep at least min_tokens_to_keep
@@ -559,8 +486,9 @@ def _apply_temperature(
 
 def _apply_quadratic_sampling(
     logits: torch.Tensor,
-    smoothing_factors: torch.Tensor,
-    smoothing_curves: torch.Tensor,
+    indices: torch.Tensor,
+    factors: torch.Tensor,
+    curves: torch.Tensor,
 ) -> torch.Tensor:
     """
     Applies a quadratic transformation to the logits based on the
@@ -574,9 +502,11 @@ def _apply_quadratic_sampling(
 
     params:
         logits (torch.Tensor): The logits to be transformed.
-        smoothing_factors (torch.Tensor): The factors to scale the quadratic
+        indices (torch.Tensor): Indices to project `logits` down to 
+            the other tensor's lengths.
+        factors (torch.Tensor): The factors to scale the quadratic
             term in the transformation.
-        smoothing_curves (torch.Tensor): The factors to scale the cubic term
+        curves (torch.Tensor): The factors to scale the cubic term
             in the transformation.
 
     returns:
@@ -584,20 +514,20 @@ def _apply_quadratic_sampling(
 
     Credits: @kalomaze
     """
-    max_logits = logits.max(dim=-1, keepdim=True).values
-    diff = logits - max_logits
-    smoothing_factors.unsqueeze_(dim=1)
-    smoothing_curves.unsqueeze_(dim=1)
+    factors.unsqueeze_(dim=1)
+    curves.unsqueeze_(dim=1)
+    k = factors * (3 - curves) / 2
+    s = factors * (curves - 1) / 2
 
-    k = (3 - smoothing_curves) / 2
-    s = (smoothing_curves - 1) / 2
+    quadlogits = logits[indices]  # project to only relevant logits
+    max_logits = quadlogits.max(dim=-1, keepdim=True).values
 
-    mask = smoothing_factors > 0
-    mask = mask.flatten()
-    transformed_logits = torch.where(
-        logits != float('-inf'), -(k * smoothing_factors * diff**2) +
-        (s * smoothing_factors * diff**3) + max_logits, logits)
-    logits[mask, :] = transformed_logits[mask, :]
+    # Construct the delta from each logit to its new value
+    diff = quadlogits - max_logits
+    diff -= diff**2 * (s * diff - k)
+    diff[diff != diff] = 0  # Eliminate NaNs from infs
+
+    logits[indices] -= diff
     return logits
 
 
@@ -939,8 +869,8 @@ def _build_sampler_output(
         seq_outputs = [
             SequenceOutput(seq_ids[parent_id], token_id, logprobs,
                            output_metadata.get(seq_ids[parent_id], idx))
-            for idx, (token_id, parent_id, logprobs) in
-            enumerate(zip(*sample_result, group_sample_logprobs))
+            for idx, (token_id, parent_id, logprobs) in enumerate(
+                zip(*sample_result, group_sample_logprobs))
         ]
 
         sampler_output.append(
@@ -948,15 +878,13 @@ def _build_sampler_output(
     return sampler_output
 
 
-def _apply_mirostat_v2(
-        logits: torch.Tensor,
-        sampling_tensors: SamplingTensors
-) -> torch.Tensor:
+def _apply_mirostat_v2(logits: torch.Tensor,
+                       sampling_tensors: SamplingTensors) -> torch.Tensor:
     # Reduce our view to just the affected logits
     logit_view = logits[sampling_tensors.miro_indices]
-    
+
     # Calculate surprise value per token
-    #  Converts from nats to bits for compatibility with ooba/kobold.
+    #  Convert nats to bits for compatibility with ooba/kobold parameters.
     logit_surprise = torch.log_softmax(logit_view, dim=-1) / -math.log(2)
 
     # Mask out "too-surprising" tokens (surprisal > mu)
@@ -964,8 +892,8 @@ def _apply_mirostat_v2(
     miro_mask = logit_surprise > mus.unsqueeze(dim=-1)
 
     # Unmask most-likely logit to guarantee a selection.
-    mininds = torch.argmin(logit_surprise, dim=-1)
-    miro_mask.scatter_(1, mininds.unsqueeze(dim=-1), False)
+    maxinds = torch.argmax(logit_view, dim=-1, keepdim=True)
+    miro_mask.scatter_(dim=1, index=maxinds, value=False)
 
     # Apply logit mask (effectively a top-k filter).
     logit_view[miro_mask] = -float("inf")
@@ -976,13 +904,10 @@ def _apply_mirostat_v2(
     return logits
 
 
-def _mirostat_store_args(
-        logits: torch.Tensor,
-        args: SamplingTensors,
-        sample_results: List[Tuple[List[int], List[int]]],
-        sampling_metadata: SamplingMetadata,
-        output_metadata: OutputMetadata
-) -> None:
+def _mirostat_store_args(logits: torch.Tensor, args: SamplingTensors,
+                         sample_results: List[Tuple[List[int], List[int]]],
+                         sampling_metadata: SamplingMetadata,
+                         output_metadata: OutputMetadata) -> None:
     """Based on whichever token was finally sampled, we calculate the
     final surprisal values to update the mus.
     
@@ -996,28 +921,26 @@ def _mirostat_store_args(
         for idx, (token, parent) in enumerate(zip(toks, parents)):
             seqid_to_tokens.setdefault(sids[parent], []).append(token)
             seqid_to_indices.setdefault(sids[parent], []).append(idx)
-    
+
     seqids = args.miro_seqids
 
     picked_tokens = torch.tensor([seqid_to_tokens[x] for x in seqids],
                                  device=logits.device,
                                  dtype=torch.long)
-    
+
     # Clumsily, we recalculate token surprisals.
     logits_view = logits[args.miro_indices]
     picked_surprise = torch.gather(torch.log_softmax(logits_view, dim=-1),
                                    dim=-1,
                                    index=picked_tokens) / -math.log(2)
-    
+
     taus = args.miro_taus.unsqueeze(dim=-1)  # AKA target surprisals
     etas = args.miro_etas.unsqueeze(dim=-1)  # AKA accumulation rates
     mus = args.miro_mus.unsqueeze(dim=-1)  # AKA surprisal accumulators
     nu_mus = mus - (picked_surprise - taus) * etas
-
 
     # Record updated mu values for use in the next iteration
     # Note how each mu is split into multiple based on the number of samples.
     for seqid, seq_mus in zip(seqids, nu_mus):
         for sample_idx, mu in zip(seqid_to_indices[seqid], seq_mus):
             output_metadata.add(seqid, sample_idx, "miro_mu", mu)
-
