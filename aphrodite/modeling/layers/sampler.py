@@ -417,7 +417,7 @@ def _apply_alphabet_soup(
     logits_sort[mask] = -float("inf")
 
     # Apply top-k.
-    for i,nk in enumerate(k):
+    for i, nk in enumerate(k):
         logits_sort[i, nk:] = -float("inf")
 
     # Re-sort the probabilities.

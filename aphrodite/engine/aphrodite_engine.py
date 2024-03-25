@@ -334,7 +334,6 @@ class AphroditeEngine:
         # FIXME: Change to debug log.
         logger.info(f"# GPU blocks: {num_gpu_blocks}, "
                     f"# CPU blocks: {num_cpu_blocks}")
-        logger.info(f"Expected concurrency: {num_gpu_blocks * self.cache_config.block_size / self.scheduler_config.max_model_len:.02f}x")
 
         logger.info(
             f"Minimum concurrency: {num_gpu_blocks * self.cache_config.block_size / self.scheduler_config.max_model_len:.2f}x"

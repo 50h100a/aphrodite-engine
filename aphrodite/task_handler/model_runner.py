@@ -524,7 +524,7 @@ class ModelRunner:
             if sampling_params.seed is not None:
                 generators.append(seq_group_metadata.state.generator)
 
-        selected_token_indices = _async_h2d(
+        selected_token_indices_t = _async_h2d(
             selected_token_indices,
             dtype=torch.long,
             target_device=self.device,
@@ -552,7 +552,7 @@ class ModelRunner:
             seq_groups=seq_groups,
             seq_data=seq_data,
             prompt_lens=prompt_lens,
-            selected_token_indices=selected_token_indices,
+            selected_token_indices=selected_token_indices_t,
             categorized_sample_indices=categorized_sample_indices,
             generators=generators,
             persistent_metadata=PersistentMetadata(seq_persistence_data),
