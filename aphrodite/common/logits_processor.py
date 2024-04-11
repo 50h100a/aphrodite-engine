@@ -54,6 +54,7 @@ class BanEOSUntil(LogitsProcessor):
 
     def __call__(self, logits: torch.Tensor,
                  output_tokens: List[List[int]]) -> None:
-        for i in range(len(output_tokens)):
-            if len(output_tokens[i]) < self._min_tokens:
-                logits[i][self._eos_token_id] = -float("inf")
+        terminate_mask = torch.tensor([len(toks) < self._min_tokens
+                                       for toks in output_tokens],
+                                       device=logits.device)
+        logits[terminate_mask, self._eos_token_id] = -float("inf")
