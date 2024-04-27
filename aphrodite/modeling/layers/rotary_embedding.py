@@ -227,10 +227,11 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
         # Thus, the maximum length after applying the rope scaling is
         # self.max_position_embeddings * self.scaling_factor.
         max_len = self.max_position_embeddings * self.scaling_factor
-        base = self.base * (
-            (self.scaling_factor * max_len / self.max_position_embeddings) -
-            (self.scaling_factor - 1))**(self.rotary_dim /
-                                         (self.rotary_dim - 2))
+        # This is NOT dynamic NTK, but it uses dynamic NTK's alpha formula.
+        alpha = self.scaling_factor
+        alpha = alpha * (max_len/self.max_position_embeddings) - (alpha - 1)
+        # print(f"Using alpha of {alpha} for a {self.scaling_factor}x context.")
+        base = self.base * alpha**(self.rotary_dim / (self.rotary_dim - 2))
         inv_freq = self._compute_inv_freq(base)
         t = torch.arange(max_len, dtype=torch.float)
 

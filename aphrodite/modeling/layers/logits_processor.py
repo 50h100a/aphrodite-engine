@@ -82,6 +82,9 @@ def _apply_logits_processors(
     logits: torch.Tensor,
     sampling_metadata: SamplingMetadata,
 ) -> torch.Tensor:
+    assert sampling_metadata.seq_groups is not None
+    assert sampling_metadata.prompt_lens is not None
+    assert sampling_metadata.seq_data is not None
     logits_row_idx = 0
     found_logits_processors = False
     for i, seq_group in enumerate(sampling_metadata.seq_groups):

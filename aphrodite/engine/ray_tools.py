@@ -1,4 +1,4 @@
-import pickle
+import pickle, os
 
 from typing import Optional, List, Tuple
 from loguru import logger
@@ -91,6 +91,8 @@ def initialize_ray_cluster(
             "Ray is not installed. Please install Ray to use distributed "
             "serving.")
 
+    os.environ["RAY_DEDUP_LOGS"] = "0"
+    os.environ["RAY_memory_monitor_refresh_ms"] = "0"
     # Connect to a ray cluster.
     if is_hip():
         ray.init(address=ray_address,
