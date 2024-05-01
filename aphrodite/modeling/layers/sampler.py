@@ -16,6 +16,22 @@ from aphrodite.common.sequence import (Logprob, PromptLogprobs, SampleLogprobs,
 from aphrodite.modeling.layers.ops.sample import sample as sample_triton
 
 
+# import json
+# def push_logit_hist(name, logit_hist, logit_matrix:torch.Tensor):
+#     ltop, ltopidx = logit_matrix.sort(descending=True)
+#     maxidxs = (ltop != -float("inf")).long().count_nonzero(dim=-1)
+#     for seq in range(len(logit_matrix)):
+#         maxidx = maxidxs[seq].item()
+#         logit_hist[seq].append({
+#             "name": name,
+#             "top_logs": [ltop[seq][i].item() for i in range(10)],
+#             "top_toks": [ltopidx[seq][i].item() for i in range(10)],
+#             "min_log": ltop[seq][maxidx-1].item(),
+#             "count": maxidx
+#         })
+
+
+
 class Sampler(nn.Module):
     """Samples the next tokens from the model's outputs.
     This layer does the following:
