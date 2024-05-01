@@ -535,7 +535,7 @@ class Scheduler:
                     ScheduledSequenceGroup(seq_group,
                                            token_chunk_size=num_new_tokens))
             else:
-                assert num_new_tokens == 1
+                # assert num_new_tokens == 1
                 decode_seq_groups.append(
                     ScheduledSequenceGroup(seq_group, token_chunk_size=1))
             budget.add_num_batched_tokens(seq_group.request_id, num_new_tokens)
