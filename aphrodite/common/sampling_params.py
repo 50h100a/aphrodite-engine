@@ -17,7 +17,7 @@ class SamplingType(IntEnum):
     BEAM = 3
 
 
-LogitsProcessorFunc = Callable[[torch.Tensor, List[List[int]]], None]
+LogitsProcessorFunc = Callable[[List[int], torch.Tensor], torch.Tensor]
 """LogitsProcessorFunc takes a logits tensor and corresponding lists of
 previously generated output tokens, and modifies the logits tensor."""
 

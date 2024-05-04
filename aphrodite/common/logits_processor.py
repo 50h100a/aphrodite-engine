@@ -45,21 +45,21 @@ class BiasLogitsProcessor(LogitsProcessor):
         logits[:, keys] += values
 
 
-class BanEOSUntil(LogitsProcessor):
+class BanTokensUntil(LogitsProcessor):
     """Bans the EOS token until a certain condition is met.
     In this case, 'number of output tokens'.
 
     With this condition, both 'min_tokens' and 'ignore_eos'
     parameters can be handled gracefully."""
 
-    def __init__(self, min_tokens: int, eos_token_id: int):
+    def __init__(self, min_tokens: int, banned_tokens: list[int]):
         self._min_tokens = min_tokens
-        self._eos_token_id = eos_token_id
+        self._banned_tokens = banned_tokens
 
     def __call__(self, output_tokens: List[int],
                  logits: torch.Tensor) -> torch.Tensor:
         if len(output_tokens) < self._min_tokens:
-            logits[self._eos_token_id] = -float("inf")
+            logits[self._banned_tokens] = -float("inf")
         return logits
 
     def batched(self, logits: torch.Tensor,
@@ -67,4 +67,4 @@ class BanEOSUntil(LogitsProcessor):
         terminate_mask = torch.tensor(
             [len(toks) < self._min_tokens for toks in output_tokens],
             device=logits.device)
-        logits[terminate_mask, self._eos_token_id] = -float("inf")
+        logits[terminate_mask, self._banned_tokens] = -float("inf")
