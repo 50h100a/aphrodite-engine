@@ -1064,7 +1064,11 @@ def _mirostat_store_args(logits: torch.Tensor, args: SamplingTensors,
 
     seqids = args.miro_seqids
 
-    picked_tokens = torch.tensor([seqid_to_tokens[x] for x in seqids],
+    padded_tokidxs = [seqid_to_tokens[x] for x in seqids]
+    maxidxs = max(len(x) for x in padded_tokidxs)
+    padded_tokidxs = [x + [0]*(maxidxs-len(x)) for x in padded_tokidxs]
+    
+    picked_tokens = torch.tensor(padded_tokidxs,
                                  device=logits.device,
                                  dtype=torch.long)
 
