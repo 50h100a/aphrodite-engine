@@ -128,8 +128,6 @@ class Sampler(nn.Module):
         do_xtc = self._do_xtc
         do_temp_last = self._do_temp_last
 
-        logits = _apply_min_tokens_penalty(logits, sampling_metadata)
-
         # Apply presence and frequency penalties.
         if do_penalties:
             logits = _apply_penalties(logits, sampling_tensors.prompt_tokens,
@@ -336,54 +334,6 @@ def _apply_token_bans(logits: torch.Tensor,
             continue
         logits[i, banned_token_ids] = -float("inf")
     return logits
-
-
-def _apply_min_tokens_penalty(
-    logits: torch.Tensor,
-    sampling_metadata: SamplingMetadata,
-) -> torch.Tensor:
-    """Apply min_tokens penalty which sets stop tokens to -inf if min_tokens
-        have not been generated yet
-    """
-    # list of indices in logits that will be set to -inf
-    logits_to_penalize = []
-    logits_applied = 0
-    for seq_group in sampling_metadata.seq_groups:
-        seq_ids = seq_group.seq_ids
-        sampling_params = seq_group.sampling_params
-
-        sample_indices = seq_group.sample_indices
-        logits_applied += len(sample_indices) + len(
-            seq_group.prompt_logprob_indices)
-        if not seq_group.do_sample:
-            continue
-
-        start_idx = sample_indices[0]
-        min_tokens = sampling_params.min_tokens
-        token_ids_to_penalize = sampling_params.all_stop_token_ids
-        if min_tokens > 0 and token_ids_to_penalize:
-            seqs_to_penalize = []
-            for j, seq_id in enumerate(seq_ids):
-                seq_data = seq_group.seq_data[seq_id]
-                if len(seq_data.output_token_ids_array) < min_tokens:
-                    seqs_to_penalize.append(j)
-
-            if seqs_to_penalize:
-                # convert to the index into logits
-                seqs_to_penalize = [start_idx + j for j in seqs_to_penalize]
-                # itertools.product pairs each seq index with every token id
-                logits_to_penalize.extend(
-                    itertools.product(seqs_to_penalize, token_ids_to_penalize))
-
-    if logits_to_penalize:
-        # use zip and * to group indices along each dimension
-        # eg. [ (1,2), (1,3), (5,6) ] -> ( (1,1,5), (2,3,6) )
-        logits[tuple(zip(*logits_to_penalize))] = -float("inf")
-
-    # verifies that no rows in logits were missed unexpectedly
-    assert logits_applied == logits.shape[0]
-    return logits
-
 
 def _apply_top_k_top_p(
     logits: torch.Tensor,
