@@ -255,20 +255,6 @@ def _get_bin_counts_and_mask(
     return bin_counts, mask
 
 
-def _get_custom_token_bans(
-        sampling_metadata: SamplingMetadata) -> List[List[int]]:
-    assert sampling_metadata.seq_groups is not None
-    banned_tokens: List[List[int]] = []
-    for i, seq_group in enumerate(sampling_metadata.seq_groups):
-        sampling_params = sampling_metadata.seq_groups[i].sampling_params
-        seq_ids = seq_group.seq_ids
-        custom_token_bans = sampling_params.custom_token_bans
-        if (i < sampling_metadata.num_prompts
-                and sampling_params.prompt_logprobs is not None):
-            prompt_len = len(seq_group.prompt_logprob_indices)
-            banned_tokens += [custom_token_bans] * (prompt_len - 1)
-        banned_tokens += [custom_token_bans] * len(seq_ids)
-    return banned_tokens
 
     
 def _apply_temperatures(
@@ -278,7 +264,7 @@ def _apply_temperatures(
     dynatemp_maxs: torch.Tensor,
     dynatemp_exps: torch.Tensor,
 ) -> torch.Tensor:
-    dynatemp_mask = dynatemp_exps != 0
+    dynatemp_mask = (dynatemp_mins != 0) | (dynatemp_maxs != 0)
     dynatemp_mins = dynatemp_mins[dynatemp_mask]
     dynatemp_maxs = dynatemp_maxs[dynatemp_mask]
     dynatemp_exps = dynatemp_exps[dynatemp_mask]
@@ -295,7 +281,7 @@ def _apply_temperatures(
                 normalized_entropies.pow_(dynatemp_exps))
 
     temperatures[dynatemp_mask] = dyn_temp
-    temperatures[temperatures <= 0.0] = 1.0
+    temperatures[(temperatures <= 0.0) | (temperatures != temperatures)] = 1.0
     logits.div_(temperatures.unsqueeze(dim=1))
     return logits
 
@@ -356,7 +342,19 @@ def _apply_temperatures(
 
 
 def _apply_token_bans(logits: torch.Tensor,
-                      banned_tokens: List[List[int]]) -> torch.Tensor:
+                      sampling_metadata: SamplingMetadata) -> torch.Tensor:
+    assert sampling_metadata.seq_groups is not None
+    banned_tokens: List[List[int]] = []
+    for i, seq_group in enumerate(sampling_metadata.seq_groups):
+        sampling_params = sampling_metadata.seq_groups[i].sampling_params
+        seq_ids = seq_group.seq_ids
+        custom_token_bans = sampling_params.custom_token_bans
+        if (i < sampling_metadata.num_prompts
+                and sampling_params.prompt_logprobs is not None):
+            prompt_len = len(seq_group.prompt_logprob_indices)
+            banned_tokens += [custom_token_bans] * (prompt_len - 1)
+        banned_tokens += [custom_token_bans] * len(seq_ids)
+
     for i, banned_token_ids in enumerate(banned_tokens):
         if i >= logits.size(0):
             break

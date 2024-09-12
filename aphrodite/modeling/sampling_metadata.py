@@ -534,7 +534,8 @@ class SamplingTensors:
                 temperature_lasts += [temperature_last] * prefill_len
                 dynatemp_mins += [sampling_params.dynatemp_min] * prefill_len
                 dynatemp_maxs += [sampling_params.dynatemp_max] * prefill_len
-                dynatemp_exps += [sampling_params.dynatemp_exp] * prefill_len
+                dynatemp_exps += ([sampling_params.dynatemp_exponent] *
+                                  prefill_len)
                 top_ps += [top_p] * prefill_len
                 top_ks += [top_k] * prefill_len
                 top_as += [top_a] * prefill_len
@@ -561,7 +562,8 @@ class SamplingTensors:
                 temperature_lasts += [temperature_last] * len(seq_ids)
                 dynatemp_mins += [sampling_params.dynatemp_min] * len(seq_ids)
                 dynatemp_maxs += [sampling_params.dynatemp_max] * len(seq_ids)
-                dynatemp_exps += [sampling_params.dynatemp_exp] * len(seq_ids)
+                dynatemp_exps += ([sampling_params.dynatemp_exponent] *
+                                  len(seq_ids))
                 top_ps += [top_p] * len(seq_ids)
                 top_ks += [top_k] * len(seq_ids)
                 top_as += [top_a] * len(seq_ids)
