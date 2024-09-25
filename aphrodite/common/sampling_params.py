@@ -159,9 +159,6 @@ class SamplingParams:
         dynatemp_max: float = 0.0,
         dynatemp_exponent: float = 1.0,
         temperature_last: bool = False,
-        dynatemp_min: float = 0.0,
-        dynatemp_max: float = 0.0,
-        dynatemp_exponent: float = 1.0,
         top_p: float = 1.0,
         top_k: int = -1,
         top_a: float = 0.0,
@@ -209,9 +206,6 @@ class SamplingParams:
         self.dynatemp_max = dynatemp_max
         self.dynatemp_exponent = dynatemp_exponent
         self.temperature_last = temperature_last
-        self.dynatemp_min = dynatemp_min
-        self.dynatemp_max = dynatemp_max
-        self.dynatemp_exponent = dynatemp_exponent
         self.top_p = top_p
         self.top_k = top_k
         self.top_a = top_a
@@ -271,9 +265,6 @@ class SamplingParams:
             "dynatemp_max": 0.0,
             "dynatemp_exponent": 1.0,
             "temperature_last": False,
-            "dynatemp_min": 0.0,
-            "dynatemp_max": 0.0,
-            "dynatemp_exponent": 1.0,
             "top_p": 1.0,
             "top_k": -1,
             "top_a": 0.0,
