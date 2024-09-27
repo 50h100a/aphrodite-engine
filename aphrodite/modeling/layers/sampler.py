@@ -174,8 +174,7 @@ class Sampler(nn.Module):
 
         if do_xtc:
             logits = _apply_xtc_sampling(
-                logits, sampling_tensors.xtc_thresholds,
-                sampling_tensors.xtc_probabilities)
+                logits, sampling_tensors.xtc_thresholds)
 
         if do_temperatures and do_temp_last:
             _apply_temperatures(logits, sampling_tensors.temperatures,
@@ -527,8 +526,7 @@ def _apply_quadratic_sampling(
 
 def _apply_xtc_sampling(
     logits: torch.Tensor,
-    xtc_thresholds: torch.Tensor,
-    xtc_probabilities: torch.Tensor,
+    xtc_thresholds: torch.Tensor
 ) -> torch.Tensor:
     """Apply Exclude Top Choices (XTC) sampling to the logits.
     Reference: https://github.com/oobabooga/text-generation-webui/pull/6335
@@ -542,7 +540,7 @@ def _apply_xtc_sampling(
     Returns:
         torch.Tensor: The modified logits.
     """
-    apply_xtc = torch.rand_like(xtc_probabilities) < xtc_probabilities
+    apply_xtc = xtc_thresholds < 1
 
     if not apply_xtc.any():
         return logits

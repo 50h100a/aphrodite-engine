@@ -385,7 +385,6 @@ class SamplingTensors:
     smoothing_factors: torch.Tensor
     smoothing_curves: torch.Tensor
     xtc_thresholds: torch.Tensor
-    xtc_probabilities: torch.Tensor
     sampling_seeds: torch.Tensor
     sample_indices: torch.Tensor
     extra_seeds: Optional[torch.Tensor]
@@ -430,8 +429,7 @@ class SamplingTensors:
         smoothing_factors: List[float] = []
         smoothing_curves: List[float] = []
         xtc_thresholds: List[float] = []
-        xtc_probabilities: List[float] = []
-        sampling_seeds: List[int] = []
+        sampling_seeds: List[List[int]] = []
         sample_indices: List[int] = []
         do_penalties = False
         do_temperatures = False
@@ -543,28 +541,33 @@ class SamplingTensors:
                 xtc_probabilities += [xtc_probability] * prefill_len
 
             if seq_group.do_sample:
-                sample_lens = len(seq_group.sample_indices)
-                assert sample_lens == len(seq_ids)
-                temperatures += [temperature] * len(seq_ids)
-                dynatemp_mins += [dynatemp_min] * len(seq_ids)
-                dynatemp_maxs += [dynatemp_max] * len(seq_ids)
-                dynatemp_exps += [dynatemp_exp] * len(seq_ids)
-                temperature_lasts += [temperature_last] * len(seq_ids)
-                top_ps += [top_p] * len(seq_ids)
-                top_ks += [top_k] * len(seq_ids)
-                top_as += [top_a] * len(seq_ids)
-                min_ps += [min_p] * len(seq_ids)
-                presence_penalties += [p] * len(seq_ids)
-                frequency_penalties += [f] * len(seq_ids)
-                repetition_penalties += [r] * len(seq_ids)
-                tfss += [tfs] * len(seq_ids)
-                eta_cutoffs += [eta_cutoff] * len(seq_ids)
-                epsilon_cutoffs += [epsilon_cutoff] * len(seq_ids)
-                typical_ps += [typical_p] * len(seq_ids)
-                smoothing_factors += [smoothing_factor] * len(seq_ids)
-                smoothing_curves += [smoothing_curve] * len(seq_ids)
-                xtc_thresholds += [xtc_threshold] * len(seq_ids)
-                xtc_probabilities += [xtc_probability] * len(seq_ids)
+                assert len(seq_group.sample_indices) == len(seq_ids)
+                n_seqs += len(seq_ids)
+
+            temperatures += [temperature] * n_seqs
+            dynatemp_mins += [params.dynatemp_min] * n_seqs
+            dynatemp_maxs += [params.dynatemp_max] * n_seqs
+            dynatemp_exps += [params.dynatemp_exponent] * n_seqs
+            temperature_lasts += [params.temperature_last] * n_seqs
+            top_ps += [params.top_p] * n_seqs
+            top_ks += [top_k] * n_seqs
+            top_as += [params.top_a] * n_seqs
+            min_ps += [params.min_p] * n_seqs
+            presence_penalties += [params.presence_penalty] * n_seqs
+            frequency_penalties += [params.frequency_penalty] * n_seqs
+            repetition_penalties += [params.repetition_penalty] * n_seqs
+            tfss += [params.tfs] * n_seqs
+            eta_cutoffs += [params.eta_cutoff] * n_seqs
+            epsilon_cutoffs += [params.epsilon_cutoff] * n_seqs
+            typical_ps += [params.typical_p] * n_seqs
+            smoothing_factors += [params.smoothing_factor] * n_seqs
+            smoothing_curves += [params.smoothing_curve] * n_seqs
+
+            xtc_passes = (torch.rand(n_seqs, generator=seq_group.generator,
+                                     device=device) <
+                          params.xtc_probability).tolist()
+            xtc_thresholds += [max(params.xtc_threshold, _SAMPLING_EPS) if x else 1
+                               for x in xtc_passes]
 
             if _USE_TRITON_SAMPLER:
                 if is_prompt:
@@ -609,7 +612,7 @@ class SamplingTensors:
             temperature_lasts, top_ps, top_ks, top_as, min_ps,
             presence_penalties, frequency_penalties, repetition_penalties,
             tfss, eta_cutoffs, epsilon_cutoffs, typical_ps, smoothing_factors,
-            smoothing_curves, xtc_thresholds, xtc_probabilities,sampling_seeds,
+            smoothing_curves, xtc_thresholds, sampling_seeds,
             sample_indices, prompt_tokens, output_tokens, vocab_size,
             extra_seeds_to_generate, device, dtype)
         return (sampling_tensors, do_penalties, do_temperatures,
@@ -628,7 +631,7 @@ class SamplingTensors:
                    eta_cutoffs: List[float], epsilon_cutoffs: List[float],
                    typical_ps: List[float], smoothing_factors: List[float],
                    smoothing_curves: List[float], xtc_thresholds: List[float],
-                   xtc_probabilities: List[float], sampling_seeds: List[int],
+                   sampling_seeds: List[List[int]],
                    sample_indices: List[int], prompt_tokens: List[array],
                    output_tokens: List[array], vocab_size: int,
                    extra_seeds_to_generate: int, device: torch.device,
@@ -756,10 +759,6 @@ class SamplingTensors:
                                         device="cpu",
                                         dtype=dtype,
                                         pin_memory=pin_memory)
-        xtc_probabilities_t = torch.tensor(xtc_probabilities,
-                                           device="cpu",
-                                           dtype=dtype,
-                                           pin_memory=pin_memory)
         sample_indices_t = torch.tensor(
             sample_indices,
             device="cpu",
@@ -814,8 +813,6 @@ class SamplingTensors:
                                                    non_blocking=True),
             xtc_thresholds=xtc_thresholds_t.to(device=device,
                                                non_blocking=True),
-            xtc_probabilities=xtc_probabilities_t.to(device=device,
-                                                     non_blocking=True),
             typical_ps=typical_ps_t.to(device=device, non_blocking=True),
             prompt_tokens=prompt_t.to(device=device, non_blocking=True),
             output_tokens=output_t.to(device=device, non_blocking=True),
