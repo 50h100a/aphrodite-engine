@@ -385,7 +385,6 @@ class SamplingTensors:
     smoothing_factors: torch.Tensor
     smoothing_curves: torch.Tensor
     xtc_thresholds: torch.Tensor
-    xtc_probabilities: torch.Tensor
     sampling_seeds: torch.Tensor
     sample_indices: torch.Tensor
     extra_seeds: Optional[torch.Tensor]
@@ -430,7 +429,6 @@ class SamplingTensors:
         smoothing_factors: List[float] = []
         smoothing_curves: List[float] = []
         xtc_thresholds: List[float] = []
-        xtc_probabilities: List[float] = []
         sampling_seeds: List[List[int]] = []
         sample_indices: List[int] = []
         do_penalties = False
@@ -518,8 +516,12 @@ class SamplingTensors:
             typical_ps += [params.typical_p] * n_seqs
             smoothing_factors += [params.smoothing_factor] * n_seqs
             smoothing_curves += [params.smoothing_curve] * n_seqs
-            xtc_thresholds += [params.xtc_threshold] * n_seqs
-            xtc_probabilities += [params.xtc_probability] * n_seqs
+
+            xtc_passes = (torch.rand(n_seqs, generator=seq_group.generator,
+                                     device=device) <
+                          params.xtc_probability).tolist()
+            xtc_thresholds += [max(params.xtc_threshold, _SAMPLING_EPS) if x else 1
+                               for x in xtc_passes]
 
             if _USE_TRITON_SAMPLER:
                 if is_prompt:
@@ -564,7 +566,7 @@ class SamplingTensors:
             temperature_lasts, top_ps, top_ks, top_as, min_ps,
             presence_penalties, frequency_penalties, repetition_penalties,
             tfss, eta_cutoffs, epsilon_cutoffs, typical_ps, smoothing_factors,
-            smoothing_curves, xtc_thresholds, xtc_probabilities, sampling_seeds,
+            smoothing_curves, xtc_thresholds, sampling_seeds,
             sample_indices, prompt_tokens, output_tokens, vocab_size,
             extra_seeds_to_generate, device, dtype)
         return (sampling_tensors, do_penalties, do_temperatures,
@@ -583,7 +585,6 @@ class SamplingTensors:
                    eta_cutoffs: List[float], epsilon_cutoffs: List[float],
                    typical_ps: List[float], smoothing_factors: List[float],
                    smoothing_curves: List[float], xtc_thresholds: List[float],
-                   xtc_probabilities: List[float],
                    sampling_seeds: List[List[int]],
                    sample_indices: List[int], prompt_tokens: List[array],
                    output_tokens: List[array], vocab_size: int,
@@ -712,10 +713,6 @@ class SamplingTensors:
                                         device="cpu",
                                         dtype=dtype,
                                         pin_memory=pin_memory)
-        xtc_probabilities_t = torch.tensor(xtc_probabilities,
-                                           device="cpu",
-                                           dtype=dtype,
-                                           pin_memory=pin_memory)
         sample_indices_t = torch.tensor(
             sample_indices,
             device="cpu",
@@ -770,8 +767,6 @@ class SamplingTensors:
                                                    non_blocking=True),
             xtc_thresholds=xtc_thresholds_t.to(device=device,
                                                non_blocking=True),
-            xtc_probabilities=xtc_probabilities_t.to(device=device,
-                                                     non_blocking=True),
             typical_ps=typical_ps_t.to(device=device, non_blocking=True),
             prompt_tokens=prompt_t.to(device=device, non_blocking=True),
             output_tokens=output_t.to(device=device, non_blocking=True),

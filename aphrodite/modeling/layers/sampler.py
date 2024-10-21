@@ -133,8 +133,6 @@ class Sampler(nn.Module):
         do_xtc = self._do_xtc
         do_temp_last = self._do_temp_last
 
-        logits = _apply_min_tokens_penalty(logits, sampling_metadata)
-
         # Apply presence and frequency penalties.
         if do_penalties:
             logits = _apply_penalties(logits, sampling_tensors.prompt_tokens,
@@ -181,8 +179,7 @@ class Sampler(nn.Module):
 
         if do_xtc:
             logits = _apply_xtc_sampling(
-                logits, sampling_tensors.xtc_thresholds,
-                sampling_tensors.xtc_probabilities)
+                logits, sampling_tensors.xtc_thresholds)
 
         if do_temperatures and do_temp_last:
             _apply_temperatures(logits, sampling_tensors.temperatures,
@@ -190,8 +187,7 @@ class Sampler(nn.Module):
                                 sampling_tensors.dynatemp_maxs,
                                 sampling_tensors.dynatemp_exps)
 
-        banned_tokens = _get_custom_token_bans(sampling_metadata)
-        logits = _apply_token_bans(logits, banned_tokens)
+        logits = _apply_token_bans(logits, sampling_metadata)
 
         # We use float32 for probabilities and log probabilities.
         # Compute the probabilities.
@@ -262,20 +258,6 @@ def _get_bin_counts_and_mask(
     return bin_counts, mask
 
 
-def _get_custom_token_bans(
-        sampling_metadata: SamplingMetadata) -> List[List[int]]:
-    assert sampling_metadata.seq_groups is not None
-    banned_tokens: List[List[int]] = []
-    for i, seq_group in enumerate(sampling_metadata.seq_groups):
-        sampling_params = sampling_metadata.seq_groups[i].sampling_params
-        seq_ids = seq_group.seq_ids
-        custom_token_bans = sampling_params.custom_token_bans
-        if (i < sampling_metadata.num_prompts
-                and sampling_params.prompt_logprobs is not None):
-            prompt_len = len(seq_group.prompt_logprob_indices)
-            banned_tokens += [custom_token_bans] * (prompt_len - 1)
-        banned_tokens += [custom_token_bans] * len(seq_ids)
-    return banned_tokens
 
 
 def _apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
@@ -337,7 +319,19 @@ def _apply_temperatures(
 
 
 def _apply_token_bans(logits: torch.Tensor,
-                      banned_tokens: List[List[int]]) -> torch.Tensor:
+                      sampling_metadata: SamplingMetadata) -> torch.Tensor:
+    assert sampling_metadata.seq_groups is not None
+    banned_tokens: List[List[int]] = []
+    for i, seq_group in enumerate(sampling_metadata.seq_groups):
+        sampling_params = sampling_metadata.seq_groups[i].sampling_params
+        seq_ids = seq_group.seq_ids
+        custom_token_bans = sampling_params.custom_token_bans
+        if (i < sampling_metadata.num_prompts
+                and sampling_params.prompt_logprobs is not None):
+            prompt_len = len(seq_group.prompt_logprob_indices)
+            banned_tokens += [custom_token_bans] * (prompt_len - 1)
+        banned_tokens += [custom_token_bans] * len(seq_ids)
+
     for i, banned_token_ids in enumerate(banned_tokens):
         if i >= logits.size(0):
             break
@@ -345,54 +339,6 @@ def _apply_token_bans(logits: torch.Tensor,
             continue
         logits[i, banned_token_ids] = -float("inf")
     return logits
-
-
-def _apply_min_tokens_penalty(
-    logits: torch.Tensor,
-    sampling_metadata: SamplingMetadata,
-) -> torch.Tensor:
-    """Apply min_tokens penalty which sets stop tokens to -inf if min_tokens
-        have not been generated yet
-    """
-    # list of indices in logits that will be set to -inf
-    logits_to_penalize = []
-    logits_applied = 0
-    for seq_group in sampling_metadata.seq_groups:
-        seq_ids = seq_group.seq_ids
-        sampling_params = seq_group.sampling_params
-
-        sample_indices = seq_group.sample_indices
-        logits_applied += len(sample_indices) + len(
-            seq_group.prompt_logprob_indices)
-        if not seq_group.do_sample:
-            continue
-
-        start_idx = sample_indices[0]
-        min_tokens = sampling_params.min_tokens
-        token_ids_to_penalize = sampling_params.all_stop_token_ids
-        if min_tokens > 0 and token_ids_to_penalize:
-            seqs_to_penalize = []
-            for j, seq_id in enumerate(seq_ids):
-                seq_data = seq_group.seq_data[seq_id]
-                if len(seq_data.output_token_ids_array) < min_tokens:
-                    seqs_to_penalize.append(j)
-
-            if seqs_to_penalize:
-                # convert to the index into logits
-                seqs_to_penalize = [start_idx + j for j in seqs_to_penalize]
-                # itertools.product pairs each seq index with every token id
-                logits_to_penalize.extend(
-                    itertools.product(seqs_to_penalize, token_ids_to_penalize))
-
-    if logits_to_penalize:
-        # use zip and * to group indices along each dimension
-        # eg. [ (1,2), (1,3), (5,6) ] -> ( (1,1,5), (2,3,6) )
-        logits[tuple(zip(*logits_to_penalize))] = -float("inf")
-
-    # verifies that no rows in logits were missed unexpectedly
-    assert logits_applied == logits.shape[0]
-    return logits
-
 
 def _apply_top_k_top_p(
     logits: torch.Tensor,
@@ -592,8 +538,7 @@ def _apply_quadratic_sampling(
 
 def _apply_xtc_sampling(
     logits: torch.Tensor,
-    xtc_thresholds: torch.Tensor,
-    xtc_probabilities: torch.Tensor,
+    xtc_thresholds: torch.Tensor
 ) -> torch.Tensor:
     """Apply Exclude Top Choices (XTC) sampling to the logits.
     Reference: https://github.com/oobabooga/text-generation-webui/pull/6335
@@ -607,7 +552,7 @@ def _apply_xtc_sampling(
     Returns:
         torch.Tensor: The modified logits.
     """
-    apply_xtc = torch.rand_like(xtc_probabilities) < xtc_probabilities
+    apply_xtc = xtc_thresholds < 1
 
     if not apply_xtc.any():
         return logits
