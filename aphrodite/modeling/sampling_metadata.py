@@ -379,7 +379,6 @@ class SamplingTensors:
     smoothing_factors: torch.Tensor
     smoothing_curves: torch.Tensor
     xtc_thresholds: torch.Tensor
-    xtc_probabilities: torch.Tensor
     nsigmas: torch.Tensor
     dry_multipliers: torch.Tensor
     dry_bases: torch.Tensor
@@ -424,7 +423,6 @@ class SamplingTensors:
         smoothing_factors: List[float] = []
         smoothing_curves: List[float] = []
         xtc_thresholds: List[float] = []
-        xtc_probabilities: List[float] = []
         nsigmas: List[float] = []
         dry_multipliers: List[float] = []
         dry_bases: List[float] = []
@@ -523,8 +521,12 @@ class SamplingTensors:
             typical_ps += [params.typical_p] * n_seqs
             smoothing_factors += [params.smoothing_factor] * n_seqs
             smoothing_curves += [params.smoothing_curve] * n_seqs
-            xtc_thresholds += [params.xtc_threshold] * n_seqs
-            xtc_probabilities += [params.xtc_probability] * n_seqs
+
+            xtc_passes = (torch.rand(n_seqs, generator=seq_group.generator,
+                                     device=device) <
+                          params.xtc_probability).tolist()
+            xtc_thresholds += [max(params.xtc_threshold, _SAMPLING_EPS) if x else 1
+                               for x in xtc_passes]
             nsigmas += [params.nsigma] * n_seqs
             dry_multipliers += [params.dry_multiplier] * n_seqs
             dry_bases += [params.dry_base] * n_seqs
@@ -577,7 +579,6 @@ class SamplingTensors:
             smoothing_factors,
             smoothing_curves,
             xtc_thresholds,
-            xtc_probabilities,
             nsigmas,
             dry_multipliers,
             dry_bases,
@@ -635,7 +636,6 @@ class SamplingTensors:
         smoothing_factors: List[float],
         smoothing_curves: List[float],
         xtc_thresholds: List[float],
-        xtc_probabilities: List[float],
         nsigmas: List[float],
         dry_multipliers: List[float],
         dry_bases: List[float],
@@ -780,10 +780,6 @@ class SamplingTensors:
                                         device="cpu",
                                         dtype=dtype,
                                         pin_memory=pin_memory)
-        xtc_probabilities_t = torch.tensor(xtc_probabilities,
-                                           device="cpu",
-                                           dtype=dtype,
-                                           pin_memory=pin_memory)
         nsigmas_t = torch.tensor(nsigmas,
                                  device="cpu",
                                  dtype=dtype,
@@ -876,8 +872,6 @@ class SamplingTensors:
                                                    non_blocking=True),
             xtc_thresholds=xtc_thresholds_t.to(device=device,
                                                non_blocking=True),
-            xtc_probabilities=xtc_probabilities_t.to(device=device,
-                                                     non_blocking=True),
             nsigmas=nsigmas_t.to(device=device, non_blocking=True),
             dry_multipliers=dry_multipliers_t.to(device=device,
                                                  non_blocking=True),
