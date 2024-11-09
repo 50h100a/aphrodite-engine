@@ -191,9 +191,10 @@ class Sampler(nn.Module):
 
         # We use float32 for probabilities and log probabilities.
         # Compute the probabilities.
-        probs = torch.softmax(logits, dim=-1, dtype=torch.float)
+        probs = torch.softmax(logits, dim=-1).to(dtype=torch.float16)
         # Compute the log probabilities.
-        logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
+        logprobs = torch.log_softmax(logits, dim=-1).to(dtype=torch.float16)
+        del logits
 
         # Sample the next tokens.
         sample_results, maybe_sampled_tokens_tensor = _sample(
@@ -961,7 +962,7 @@ def _sample(
     #                                   sampling_tensors)
 
 
-def _get_ranks(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+def _get_ranks(logprobs: torch.Tensor, query_indices: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     """
     This function calculates the ranks of the chosen tokens in a logprob tensor.
     Args:
@@ -973,11 +974,16 @@ def _get_ranks(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
                     Each element in the returned tensor represents the rank 
                     of the chosen token in the input logprob tensor.
     """
-    vals = x[torch.arange(0, len(x), device=x.device, dtype=indices.dtype),
-             indices]
-    return (x > vals[:, None]).long().sum(1).add_(1)
+    expanded_indices = torch.zeros(logprobs.shape[0], dtype=indices.dtype, device=indices.device)
+    expanded_indices.scatter_(-1, query_indices, indices)
+    vals = torch.gather(logprobs, -1, expanded_indices.unsqueeze(dim=1))
+    # doing this in a single pass is not practical for prompt logprobs.
+    outs = torch.zeros_like(indices)
+    for i in range(0, vals.shape[0], 10):
+        outs[i:i+10] = (logprobs[i:i+10] > vals[i:i+10]).sum(dim=-1, dtype=indices.dtype)
+    return outs[query_indices].add_(1)
 
-
+# logprobs[query_indices_gpu]
 def _get_logprobs(
     logprobs: torch.Tensor,
     sampling_metadata: SamplingMetadata,
@@ -1032,7 +1038,8 @@ def _get_logprobs(
             next_prompt_tokens = _get_next_prompt_tokens(seq_group)
             query_indices.extend(seq_group.prompt_logprob_indices)
             next_token_ids.extend(next_prompt_tokens)
-
+            assert len(next_prompt_tokens) == len(seq_group.prompt_logprob_indices), f"{len(next_prompt_tokens)} vs {len(seq_group.prompt_logprob_indices)}"
+            
         # Update indices and next tokenes for sample logprob.
         if seq_group.do_sample:
             token_ids, parent_seq_ids = sample_result
@@ -1044,6 +1051,7 @@ def _get_logprobs(
             query_indices.extend(
                 [query_idx + parent_id for parent_id in parent_seq_ids])
             next_token_ids.extend(token_ids)
+            assert len(token_ids) == len(parent_seq_ids), f"{len(token_ids)} vs {len(parent_seq_ids)}"
 
             if sampling_params.logprobs is not None:
                 largest_num_logprobs = max(largest_num_logprobs,
@@ -1051,7 +1059,7 @@ def _get_logprobs(
 
             use_beam_search = use_beam_search or sampling_params.use_beam_search
 
-        assert len(next_token_ids) == len(query_indices)
+        assert len(next_token_ids) == len(query_indices), f"{len(next_token_ids)} vs {len(query_indices)}"
 
     if len(query_indices) == 0:
         empty_sampled_logprob = []
@@ -1075,7 +1083,8 @@ def _get_logprobs(
             next_token_ids_gpu,
         ]]
         ranks = _get_ranks(
-            logprobs[query_indices_gpu],
+            logprobs,
+            query_indices_gpu,
             next_token_ids_gpu,
         )
         assert selected_logprobs.shape[0] == ranks.shape[0]
@@ -1342,7 +1351,7 @@ def _build_sampler_output(
     )
 
 
-def _get_next_prompt_tokens(seq_group: SequenceGroupToSample) -> List[str]:
+def _get_next_prompt_tokens(seq_group: SequenceGroupToSample) -> Tuple[int, ...]:
     """Get a list of next prompt tokens to compute logprob from a
         given sequence group.
     It is used to compute prompt logprob. Imagine you have logprob for each
