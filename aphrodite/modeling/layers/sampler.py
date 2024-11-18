@@ -194,10 +194,12 @@ class Sampler(nn.Module):
         logits = _apply_token_bans(logits, banned_tokens)
 
         # We use float32 for probabilities and log probabilities.
-        # Compute the probabilities.
-        probs = torch.softmax(logits, dim=-1, dtype=torch.float)
         # Compute the log probabilities.
-        logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
+        logprobs = torch.log_softmax(logits, dim=-1,
+                                     dtype=torch.float).to(logits.dtype)
+        del logits
+        # Compute the probabilities.
+        probs = logprobs.exp()
 
         # Sample the next tokens.
         sample_results, maybe_sampled_tokens_tensor = _sample(
@@ -1016,7 +1018,7 @@ def _sample(
     #                                   sampling_tensors)
 
 
-def _get_ranks(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+def _get_ranks(logprobs: torch.Tensor, query_indices: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     """
     This function calculates the ranks of the chosen tokens in a logprob tensor.
     Args:
@@ -1028,11 +1030,16 @@ def _get_ranks(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
                     Each element in the returned tensor represents the rank 
                     of the chosen token in the input logprob tensor.
     """
-    vals = x[torch.arange(0, len(x), device=x.device, dtype=indices.dtype),
-             indices]
-    return (x > vals[:, None]).long().sum(1).add_(1)
+    expanded_indices = torch.zeros(logprobs.shape[0], dtype=indices.dtype, device=indices.device)
+    expanded_indices.scatter_(-1, query_indices, indices)
+    vals = torch.gather(logprobs, -1, expanded_indices.unsqueeze(dim=1))
+    # doing this in a single pass is not practical for prompt logprobs.
+    outs = torch.zeros_like(indices)
+    for i in range(0, vals.shape[0], 10):
+        outs[i:i+10] = (logprobs[i:i+10] > vals[i:i+10]).sum(dim=-1, dtype=indices.dtype)
+    return outs[query_indices].add_(1)
 
-
+# logprobs[query_indices_gpu]
 def _get_logprobs(
     logprobs: torch.Tensor,
     sampling_metadata: SamplingMetadata,
@@ -1130,7 +1137,8 @@ def _get_logprobs(
             next_token_ids_gpu,
         ]]
         ranks = _get_ranks(
-            logprobs[query_indices_gpu],
+            logprobs,
+            query_indices_gpu,
             next_token_ids_gpu,
         )
         assert selected_logprobs.shape[0] == ranks.shape[0]
