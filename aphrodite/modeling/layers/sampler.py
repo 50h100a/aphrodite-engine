@@ -292,7 +292,7 @@ class Sampler(nn.Module):
         do_skew = self._do_skew
         do_temp_last = self._do_temp_last
 
-        logits = _apply_token_bans(logits, banned_tokens)
+        logits = _apply_token_bans(logits, sampling_metadata)
 
         sampler_order = None
         if sampling_metadata.seq_groups:
