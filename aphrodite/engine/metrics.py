@@ -366,16 +366,16 @@ class LoggingStatLogger(StatLoggerBase):
                     now=stats.now,
                     last_log=self.last_local_log)
 
-            # Log to stdout.
-            logger.info(
-                f"Prompt:{prompt_throughput:8.1f} t/s, "
-                f"Output:{generation_throughput:7.1f} t/s. "
-                f"Requests:{stats.num_running_sys:3d} running,"
-                f"{stats.num_swapped_sys:3d} swapped,"
-                f"{stats.num_waiting_sys:3d} pending. "
-                f"KV Cache: GPU{stats.gpu_cache_usage_sys * 100:3.0f}%, "
-                f"CPU{stats.cpu_cache_usage_sys * 100:3.0f}%."
-            )
+                # Log to stdout.
+                logger.info(
+                    f"Prompt:{prompt_throughput:8.1f} t/s, "
+                    f"Output:{generation_throughput:7.1f} t/s. "
+                    f"Requests:{stats.num_running_sys:3d} running,"
+                    f"{stats.num_swapped_sys:3d} swapped,"
+                    f"{stats.num_waiting_sys:3d} pending. "
+                    f"KV Cache: GPU{stats.gpu_cache_usage_sys * 100:3.0f}%, "
+                    f"CPU{stats.cpu_cache_usage_sys * 100:3.0f}%."
+                )
 
                 if (stats.cpu_prefix_cache_hit_rate >= 0
                         or stats.gpu_prefix_cache_hit_rate >= 0):
