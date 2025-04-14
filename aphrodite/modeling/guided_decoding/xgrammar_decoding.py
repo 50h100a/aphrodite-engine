@@ -125,17 +125,19 @@ class GrammarCompilerCache:
             # In TokenizerDataCache.get_tokenizer_data, a serializable
             # tokenizer_data is created and cached. This data is used to build
             # a tokenizer_info and create an xgrammar compiler.
-            # - If tokenizer_data has backend_str set, use
-            # xgr_core.TokenizerInfo.from_huggingface (a C++ bind).
-            # - Otherwise, use the default constructor with vocab_type.
-            # - xgr_core.TokenizerInfo.from_huggingface !=
-            #   xgr.TokenizerInfo.from_huggingface.
             if config_data.backend_str:
-                tokenizer_info = xgr.TokenizerInfo._create_from_handle(
-                    xgr_core.TokenizerInfo.from_huggingface(
-                        config_data.encoded_vocab, config_data.backend_str,
-                        config.vocab_size, config_data.stop_token_ids))
+                metadata = xgr.TokenizerInfo._detect_metadata_from_hf(
+                    config_data.backend_str)
+                tokenizer_info = xgr.TokenizerInfo(
+                    config_data.encoded_vocab,
+                    vocab_type=metadata["vocab_type"],
+                    vocab_size=config.vocab_size,
+                    stop_token_ids=config_data.stop_token_ids,
+                    add_prefix_space=metadata["add_prefix_space"],
+                )
+
             else:
+                assert config_data.vocab_type is not None
                 tokenizer_info = xgr.TokenizerInfo(
                     config_data.encoded_vocab,
                     config_data.vocab_type,
