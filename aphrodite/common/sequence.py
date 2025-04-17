@@ -1,6 +1,7 @@
 """Sequence and its related classes."""
 import copy
 import enum
+import math
 from abc import ABC, abstractmethod
 from array import array
 from collections import defaultdict
@@ -66,6 +67,7 @@ class SequenceStatus(enum.IntEnum):
     FINISHED_LENGTH_CAPPED = 4
     FINISHED_ABORTED = 5
     FINISHED_IGNORED = 6
+    FINISHED_CONSTRAINT = 7
 
     @staticmethod
     def is_finished(status: "SequenceStatus") -> bool:
@@ -84,6 +86,8 @@ class SequenceStatus(enum.IntEnum):
             # are longer than the model's length cap. Therefore, the stop
             # reason should also be "length" as in OpenAI API.
             finish_reason = "length"
+        elif status == SequenceStatus.FINISHED_CONSTRAINT:
+            finish_reason = "constraint"
         else:
             finish_reason = None
         return finish_reason
@@ -267,7 +271,8 @@ class SequenceData(msgspec.Struct,
         self._output_token_ids.append(token_id)
         self._new_appended_tokens.append(token_id)
         self._cached_all_token_ids.append(token_id)
-        self._cumulative_logprob += logprob
+        if math.isfinite(logprob):
+            self._cumulative_logprob += logprob
 
     def get_len(self) -> int:
         return len(self._output_token_ids) + len(self._prompt_token_ids)
