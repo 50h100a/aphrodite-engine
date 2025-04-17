@@ -132,18 +132,14 @@ def _apply_logits_processors(
             for seq_id, logits_row_idx in zip(seq_ids,
                                               seq_group.sample_indices):
                 logits_row = logits[logits_row_idx]
-                past_tokens_ids = seq_group.seq_data[seq_id].output_token_ids
+                output_token_ids = seq_group.seq_data[seq_id].output_token_ids
                 prompt_tokens_ids = seq_group.seq_data[seq_id].prompt_token_ids
 
                 for logits_processor in logits_processors:
-                    parameters = inspect.signature(logits_processor).parameters
-                    if len(parameters) == 3:
-                        logits_row = logits_processor(prompt_tokens_ids,
-                                                      past_tokens_ids,
-                                                      logits_row)
-                    else:
-                        logits_row = logits_processor(past_tokens_ids,
-                                                      logits_row)
+                    logits_row = logits_processor(seq_id,
+                                                  prompt_tokens_ids,
+                                                  output_token_ids,
+                                                  logits_row)
 
                 logits[logits_row_idx] = logits_row
 

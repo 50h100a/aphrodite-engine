@@ -4,10 +4,10 @@ from typing import Dict, FrozenSet, Iterable, List, Optional, Union
 import torch
 from transformers import PreTrainedTokenizer
 
-from aphrodite.common.logits_processor import LogitsProcessor
+from aphrodite.common.sampling_params import LogitsProcessorBase
 
 
-class AllowedTokenIdsLogitsProcessor:
+class AllowedTokenIdsLogitsProcessor(LogitsProcessorBase):
     """Logits processor for constraining generated tokens to a
     specific set of token ids."""
 
@@ -15,7 +15,9 @@ class AllowedTokenIdsLogitsProcessor:
         self.allowed_ids: Optional[List[int]] = list(allowed_ids)
         self.mask: Optional[torch.Tensor] = None
 
-    def __call__(self, token_ids: List[int],
+    def __call__(self, seq_id:int,
+                 prompt_tokens: tuple[int, ...],
+                 output_tokens: tuple[int, ...],
                  logits: torch.Tensor) -> torch.Tensor:
         if self.mask is None:
             self.mask = torch.ones((logits.shape[-1], ),
@@ -31,7 +33,7 @@ class AllowedTokenIdsLogitsProcessor:
 def _get_allowed_token_ids_logits_processor(
     allowed_token_ids: FrozenSet[int],
     vocab_size: int,
-) -> LogitsProcessor:
+) -> LogitsProcessorBase:
     if not allowed_token_ids:
         raise ValueError("Empty allowed_token_ids provided")
     if not all(0 <= tid < vocab_size for tid in allowed_token_ids):
@@ -40,20 +42,23 @@ def _get_allowed_token_ids_logits_processor(
     return AllowedTokenIdsLogitsProcessor(allowed_token_ids)
 
 
-def logit_bias_logits_processor(
-    logit_bias: Dict[int, float],
-    token_ids: List[int],
-    logits: torch.Tensor,
-) -> torch.Tensor:
-    for token_id, bias in logit_bias.items():
-        logits[token_id] += bias
-    return logits
+class BiasProcessor(LogitsProcessorBase):
+    def __init__(self, logit_bias:Dict[int, float]):
+        self._bias = logit_bias
+
+    def __call__(self, seq_id:int,
+                 prompt_tokens: tuple[int, ...],
+                 output_tokens: tuple[int, ...],
+                 logits: torch.Tensor) -> torch.Tensor:
+        for token_id, bias in self._bias.items():
+            logits[token_id] += bias
+        return logits
 
 
 def get_logits_processors(
         logit_bias: Optional[Union[Dict[int, float], Dict[str, float]]],
         allowed_token_ids: Optional[List[int]],
-        tokenizer: PreTrainedTokenizer) -> List[LogitsProcessor]:
+        tokenizer: PreTrainedTokenizer) -> List[LogitsProcessorBase]:
     logits_processors = []
     if logit_bias:
         try:
@@ -74,8 +79,7 @@ def get_logits_processors(
                 raise ValueError("token_id in logit_bias contains "
                                  "out-of-vocab token id")
 
-        logits_processors.append(
-            partial(logit_bias_logits_processor, clamped_logit_bias))
+        logits_processors.append(BiasProcessor(clamped_logit_bias))
 
     if allowed_token_ids is not None:
         logits_processors.append(

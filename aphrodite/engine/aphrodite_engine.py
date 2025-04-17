@@ -21,11 +21,12 @@ from aphrodite.common.config import (CacheConfig, ConfigMixin, DecodingConfig,
                                      PromptAdapterConfig, SchedulerConfig,
                                      SpeculativeConfig)
 from aphrodite.common.logger import setup_logger
-from aphrodite.common.logits_processor import get_bad_words_logits_processors
 from aphrodite.common.outputs import (EmbeddingRequestOutput, RequestOutput,
                                       RequestOutputFactory)
 from aphrodite.common.pooling_params import PoolingParams
-from aphrodite.common.sampling_params import RequestOutputKind, SamplingParams
+from aphrodite.common.sampling_params import (RequestOutputKind,
+                                              SamplingParams,
+                                              LogitsProcessorBase)
 from aphrodite.common.sequence import (EmbeddingSequenceGroupOutput,
                                        ExecuteModelRequest,
                                        ParallelSampleSequenceGroup, Sequence,
@@ -1764,12 +1765,14 @@ class AphroditeEngine:
         logits_bias, and allowed_token_ids fields in sampling_params. Deletes
         those fields and adds the constructed logits processors to the
         logits_processors field. Returns the modified sampling params."""
-        logits_processors = []
+        logprocs:list[LogitsProcessorBase] = []
+
         if sampling_params.guided_decoding is not None:
             # Defensively copy sampling params since guided decoding logits
             # processors can have different state for each request
             sampling_params = copy.copy(sampling_params)
             guided_decoding = sampling_params.guided_decoding
+            assert guided_decoding is not None
             logger.debug(
                 "Building guided decoding logits processor in "
                 f"AphroditeEngine. Params: {guided_decoding}"
@@ -1784,9 +1787,10 @@ class AphroditeEngine:
                 model_config=self.model_config
             )
             if processor:
-                logits_processors.append(processor)
+                logprocs.append(processor)
             # Unset so this doesn't get passed down to the model
             sampling_params.guided_decoding = None
+
         if sampling_params.logit_bias or sampling_params.allowed_token_ids:
             tokenizer = self.get_tokenizer(lora_request=lora_request)
             processors = get_openai_logits_processors(
@@ -1794,22 +1798,16 @@ class AphroditeEngine:
                 allowed_token_ids=sampling_params.allowed_token_ids,
                 tokenizer=tokenizer,
             )
-            logits_processors.extend(processors)
+            logprocs.extend(processors)
             # Unset so these don't get passed down to the model
             sampling_params.logit_bias = None
             sampling_params.allowed_token_ids = None
 
-        if len(sampling_params.bad_words) > 0:
-            tokenizer = self.get_tokenizer(lora_request)
-            processors = get_bad_words_logits_processors(
-                bad_words=sampling_params.bad_words, tokenizer=tokenizer)
-            logits_processors.extend(processors)
+        if logprocs:
+            if not sampling_params.logits_processors:
+                sampling_params.logits_processors = []
+            sampling_params.logits_processors.extend(logprocs)
 
-        if logits_processors:
-            if sampling_params.logits_processors is None:
-                sampling_params.logits_processors = logits_processors
-            else:
-                sampling_params.logits_processors.extend(logits_processors)
         return sampling_params
 
 
