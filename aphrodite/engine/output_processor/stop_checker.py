@@ -40,6 +40,14 @@ class StopChecker:
            sequence's output text for the newly generated token
         """
 
+        last_token_id = seq.get_last_token_id()
+        if last_token_id == 0:
+            seq.status = SequenceStatus.FINISHED_CONSTRAINT
+            seq.data._output_token_ids.pop(-1)
+            seq.data._cached_all_token_ids.pop(-1)
+            seq.data._new_appended_tokens.pop(-1)
+            return
+
         # Check if the minimum number of tokens has been generated yet;
         # skip the stop string/token checks if not
         if seq.get_output_len() < sampling_params.min_tokens:
@@ -58,8 +66,7 @@ class StopChecker:
 
         # Check if a stop token was encountered.
         # This assumes a single token produced per step.
-        last_token_id = seq.get_last_token_id()
-        if last_token_id in sampling_params.stop_token_ids:
+        if last_token_id in (sampling_params.stop_token_ids or []):
             if new_char_count and (
                     not sampling_params.include_stop_str_in_output):
                 # Remove last token
