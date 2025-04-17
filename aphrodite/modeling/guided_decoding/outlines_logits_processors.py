@@ -36,14 +36,16 @@ class BaseLogitsProcessor:
         self._guide: Guide = guide
         self._fsm_state: DefaultDict[int, int] = defaultdict(int)
 
-    def __call__(self, input_ids: List[int],
+    def __call__(self, seq_id:int,
+                 prompt_tokens: tuple[int, ...],
+                 output_tokens: tuple[int, ...],
                  scores: torch.Tensor) -> torch.Tensor:
         """Use the FSM to bias the logits before sampling the next token."""
-        seq_id = hash(tuple(input_ids))
+        seq_id = hash(output_tokens)
 
-        if len(input_ids) > 0:
-            last_token = input_ids[-1]
-            last_seq_id = hash(tuple(input_ids[:-1]))
+        if len(output_tokens) > 0:
+            last_token = output_tokens[-1]
+            last_seq_id = hash(tuple(output_tokens[:-1]))
             self._fsm_state[seq_id] = self._guide.get_next_state(
                 state=self._fsm_state[last_seq_id], token_id=last_token)
         else:

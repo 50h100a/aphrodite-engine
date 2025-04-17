@@ -3,7 +3,8 @@ import copy
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from functools import cached_property
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from abc import ABC, abstractmethod
 
 import msgspec
 import torch
@@ -137,14 +138,23 @@ class SamplerID(IntEnum):
             ) from e
 
 
-LogitsProcessorFunc = Union[Callable[[List[int], torch.Tensor], torch.Tensor],
-                            Callable[[List[int], List[int], torch.Tensor],
-                                     torch.Tensor]]
-"""LogitsProcessor is a function that takes a list
-of previously generated tokens, the logits tensor
-for the next token and, optionally, prompt tokens as a
-first argument, and returns a modified tensor of logits
-to sample from."""
+
+class LogitsProcessorBase(ABC):
+    """A LogitsProcessor that modifies logit scores prior to running other
+    samplers for each token. It is recommended to edit the logits inplace.
+    
+    Q: Why a class instead of a function?
+    A: Function signatures are impossible to maintain because they cannot be
+    easily found for fixes and refactors. ABCs can be searched for."""
+
+    @abstractmethod
+    def __call__(self,
+                 seq_id:int,
+                 prompt_tokens: tuple[int, ...],
+                 output_tokens: tuple[int, ...],
+                 logits: torch.Tensor
+        ) -> torch.Tensor:
+        pass
 
 
 class SamplingParams(
@@ -345,10 +355,7 @@ class SamplingParams(
     token_ban_ranges: Optional[List[Tuple[List[int], int, int]]] = None
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
-    # Optional[List[LogitsProcessorFunc]] type.
-    # We use Any here because the type above
-    # is not supported by msgspec.
-    logits_processors: Optional[Any] = None
+    logits_processors: Optional[List[LogitsProcessorBase]] = None
     truncate_prompt_tokens: Optional[Annotated[int, msgspec.Meta(ge=1)]] = None
     xtc_threshold: float = 0.1
     xtc_probability: float = 0

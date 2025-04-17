@@ -10,8 +10,8 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 
     from aphrodite.common.config import ModelConfig
-    from aphrodite.common.logits_processor import LogitsProcessor
-    from aphrodite.common.sampling_params import GuidedDecodingParams
+    from aphrodite.common.sampling_params import (GuidedDecodingParams,
+                                                  LogitsProcessorBase)
 
 
 def maybe_backend_fallback(
@@ -41,7 +41,7 @@ def maybe_backend_fallback(
 
 async def get_guided_decoding_logits_processor(
         guided_params: GuidedDecodingParams, tokenizer: PreTrainedTokenizer,
-        model_config: ModelConfig) -> LogitsProcessor | None:
+        model_config: ModelConfig) -> LogitsProcessorBase | None:
     guided_params = maybe_backend_fallback(guided_params)
     # CFG grammar not supported by LMFE, so we use outlines instead
     if guided_params.backend == 'outlines':
@@ -67,7 +67,7 @@ async def get_guided_decoding_logits_processor(
 
 def get_local_guided_decoding_logits_processor(
         guided_params: GuidedDecodingParams, tokenizer: PreTrainedTokenizer,
-        model_config: ModelConfig) -> LogitsProcessor | None:
+        model_config: ModelConfig) -> LogitsProcessorBase | None:
     guided_params = maybe_backend_fallback(guided_params)
     # CFG grammar not supported by LMFE, so we use outlines instead
     if guided_params.backend == 'outlines':

@@ -18,6 +18,7 @@ except ImportError:
 from aphrodite.modeling.guided_decoding.utils import (convert_lark_to_gbnf,
                                                       grammar_is_likely_lark)
 from aphrodite.transformers_utils.tokenizers.mistral import MistralTokenizer
+from aphrodite.common.sampling_params import LogitsProcessorBase
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
@@ -253,15 +254,14 @@ class GrammarConfig:
 
 
 @dataclass
-class XGrammarLogitsProcessor:
+class XGrammarLogitsProcessor(LogitsProcessorBase):
     """Wrapper class to support pickle protocol"""
     config: GrammarConfig
 
     ctx: xgr.CompiledGrammar | None = None
     token_bitmask: torch.Tensor = None  # type: ignore[assignment]
-    matchers: list[xgr.GrammarMatcher] = field(default_factory=list)
-    batch_size: int = field(default=1)
-    prefilled: bool = field(default=False)
+    matchers: dict[int, xgr.GrammarMatcher] = field(default_factory=dict)
+    accepted_tokens: dict[int, int] = field(default_factory=dict)
 
     def __getstate__(self) -> dict[str, Any]:
         return {'config': self.config}
@@ -270,10 +270,9 @@ class XGrammarLogitsProcessor:
         self.config = state['config']
 
         self.ctx = None
-        self.matchers = []
-        self.batch_size = 1
+        self.matchers = {}
         self.token_bitmask = None  # type: ignore[assignment]
-        self.prefilled = False
+        self.accepted_tokens = {}
 
     def _ensure_ctx(self):
         """Lazily initialize the processor in the worker process"""
@@ -289,32 +288,34 @@ class XGrammarLogitsProcessor:
                 raise ValueError(
                     "Invalid configuration for xgrammar logits processor")
 
-    def __call__(self, input_ids: list[int],
+    def __call__(self,
+                 seq_id:int,
+                 prompt_tokens: list[int],
+                 output_tokens: list[int],
                  scores: torch.Tensor) -> torch.Tensor:
         if self.ctx is None:
             self._ensure_ctx()
-
-        if len(self.matchers) == 0:
-            self.matchers = [
-                xgr.GrammarMatcher(self.ctx) for _ in range(self.batch_size)
-            ]
             self.token_bitmask = xgr.allocate_token_bitmask(
-                self.batch_size, self.config.vocab_size)
+                batch_size=1,
+                vocab_size=self.config.vocab_size
+            )
 
-        if not self.prefilled:
-            # Have not sampled a token yet
-            self.prefilled = True
-        else:
-            for i, matcher in enumerate(self.matchers):
-                if not matcher.is_terminated():
-                    sampled_token = input_ids[-1]
-                    assert self.matchers[i].accept_token(sampled_token)
+        if seq_id not in self.matchers:
+            assert self.ctx is not None
+            self.matchers[seq_id] = xgr.GrammarMatcher(self.ctx)
+            self.accepted_tokens[seq_id] = 0
+            
+        matcher = self.matchers[seq_id]
+        for token in output_tokens[self.accepted_tokens[seq_id]:]:
+            if token and not matcher.is_terminated():
+                assert matcher.accept_token(token), f"Can't accept {repr(token)}"
 
-        for i, matcher in enumerate(self.matchers):
-            if not matcher.is_terminated():
-                # ideally, fill_next_token_bitmask should be
-                # parallelized with model decoding
-                matcher.fill_next_token_bitmask(self.token_bitmask, i)
+        self.accepted_tokens[seq_id] = len(output_tokens)
+            
+        if not matcher.is_terminated():
+            # ideally, fill_next_token_bitmask should be
+            # parallelized with model decoding
+            matcher.fill_next_token_bitmask(self.token_bitmask, 0)
 
         # token_bitmask is a CPU tensor for use with accept_token and
         # fill_next_token_bitmask so we move it to the device of scores

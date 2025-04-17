@@ -11,9 +11,10 @@ from transformers import PreTrainedTokenizerBase
 
 import aphrodite
 from aphrodite.transformers_utils.tokenizers.mistral import MistralTokenizer
+from aphrodite.common.sampling_params import LogitsProcessorBase
 
 
-class aphroditeLogitsProcessor:
+class aphroditeLogitsProcessor(LogitsProcessorBase):
 
     def __init__(self, token_enforcer: TokenEnforcer, analyze):
         self.token_enforcer = token_enforcer
@@ -21,12 +22,13 @@ class aphroditeLogitsProcessor:
             token_enforcer) if analyze else None
         self.mask: Optional[torch.Tensor] = None
 
-    def __call__(self, input_ids: List[int],
+    def __call__(self, seq_id:int,
+                 prompt_tokens: tuple[int, ...],
+                 output_tokens: tuple[int, ...],
                  scores: torch.Tensor) -> torch.Tensor:
-        token_sequence = input_ids
         if self.analyzer:
-            self.analyzer.report_raw_logits(token_sequence, scores.tolist())
-        allowed_tokens = self.token_enforcer.get_allowed_tokens(token_sequence)
+            self.analyzer.report_raw_logits(output_tokens, scores.tolist())
+        allowed_tokens = self.token_enforcer.get_allowed_tokens(output_tokens)
         if self.mask is not None:
             self.mask.fill_(-math.inf)
         else:

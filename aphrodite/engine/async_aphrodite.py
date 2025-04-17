@@ -480,6 +480,8 @@ async def build_guided_decoding_logits_processor_async(
     # processors can have different state for each request
     sampling_params = copy.copy(sampling_params)
     guided_decoding = sampling_params.guided_decoding
+    assert guided_decoding is not None
+    
     logger.debug(
         "Building guided decoding logits processor. "
         f"Params: {guided_decoding}"
