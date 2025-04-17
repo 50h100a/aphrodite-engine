@@ -261,7 +261,7 @@ class Sampler(nn.Module):
             sampling_metadata: Metadata for sampling.
         """
         assert logits is not None
-        _, vocab_size = logits.shape
+        # _, vocab_size = logits.shape
 
         # Prepare sampling tensors with pinned memory to avoid blocking.
         if not sampling_metadata.reuse_sampling_tensors:
@@ -613,18 +613,6 @@ def _get_bin_counts_and_mask(
     mask = bin_counts > 0
 
     return bin_counts, mask
-
-
-
-def _apply_token_bans(logits: torch.Tensor,
-                      banned_tokens: List[List[int]]) -> torch.Tensor:
-    for i, banned_token_ids in enumerate(banned_tokens):
-        if i >= logits.size(0):
-            break
-        if not banned_token_ids:
-            continue
-        logits[i, banned_token_ids] = -float("inf")
-    return logits
 
 
 def _apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
@@ -1516,7 +1504,7 @@ def _sample(
     )
 
 
-def _get_ranks(logprobs: torch.Tensor, query_indices: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+def _get_ranks(logprobs: torch.Tensor, query_indices: torch.Tensor, token_indices: torch.Tensor) -> torch.Tensor:
     """
     This function calculates the ranks of the chosen tokens in a logprob tensor.
     Args:
@@ -1528,13 +1516,13 @@ def _get_ranks(logprobs: torch.Tensor, query_indices: torch.Tensor, indices: tor
                     Each element in the returned tensor represents the rank
                     of the chosen token in the input logprob tensor.
     """
-    expanded_indices = torch.zeros(logprobs.shape[0], dtype=indices.dtype, device=indices.device)
-    expanded_indices.scatter_(-1, query_indices, indices)
+    expanded_indices = torch.zeros(logprobs.shape[0], dtype=token_indices.dtype, device=token_indices.device)
+    expanded_indices.scatter_(-1, query_indices, token_indices)
     vals = torch.gather(logprobs, -1, expanded_indices.unsqueeze(dim=1))
     # doing this in a single pass is not practical for prompt logprobs.
-    outs = torch.zeros_like(indices)
-    for i in range(0, vals.shape[0], 10):
-        outs[i:i+10] = (logprobs[i:i+10] > vals[i:i+10]).sum(dim=-1, dtype=indices.dtype)
+    outs = torch.zeros_like(token_indices)
+    for idx,querying in enumerate(query_indices):
+        outs[idx] = (logprobs[querying] > logprobs[querying][token_indices[idx]]).sum(dim=-1, dtype=token_indices.dtype)
     return outs[query_indices].add_(1)
 
 def get_logprobs(
