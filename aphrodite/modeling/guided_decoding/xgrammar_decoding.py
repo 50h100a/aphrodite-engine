@@ -3,22 +3,20 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, List
 
 import torch
 from transformers import PreTrainedTokenizerFast
 
-try:
+with suppress(ImportError):
     import xgrammar as xgr
-    from xgrammar.base import _core as xgr_core
-except ImportError:
-    pass
 
+from aphrodite.common.sampling_params import LogitsProcessorBase
 from aphrodite.modeling.guided_decoding.utils import (convert_lark_to_gbnf,
                                                       grammar_is_likely_lark)
 from aphrodite.transformers_utils.tokenizers.mistral import MistralTokenizer
-from aphrodite.common.sampling_params import LogitsProcessorBase
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
@@ -308,7 +306,8 @@ class XGrammarLogitsProcessor(LogitsProcessorBase):
         matcher = self.matchers[seq_id]
         for token in output_tokens[self.accepted_tokens[seq_id]:]:
             if token and not matcher.is_terminated():
-                assert matcher.accept_token(token), f"Can't accept {repr(token)}"
+                assert matcher.accept_token(token), \
+                        f"Can't accept {repr(token)}"
 
         self.accepted_tokens[seq_id] = len(output_tokens)
             

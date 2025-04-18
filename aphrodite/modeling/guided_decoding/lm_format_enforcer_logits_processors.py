@@ -1,6 +1,6 @@
 """The LM Format Enforcer logits processor."""
 import math
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 import torch
 from lmformatenforcer import (CharacterLevelParser, FormatEnforcerAnalyzer,
@@ -10,8 +10,8 @@ from lmformatenforcer.integrations.transformers import (
 from transformers import PreTrainedTokenizerBase
 
 import aphrodite
-from aphrodite.transformers_utils.tokenizers.mistral import MistralTokenizer
 from aphrodite.common.sampling_params import LogitsProcessorBase
+from aphrodite.transformers_utils.tokenizers.mistral import MistralTokenizer
 
 
 class aphroditeLogitsProcessor(LogitsProcessorBase):

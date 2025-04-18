@@ -24,9 +24,9 @@ from aphrodite.common.logger import setup_logger
 from aphrodite.common.outputs import (EmbeddingRequestOutput, RequestOutput,
                                       RequestOutputFactory)
 from aphrodite.common.pooling_params import PoolingParams
-from aphrodite.common.sampling_params import (RequestOutputKind,
-                                              SamplingParams,
-                                              LogitsProcessorBase)
+from aphrodite.common.sampling_params import (LogitsProcessorBase,
+                                              RequestOutputKind,
+                                              SamplingParams)
 from aphrodite.common.sequence import (EmbeddingSequenceGroupOutput,
                                        ExecuteModelRequest,
                                        ParallelSampleSequenceGroup, Sequence,

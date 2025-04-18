@@ -1,10 +1,10 @@
 """Sampling parameters for text generation."""
 import copy
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from functools import cached_property
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
-from abc import ABC, abstractmethod
 
 import msgspec
 from loguru import logger

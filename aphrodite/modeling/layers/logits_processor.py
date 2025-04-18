@@ -1,5 +1,4 @@
 """A layer that compute logits from hidden_stats."""
-import inspect
 from typing import Optional
 
 import torch

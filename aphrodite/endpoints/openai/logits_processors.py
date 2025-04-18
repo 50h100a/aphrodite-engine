@@ -1,4 +1,4 @@
-from functools import lru_cache, partial
+from functools import lru_cache
 from typing import Dict, FrozenSet, Iterable, List, Optional, Union
 
 import torch

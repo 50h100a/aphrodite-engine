@@ -525,7 +525,8 @@ class SamplingTensors:
             xtc_passes = (torch.rand(n_seqs, generator=seq_group.generator,
                                      device=device) <
                           params.xtc_probability).tolist()
-            xtc_thresholds += [max(params.xtc_threshold, _SAMPLING_EPS) if x else 1
+            xtc_thresholds += [max(params.xtc_threshold, _SAMPLING_EPS)
+                               if x else 1
                                for x in xtc_passes]
             nsigmas += [params.nsigma] * n_seqs
             dry_multipliers += [params.dry_multiplier] * n_seqs
