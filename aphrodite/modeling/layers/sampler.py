@@ -561,7 +561,6 @@ class Sampler(nn.Module):
             include_gpu_probs_tensor=self.include_gpu_probs_tensor,
             modify_greedy_probs=self._should_modify_greedy_probs_inplace,
         )
-        print("maybe_deferred_sample_results", maybe_deferred_sample_results)
 
         if self.include_gpu_probs_tensor:
             # Since we will defer sampler result Pythonization,
