@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import Enum, IntEnum
 from functools import cached_property
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+import torch
 
 import msgspec
 from loguru import logger
