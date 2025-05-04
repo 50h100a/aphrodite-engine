@@ -116,6 +116,7 @@ class SingleStepOutputProcessor(SequenceGroupOutputProcessor):
             new_char_count = 0
         self.stop_checker.maybe_stop_sequence(
             seq,
+            sample.outcome,
             new_char_count,
             sampling_params,
             lora_req=seq_group.lora_request,

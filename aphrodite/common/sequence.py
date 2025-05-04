@@ -68,6 +68,7 @@ class SequenceStatus(enum.IntEnum):
     FINISHED_ABORTED = 5
     FINISHED_IGNORED = 6
     FINISHED_CONSTRAINT = 7
+    FINISHED_ERROR = 8
 
     @staticmethod
     def is_finished(status: "SequenceStatus") -> bool:
@@ -88,6 +89,8 @@ class SequenceStatus(enum.IntEnum):
             finish_reason = "length"
         elif status == SequenceStatus.FINISHED_CONSTRAINT:
             finish_reason = "constraint"
+        elif status == SequenceStatus.FINISHED_ERROR:
+            finish_reason = "error"
         else:
             finish_reason = None
         return finish_reason
@@ -1010,6 +1013,12 @@ class SequenceGroupMetadata(
         self.state.current_step += 1
 
 
+class SampleOutcome(enum.IntEnum):
+    VALID = 0  # Fixed at zero for 'zeros' tensor fill
+    NONE_VALID = 1
+    ERROR = 2
+
+
 class SequenceOutput(
         msgspec.Struct,
         omit_defaults=True,  # type: ignore[call-arg]
@@ -1026,11 +1035,13 @@ class SequenceOutput(
     parent_seq_id: int
     output_token: int
     logprobs: Dict[int, Logprob]
+    outcome: SampleOutcome
 
     def __repr__(self) -> str:
         return (f"SequenceOutput(parent_seq_id={self.parent_seq_id}, "
                 f"output_token={self.output_token}, "
-                f"logprobs={self.logprobs})")
+                f"logprobs={self.logprobs}, "
+                f"outcome={self.outcome})")
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, SequenceOutput):

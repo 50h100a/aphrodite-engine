@@ -4,7 +4,8 @@ import pytest
 from transformers import PreTrainedTokenizer
 
 from aphrodite.common.sampling_params import SamplingParams
-from aphrodite.common.sequence import Logprob, Sequence, SequenceStatus
+from aphrodite.common.sequence import (Logprob, Sequence, SequenceStatus,
+                                       SampleOutcome)
 from aphrodite.engine.output_processor.stop_checker import StopChecker
 
 
@@ -70,6 +71,7 @@ def test_stop_on_eos_token(text_wo_eos: str, eos_token: str, eos_token_id: int,
 
     stop_checker.maybe_stop_sequence(
         seq=seq,
+        outcome=SampleOutcome.VALID,
         new_char_count=new_char_count,
         sampling_params=sampling_params,
     )

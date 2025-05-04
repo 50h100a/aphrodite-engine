@@ -7,7 +7,8 @@ from aphrodite.common.logger import log_once
 from aphrodite.common.sampling_params import SamplingParams
 from aphrodite.common.sequence import (APHRODITE_INVALID_TOKEN_ID, Sequence,
                                        SequenceGroup, SequenceGroupOutput,
-                                       SequenceOutput, SequenceStatus)
+                                       SequenceOutput, SequenceStatus,
+                                       SampleOutcome)
 from aphrodite.common.utils import Counter
 from aphrodite.engine.output_processor.interfaces import (
     SequenceGroupOutputProcessor)
@@ -106,7 +107,7 @@ class MultiStepOutputProcessor(SequenceGroupOutputProcessor):
             # Async case: We process tokens one by one. Here, we know the token
             # was already appended, so we only need to do the rest of the
             # postprocessor: Detokenization + stopping logic
-            self._process_decode_and_stop(seq, sequence_group.sampling_params)
+            self._process_decode_and_stop(seq, outputs[0].outcome, sequence_group.sampling_params)
         else:
             # Standard multi-step case
             # Since there's only one sequence per sequence group,
@@ -124,7 +125,7 @@ class MultiStepOutputProcessor(SequenceGroupOutputProcessor):
             self._process_seq_outputs(seq, valid_samples,
                                       sequence_group.sampling_params)
 
-    def _process_decode_and_stop(self, seq: Sequence,
+    def _process_decode_and_stop(self, seq: Sequence, outcome:SampleOutcome,
                                  sampling_params: SamplingParams) -> None:
         new_char_count = 0
         if sampling_params.detokenize:
@@ -133,6 +134,7 @@ class MultiStepOutputProcessor(SequenceGroupOutputProcessor):
         # TODO(sang): Support lora.
         self.stop_checker.maybe_stop_sequence(
             seq,
+            outcome,
             new_char_count=new_char_count,
             sampling_params=sampling_params,
         )
@@ -140,14 +142,12 @@ class MultiStepOutputProcessor(SequenceGroupOutputProcessor):
     def _process_seq_outputs(self, seq: Sequence,
                              valid_samples: List[SequenceOutput],
                              sampling_params: SamplingParams) -> None:
-        output_token_ids = [sample.output_token for sample in valid_samples]
-        output_logprobs = [sample.logprobs for sample in valid_samples]
-
+        assert sampling_params.max_tokens is not None
         # Truncate to max_tokens if necessary.
         remaining_tokens = sampling_params.max_tokens - (seq.get_output_len() +
-                                                         len(output_token_ids))
+                                                         len(valid_samples))
         if remaining_tokens < 0:
-            output_token_ids = output_token_ids[:remaining_tokens]
+            valid_samples = valid_samples[:remaining_tokens]
 
         # Truncate any tokens after EOS. This is required as spec decode
         # generates a fixed number of tokens without evaluating stopping
@@ -157,20 +157,19 @@ class MultiStepOutputProcessor(SequenceGroupOutputProcessor):
             eos_token_id = self.get_tokenizer_for_seq(seq).eos_token_id
             # Avoiding .index calls as exception throwing in the happy path
             # is expensive.
-            for i in range(len(output_token_ids)):
-                if output_token_ids[i] == eos_token_id:
-                    output_token_ids = output_token_ids[:i + 1]
+            for i in range(len(valid_samples)):
+                if valid_samples[i].output_token == eos_token_id:
+                    valid_samples = valid_samples[:i + 1]
                     break
 
         is_prefill_sampled_token = seq.data.get_num_uncomputed_tokens() == 0
 
         # Incrementally append tokens to the sequence, as if we had only one new
         # token.
-        for output_token_id, output_logprob in zip(output_token_ids,
-                                                   output_logprobs):
+        for sample in valid_samples:
             seq.append_token_id(
-                token_id=output_token_id,
-                logprobs=output_logprob,
+                token_id=sample.output_token,
+                logprobs=sample.logprobs,
             )
 
             if is_prefill_sampled_token:
@@ -180,7 +179,7 @@ class MultiStepOutputProcessor(SequenceGroupOutputProcessor):
                 # a prefill step.
                 seq.data.update_num_computed_tokens(1)
 
-            self._process_decode_and_stop(seq, sampling_params)
+            self._process_decode_and_stop(seq, sample.outcome, sampling_params)
 
             if seq.is_finished():
                 break

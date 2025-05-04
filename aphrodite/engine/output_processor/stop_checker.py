@@ -3,7 +3,7 @@ from typing import Callable, Optional
 from transformers import PreTrainedTokenizer
 
 from aphrodite.common.sampling_params import SamplingParams
-from aphrodite.common.sequence import Sequence, SequenceStatus
+from aphrodite.common.sequence import Sequence, SequenceStatus, SampleOutcome
 from aphrodite.lora.request import LoRARequest
 
 
@@ -30,6 +30,7 @@ class StopChecker:
     def maybe_stop_sequence(
         self,
         seq: Sequence,
+        outcome: SampleOutcome,
         new_char_count: int,
         sampling_params: SamplingParams,
         lora_req: Optional[LoRARequest] = None,
@@ -40,9 +41,14 @@ class StopChecker:
            sequence's output text for the newly generated token
         """
 
-        last_token_id = seq.get_last_token_id()
-        if last_token_id == 0:
+        if outcome == SampleOutcome.NONE_VALID:
             seq.status = SequenceStatus.FINISHED_CONSTRAINT
+            seq.data._output_token_ids.pop(-1)
+            seq.data._cached_all_token_ids.pop(-1)
+            seq.data._new_appended_tokens.pop(-1)
+            return
+        if outcome == SampleOutcome.ERROR:
+            seq.status = SequenceStatus.FINISHED_ERROR
             seq.data._output_token_ids.pop(-1)
             seq.data._cached_all_token_ids.pop(-1)
             seq.data._new_appended_tokens.pop(-1)
@@ -54,6 +60,7 @@ class StopChecker:
             return
 
         # Check if the sequence has generated the EOS token.
+        last_token_id = seq.get_last_token_id()
         if ((not sampling_params.ignore_eos)
                 and seq.get_last_token_id() == seq.eos_token_id):
             # Remove the last EOS token unless explicitly specified
