@@ -1,25 +1,12 @@
 """Utils for model executor."""
-import random
-import importlib
 from typing import Any, Dict, Optional
 
-import numpy as np
 import torch
-
-from aphrodite.common.config import DeviceConfig, ModelConfig
-
-DEVICE_TO_MODEL_LOADER_MAP = {
-    "cuda": "loader",
-    "neuron": "neuron_loader",
-}
 
 
 def set_random_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    from aphrodite.platforms import current_platform
+    current_platform.seed_everything(seed)
 
 
 def set_weight_attrs(
@@ -40,13 +27,26 @@ def set_weight_attrs(
     for key, value in weight_attrs.items():
         assert not hasattr(
             weight, key), (f"Overwriting existing tensor attribute: {key}")
+
+        # NOTE: During weight loading, we often do something like:
+        # narrowed_tensor = param.data.narrow(0, offset, len)
+        # narrowed_tensor.copy_(real_weight)
+        # expecting narrowed_tensor and param.data to share the same storage.
+        # However, on TPUs, narrowed_tensor will lazily propagate to the base
+        # tensor, which is param.data, leading to the redundant memory usage.
+        # This sometimes causes OOM errors during model loading. To avoid this,
+        # we sync the param tensor after its weight loader is called.
+        # TODO: Remove this hack once we have a better solution.
+        from aphrodite.platforms import current_platform
+        if current_platform.is_tpu() and key == "weight_loader":
+            value = _make_synced_weight_loader(value)
         setattr(weight, key, value)
 
 
-def get_model(model_config: ModelConfig, device_config: DeviceConfig,
-              **kwargs) -> torch.nn.Module:
-    model_loader_module = DEVICE_TO_MODEL_LOADER_MAP[device_config.device_type]
-    imported_model_loader = importlib.import_module(
-        f"aphrodite.modeling.{model_loader_module}")
-    get_model_fn = imported_model_loader.get_model
-    return get_model_fn(model_config, device_config, **kwargs)
+def _make_synced_weight_loader(original_weight_loader):
+
+    def _synced_weight_loader(param, *args, **kwargs):
+        original_weight_loader(param, *args, **kwargs)
+        torch._sync(param)
+
+    return _synced_weight_loader

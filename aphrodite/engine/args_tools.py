@@ -1,528 +1,1597 @@
+# yapf: disable
 import argparse
 import dataclasses
-from dataclasses import dataclass
-from typing import Optional, Tuple
+import json
+import re
+import threading
+from dataclasses import MISSING, dataclass, fields
+from itertools import permutations
+from typing import (Any, Callable, Dict, List, Literal, Optional, Type,
+                    TypeVar, Union, cast, get_args, get_origin)
 
-from aphrodite.common.config import (
-    CacheConfig,
-    ModelConfig,
-    ParallelConfig,
-    SchedulerConfig,
-    LoRAConfig,
-    DeviceConfig,
-    TokenizerPoolConfig,
-)
+import torch
+from loguru import logger
+from typing_extensions import TypeIs, deprecated
+
+import aphrodite.common.envs as envs
+from aphrodite.common.config import (AphroditeConfig, BlockSize, CacheConfig,
+                                     CacheDType, CompilationConfig,
+                                     ConfigFormat, ConfigType, DecodingConfig,
+                                     DetailedTraceModules, Device,
+                                     DeviceConfig, DistributedExecutorBackend,
+                                     GuidedDecodingBackend,
+                                     GuidedDecodingBackendV1, HfOverrides,
+                                     KVEventsConfig, KVTransferConfig,
+                                     LoadConfig, LoadFormat, LoRAConfig,
+                                     ModelConfig, ModelDType, ModelImpl,
+                                     MultiModalConfig, ObservabilityConfig,
+                                     ParallelConfig, PoolerConfig,
+                                     PrefixCachingHashAlgo,
+                                     PromptAdapterConfig, SchedulerConfig,
+                                     SchedulerPolicy, SpeculativeConfig,
+                                     TaskOption, TokenizerMode,
+                                     TokenizerPoolConfig, get_attr_docs,
+                                     get_field)
+from aphrodite.common.test_utils import MODEL_WEIGHTS_S3_BUCKET, MODELS_ON_S3
+from aphrodite.common.utils import (FlexibleArgumentParser, GiB_bytes,
+                                    is_in_ray_actor)
+from aphrodite.executor.executor_base import ExecutorBase
+from aphrodite.plugins import load_general_plugins
+from aphrodite.quantization import QuantizationMethods
+from aphrodite.reasoning import ReasoningParserManager
+from aphrodite.transformers_utils.utils import check_gguf_file
+from aphrodite.usage.usage_lib import UsageContext
+
+# yapf: enable
+
+
+# object is used to allow for special typing forms
+T = TypeVar("T")
+TypeHint = Union[type[Any], object]
+TypeHintT = Union[type[T], object]
+
+
+def optional_type(
+        return_type: Callable[[str], T]) -> Callable[[str], Optional[T]]:
+
+    def _optional_type(val: str) -> Optional[T]:
+        if val == "" or val == "None":
+            return None
+        try:
+            if return_type is json.loads and not re.match("^{.*}$", val):
+                return cast(T, nullable_kvs(val))
+            return return_type(val)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(
+                f"Value {val} cannot be converted to {return_type}.") from e
+
+    return _optional_type
+
+
+def union_dict_and_str(val: str) -> Optional[Union[str, dict[str, str]]]:
+    if not re.match("^{.*}$", val):
+        return str(val)
+    else:
+        return optional_type(json.loads)(val)
+
+
+@deprecated(
+    "Passing a JSON argument as a string containing comma separated key=value "
+    "pairs is deprecated. This will be removed in v0.10.0. Please use a JSON "
+    "string instead.")
+def nullable_kvs(val: str) -> dict[str, int]:
+    """Parses a string containing comma separate key [str] to value [int]
+    pairs into a dictionary.
+
+    Args:
+        val: String value to be parsed.
+
+    Returns:
+        Dictionary with parsed values.
+    """
+    out_dict: dict[str, int] = {}
+    for item in val.split(","):
+        kv_parts = [part.lower().strip() for part in item.split("=")]
+        if len(kv_parts) != 2:
+            raise argparse.ArgumentTypeError(
+                "Each item should be in the form KEY=VALUE")
+        key, value = kv_parts
+
+        try:
+            parsed_value = int(value)
+        except ValueError as exc:
+            msg = f"Failed to parse value of item {key}={value}"
+            raise argparse.ArgumentTypeError(msg) from exc
+
+        if key in out_dict and out_dict[key] != parsed_value:
+            raise argparse.ArgumentTypeError(
+                f"Conflicting values specified for key: {key}")
+        out_dict[key] = parsed_value
+
+    return out_dict
+
+
+def is_type(type_hint: TypeHint, type: TypeHintT) -> TypeIs[TypeHintT]:
+    """Check if the type hint is a specific type."""
+    return type_hint is type or get_origin(type_hint) is type
+
+
+def contains_type(type_hints: set[TypeHint], type: TypeHintT) -> bool:
+    """Check if the type hints contain a specific type."""
+    return any(is_type(type_hint, type) for type_hint in type_hints)
+
+
+def get_type(type_hints: set[TypeHint], type: TypeHintT) -> TypeHintT:
+    """Get the specific type from the type hints."""
+    return next((th for th in type_hints if is_type(th, type)), None)
+
+
+def literal_to_kwargs(type_hints: set[TypeHint]) -> dict[str, Any]:
+    """Convert Literal type hints to argparse kwargs."""
+    type_hint = get_type(type_hints, Literal)
+    choices = get_args(type_hint)
+    choice_type = type(choices[0])
+    if not all(isinstance(choice, choice_type) for choice in choices):
+        raise ValueError(
+            "All choices must be of the same type. "
+            f"Got {choices} with types {[type(c) for c in choices]}")
+    return {"type": choice_type, "choices": sorted(choices)}
+
+
+def is_not_builtin(type_hint: TypeHint) -> bool:
+    """Check if the class is not a built-in type."""
+    return type_hint.__module__ != "builtins"
+
+
+def get_kwargs(cls: ConfigType) -> dict[str, Any]:
+    cls_docs = get_attr_docs(cls)
+    kwargs = {}
+    for field in fields(cls):
+        # Get the default value of the field
+        default = field.default
+        if field.default_factory is not MISSING:
+            default = field.default_factory()
+
+        # Get the help text for the field
+        name = field.name
+        help = cls_docs[name]
+        # Escape % for argparse
+        help = help.replace("%", "%%")
+
+        # Initialise the kwargs dictionary for the field
+        kwargs[name] = {"default": default, "help": help}
+
+        # Get the set of possible types for the field
+        type_hints: set[TypeHint] = set()
+        if get_origin(field.type) is Union:
+            type_hints.update(get_args(field.type))
+        else:
+            type_hints.add(field.type)
+
+        # Set other kwargs based on the type hints
+        if contains_type(type_hints, bool):
+            # Creates --no-<name> and --<name> flags
+            kwargs[name]["action"] = argparse.BooleanOptionalAction
+        elif contains_type(type_hints, Literal):
+            kwargs[name].update(literal_to_kwargs(type_hints))
+        elif contains_type(type_hints, tuple):
+            type_hint = get_type(type_hints, tuple)
+            types = get_args(type_hint)
+            tuple_type = types[0]
+            assert all(t is tuple_type for t in types if t is not Ellipsis), (
+                "All non-Ellipsis tuple elements must be of the same "
+                f"type. Got {types}.")
+            kwargs[name]["type"] = tuple_type
+            kwargs[name]["nargs"] = "+" if Ellipsis in types else len(types)
+        elif contains_type(type_hints, list):
+            type_hint = get_type(type_hints, list)
+            types = get_args(type_hint)
+            assert len(types) == 1, (
+                "List type must have exactly one type. Got "
+                f"{type_hint} with types {types}")
+            kwargs[name]["type"] = types[0]
+            kwargs[name]["nargs"] = "+"
+        elif contains_type(type_hints, int):
+            kwargs[name]["type"] = int
+            # Special case for large integers
+            if name in {"max_model_len"}:
+                kwargs[name]["type"] = human_readable_int
+        elif contains_type(type_hints, float):
+            kwargs[name]["type"] = float
+        elif contains_type(type_hints,
+                           dict) and (contains_type(type_hints, str) or any(
+                               is_not_builtin(th) for th in type_hints)):
+            kwargs[name]["type"] = union_dict_and_str
+        elif contains_type(type_hints, dict):
+            # Dict arguments will always be optional
+            kwargs[name]["type"] = optional_type(json.loads)
+        elif (contains_type(type_hints, str)
+              or any(is_not_builtin(th) for th in type_hints)):
+            kwargs[name]["type"] = str
+        else:
+            raise ValueError(
+                f"Unsupported type {type_hints} for argument {name}.")
+
+        # If the type hint was a sequence of literals, use the helper function
+        # to update the type and choices
+        if get_origin(kwargs[name].get("type")) is Literal:
+            kwargs[name].update(literal_to_kwargs({kwargs[name]["type"]}))
+
+        # If None is in type_hints, make the argument optional.
+        # But not if it's a bool, argparse will handle this better.
+        if type(None) in type_hints and not contains_type(type_hints, bool):
+            kwargs[name]["type"] = optional_type(kwargs[name]["type"])
+            if kwargs[name].get("choices"):
+                kwargs[name]["choices"].append("None")
+    return kwargs
 
 
 @dataclass
 class EngineArgs:
     """Arguments for Aphrodite engine."""
-
-    model: str
-    tokenizer: Optional[str] = None
-    tokenizer_mode: str = "auto"
-    trust_remote_code: bool = False
-    download_dir: Optional[str] = None
-    load_format: str = "auto"
-    dtype: str = "auto"
-    kv_cache_dtype: str = "auto"
-    # kv_quant_params_path: str = None
-    seed: int = 0
-    max_model_len: Optional[int] = None
-    worker_use_ray: bool = False
-    pipeline_parallel_size: int = 1
-    tensor_parallel_size: int = 1
-    max_parallel_loading_workers: Optional[int] = None
-    block_size: int = 16
-    context_shift: bool = False
-    swap_space: int = 4  # GiB
-    gpu_memory_utilization: float = 0.90
-    max_num_batched_tokens: Optional[int] = None
-    max_num_seqs: int = 256
-    max_log_probs: int = 10  # OpenAI default is 5, setting to 10 because ST
+    model: str = ModelConfig.model
+    served_model_name: Optional[Union[
+        str, List[str]]] = ModelConfig.served_model_name
+    tokenizer: Optional[str] = ModelConfig.tokenizer
+    hf_config_path: Optional[str] = ModelConfig.hf_config_path
+    task: TaskOption = ModelConfig.task
+    skip_tokenizer_init: bool = ModelConfig.skip_tokenizer_init
+    tokenizer_mode: TokenizerMode = ModelConfig.tokenizer_mode
+    trust_remote_code: bool = ModelConfig.trust_remote_code
+    allowed_local_media_path: str = ModelConfig.allowed_local_media_path
+    download_dir: Optional[str] = LoadConfig.download_dir
+    load_format: str = LoadConfig.load_format
+    config_format: str = ModelConfig.config_format
+    dtype: ModelDType = ModelConfig.dtype
+    kv_cache_dtype: CacheDType = CacheConfig.cache_dtype
+    seed: Optional[int] = ModelConfig.seed
+    max_model_len: Optional[int] = ModelConfig.max_model_len
+    cuda_graph_sizes: list[int] = get_field(SchedulerConfig,
+                                            "cuda_graph_sizes")
+    # Note: Specifying a custom executor backend by passing a class
+    # is intended for expert use only. The API may change without
+    # notice.
+    distributed_executor_backend: Optional[Union[
+        DistributedExecutorBackend,
+        Type[ExecutorBase]]] = ParallelConfig.distributed_executor_backend
+    # number of P/D disaggregation (or other disaggregation) workers
+    pipeline_parallel_size: int = ParallelConfig.pipeline_parallel_size
+    tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
+    data_parallel_size: int = ParallelConfig.data_parallel_size
+    enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
+    max_parallel_loading_workers: Optional[
+        int] = ParallelConfig.max_parallel_loading_workers
+    block_size: Optional[BlockSize] = CacheConfig.block_size
+    enable_prefix_caching: Optional[bool] = CacheConfig.enable_prefix_caching
+    prefix_caching_hash_algo: PrefixCachingHashAlgo = \
+        CacheConfig.prefix_caching_hash_algo
+    disable_sliding_window: bool = ModelConfig.disable_sliding_window
+    disable_cascade_attn: bool = ModelConfig.disable_cascade_attn
+    use_v2_block_manager: bool = True
+    swap_space: float = CacheConfig.swap_space
+    cpu_offload_gb: float = CacheConfig.cpu_offload_gb
+    gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
+    max_num_batched_tokens: Optional[
+        int] = SchedulerConfig.max_num_batched_tokens
+    max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
+    max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
+    long_prefill_token_threshold: int = \
+        SchedulerConfig.long_prefill_token_threshold
+    max_num_seqs: Optional[int] = SchedulerConfig.max_num_seqs
+    max_logprobs: int = ModelConfig.max_logprobs
     disable_log_stats: bool = False
-    revision: Optional[str] = None
-    code_revision: Optional[str] = None
-    tokenizer_revision: Optional[str] = None
-    quantization: Optional[str] = None
-    load_in_4bit: bool = False
-    load_in_8bit: bool = False
-    load_in_smooth: bool = False
-    enforce_eager: bool = True
-    max_context_len_to_capture: int = 8192
-    disable_custom_all_reduce: bool = False
-    tokenizer_pool_size: int = 0
-    tokenizer_pool_type: str = "ray"
-    tokenizer_pool_extra_config: Optional[dict] = None
+    revision: Optional[str] = ModelConfig.revision
+    code_revision: Optional[str] = ModelConfig.code_revision
+    rope_scaling: dict[str, Any] = get_field(ModelConfig, "rope_scaling")
+    rope_theta: Optional[float] = ModelConfig.rope_theta
+    hf_token: Optional[Union[bool, str]] = ModelConfig.hf_token
+    hf_overrides: Optional[HfOverrides] = \
+        get_field(ModelConfig, "hf_overrides")
+    tokenizer_revision: Optional[str] = ModelConfig.tokenizer_revision
+    quantization: Optional[QuantizationMethods] = ModelConfig.quantization
+    enforce_eager: bool = ModelConfig.enforce_eager
+    max_seq_len_to_capture: int = ModelConfig.max_seq_len_to_capture
+    disable_custom_all_reduce: bool = ParallelConfig.disable_custom_all_reduce
+    # The following three fields are deprecated and will be removed in a future
+    # release. Setting them will have no effect. Please remove them from your
+    # configurations.
+    tokenizer_pool_size: int = TokenizerPoolConfig.pool_size
+    tokenizer_pool_type: str = TokenizerPoolConfig.pool_type
+    tokenizer_pool_extra_config: dict = \
+        get_field(TokenizerPoolConfig, "extra_config")
+    limit_mm_per_prompt: dict[str, int] = \
+        get_field(MultiModalConfig, "limit_per_prompt")
+    mm_processor_kwargs: Optional[Dict[str, Any]] = \
+        MultiModalConfig.mm_processor_kwargs
+    disable_mm_preprocessor_cache: bool = \
+        MultiModalConfig.disable_mm_preprocessor_cache
+    # LoRA fields
     enable_lora: bool = False
-    max_loras: int = 1
-    max_lora_rank: int = 16
-    lora_extra_vocab_size: int = 256
-    lora_dtype = "auto"
-    max_cpu_loras: Optional[int] = None
-    device: str = "auto"
-    ray_workers_use_nsight: bool = False
+    enable_lora_bias: bool = LoRAConfig.bias_enabled
+    max_loras: int = LoRAConfig.max_loras
+    max_lora_rank: int = LoRAConfig.max_lora_rank
+    fully_sharded_loras: bool = LoRAConfig.fully_sharded_loras
+    max_cpu_loras: Optional[int] = LoRAConfig.max_cpu_loras
+    lora_dtype: Optional[Union[str, torch.dtype]] = LoRAConfig.lora_dtype
+    lora_extra_vocab_size: int = LoRAConfig.lora_extra_vocab_size
+    long_lora_scaling_factors: Optional[tuple[float, ...]] = \
+        LoRAConfig.long_lora_scaling_factors
+    # PromptAdapter fields
+    enable_prompt_adapter: bool = False
+    max_prompt_adapters: int = PromptAdapterConfig.max_prompt_adapters
+    max_prompt_adapter_token: int = \
+        PromptAdapterConfig.max_prompt_adapter_token
+
+    device: Device = DeviceConfig.device
+    num_scheduler_steps: int = SchedulerConfig.num_scheduler_steps
+    multi_step_stream_outputs: bool = SchedulerConfig.multi_step_stream_outputs
+    ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
+    num_gpu_blocks_override: Optional[
+        int] = CacheConfig.num_gpu_blocks_override
+    num_lookahead_slots: int = SchedulerConfig.num_lookahead_slots
+    model_loader_extra_config: dict = \
+        get_field(LoadConfig, "model_loader_extra_config")
+    ignore_patterns: Optional[Union[str,
+                                    List[str]]] = LoadConfig.ignore_patterns
+    preemption_mode: Optional[str] = SchedulerConfig.preemption_mode
+
+    scheduler_delay_factor: float = SchedulerConfig.delay_factor
+    enable_chunked_prefill: Optional[
+        bool] = SchedulerConfig.enable_chunked_prefill
+    disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
+
+    guided_decoding_backend: GuidedDecodingBackend = DecodingConfig.backend
+    guided_decoding_disable_fallback: bool = DecodingConfig.disable_fallback
+    guided_decoding_disable_any_whitespace: bool = \
+        DecodingConfig.disable_any_whitespace
+    guided_decoding_disable_additional_properties: bool = \
+        DecodingConfig.disable_additional_properties
+    logits_processor_pattern: Optional[
+        str] = ModelConfig.logits_processor_pattern
+
+    speculative_config: Optional[Dict[str, Any]] = None
+
+    qlora_adapter_name_or_path: Optional[str] = None
+    show_hidden_metrics_for_version: Optional[str] = \
+        ObservabilityConfig.show_hidden_metrics_for_version
+    otlp_traces_endpoint: Optional[str] = \
+        ObservabilityConfig.otlp_traces_endpoint
+    collect_detailed_traces: Optional[list[DetailedTraceModules]] = \
+        ObservabilityConfig.collect_detailed_traces
+    disable_async_output_proc: bool = not ModelConfig.use_async_output_proc
+    scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
+    scheduler_cls: Union[str, Type[object]] = SchedulerConfig.scheduler_cls
+
+    override_neuron_config: dict[str, Any] = \
+        get_field(ModelConfig, "override_neuron_config")
+    override_pooler_config: Optional[Union[dict, PoolerConfig]] = \
+        ModelConfig.override_pooler_config
+    compilation_config: Optional[CompilationConfig] = None
+    worker_cls: str = ParallelConfig.worker_cls
+    worker_extension_cls: str = ParallelConfig.worker_extension_cls
+
+    kv_transfer_config: Optional[KVTransferConfig] = None
+    kv_events_config: Optional[KVEventsConfig] = None
+
+    generation_config: str = ModelConfig.generation_config
+    enable_sleep_mode: bool = ModelConfig.enable_sleep_mode
+    override_generation_config: dict[str, Any] = \
+        get_field(ModelConfig, "override_generation_config")
+    model_impl: str = ModelConfig.model_impl
+
+    calculate_kv_scales: bool = CacheConfig.calculate_kv_scales
+
+    additional_config: Optional[Dict[str, Any]] = None
+    enable_reasoning: Optional[bool] = None  # DEPRECATED
+    reasoning_parser: str = DecodingConfig.reasoning_backend
+
+    use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
+    pt_load_map_location: str = LoadConfig.pt_load_map_location
+
+    single_user_mode: bool = SchedulerConfig.single_user_mode
+
+    deepspeed_fp_bits: Optional[int] = None
+    quant_llm_fp_bits: Optional[int] = None
+    quant_llm_exp_bits: Optional[int] = None
 
     def __post_init__(self):
-        if self.tokenizer is None:
-            self.tokenizer = self.model
+        # support `EngineArgs(compilation_config={...})`
+        # without having to manually construct a
+        # CompilationConfig object
+        if isinstance(self.compilation_config, (int, dict)):
+            self.compilation_config = CompilationConfig.from_cli(
+                str(self.compilation_config))
+
+        # Setup plugins
+        from aphrodite.plugins import load_general_plugins
+        load_general_plugins()
 
     @staticmethod
-    def add_cli_args(
-            parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-        """Shared CLI arguments for the Aphrodite engine."""
-
-        # NOTE: If you update any of the arguments below, please also
-        # make sure to update docs/source/models/engine_args.rst
+    def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
+        """Shared CLI arguments for Aphrodite engine."""
 
         # Model arguments
-        parser.add_argument(
-            "--model",
-            type=str,
-            default="EleutherAI/pythia-70m-deduped",
-            help="name or path of the huggingface model to use",
+        model_kwargs = get_kwargs(ModelConfig)
+        model_group = parser.add_argument_group(
+            title="ModelConfig",
+            description=ModelConfig.__doc__,
         )
-        parser.add_argument(
-            "--tokenizer",
-            type=str,
-            default=EngineArgs.tokenizer,
-            help="name or path of the huggingface tokenizer to use",
-        )
-        parser.add_argument(
-            "--revision",
-            type=str,
-            default=None,
-            help="the specific model version to use. It can be a branch "
-            "name, a tag name, or a commit id. If unspecified, will use "
-            "the default version.",
-        )
-        parser.add_argument(
-            "--code-revision",
-            type=str,
-            default=None,
-            help="the specific revision to use for the model code on "
-            "Hugging Face Hub. It can be a branch name, a tag name, or a "
-            "commit id. If unspecified, will use the default version.",
-        )
-        parser.add_argument(
-            "--tokenizer-revision",
-            type=str,
-            default=None,
-            help="the specific tokenizer version to use. It can be a branch "
-            "name, a tag name, or a commit id. If unspecified, will use "
-            "the default version.",
-        )
-        parser.add_argument(
-            "--tokenizer-mode",
-            type=str,
-            default=EngineArgs.tokenizer_mode,
-            choices=["auto", "slow"],
-            help='tokenizer mode. "auto" will use the fast '
-            'tokenizer if available, and "slow" will '
-            "always use the slow tokenizer.",
-        )
-        parser.add_argument(
-            "--trust-remote-code",
+        model_group.add_argument("--model", **model_kwargs["model"])
+        model_group.add_argument("--task", **model_kwargs["task"])
+        model_group.add_argument("--tokenizer", **model_kwargs["tokenizer"])
+        model_group.add_argument("--tokenizer-mode",
+                                 **model_kwargs["tokenizer_mode"])
+        model_group.add_argument("--trust-remote-code",
+                                 **model_kwargs["trust_remote_code"])
+        model_group.add_argument("--dtype", **model_kwargs["dtype"])
+        model_group.add_argument("--seed", **model_kwargs["seed"])
+        model_group.add_argument("--hf-config-path",
+                                 **model_kwargs["hf_config_path"])
+        model_group.add_argument("--allowed-local-media-path",
+                                 **model_kwargs["allowed_local_media_path"])
+        model_group.add_argument("--revision", **model_kwargs["revision"])
+        model_group.add_argument("--code-revision",
+                                 **model_kwargs["code_revision"])
+        model_group.add_argument("--rope-scaling",
+                                 **model_kwargs["rope_scaling"])
+        model_group.add_argument("--rope-theta", **model_kwargs["rope_theta"])
+        model_group.add_argument("--tokenizer-revision",
+                                 **model_kwargs["tokenizer_revision"])
+        model_group.add_argument("--max-model-len",
+                                 **model_kwargs["max_model_len"])
+        model_group.add_argument("--quantization", "-q",
+                                 **model_kwargs["quantization"])
+        model_group.add_argument("--enforce-eager",
+                                 **model_kwargs["enforce_eager"])
+        model_group.add_argument("--max-seq-len-to-capture",
+                                 **model_kwargs["max_seq_len_to_capture"])
+        model_group.add_argument("--max-logprobs",
+                                 **model_kwargs["max_logprobs"])
+        model_group.add_argument("--disable-sliding-window",
+                                 **model_kwargs["disable_sliding_window"])
+        model_group.add_argument("--disable-cascade-attn",
+                                 **model_kwargs["disable_cascade_attn"])
+        model_group.add_argument("--skip-tokenizer-init",
+                                 **model_kwargs["skip_tokenizer_init"])
+        model_group.add_argument("--served-model-name",
+                                 **model_kwargs["served_model_name"])
+        # This one is a special case because it is the
+        # opposite of ModelConfig.use_async_output_proc
+        model_group.add_argument(
+            "--disable-async-output-proc",
             action="store_true",
-            help="trust remote code from huggingface",
+            default=EngineArgs.disable_async_output_proc,
+            help="Disable async output processing. This may result in "
+            "lower performance.")
+        model_group.add_argument("--config-format",
+                                 choices=[f.value for f in ConfigFormat],
+                                 **model_kwargs["config_format"])
+        # This one is a special case because it can bool
+        # or str. TODO: Handle this in get_kwargs
+        model_group.add_argument("--hf-token",
+                                 type=str,
+                                 nargs="?",
+                                 const=True,
+                                 default=model_kwargs["hf_token"]["default"],
+                                 help=model_kwargs["hf_token"]["help"])
+        model_group.add_argument("--hf-overrides",
+                                 **model_kwargs["hf_overrides"])
+        model_group.add_argument("--override-neuron-config",
+                                 **model_kwargs["override_neuron_config"])
+        model_group.add_argument("--override-pooler-config",
+                                 **model_kwargs["override_pooler_config"])
+        model_group.add_argument("--logits-processor-pattern",
+                                 **model_kwargs["logits_processor_pattern"])
+        model_group.add_argument("--generation-config",
+                                 **model_kwargs["generation_config"])
+        model_group.add_argument("--override-generation-config",
+                                 **model_kwargs["override_generation_config"])
+        model_group.add_argument("--enable-sleep-mode",
+                                 **model_kwargs["enable_sleep_mode"])
+        model_group.add_argument("--model-impl",
+                                 choices=[f.value for f in ModelImpl],
+                                 **model_kwargs["model_impl"])
+
+        # Model loading arguments
+        load_kwargs = get_kwargs(LoadConfig)
+        load_group = parser.add_argument_group(
+            title="LoadConfig",
+            description=LoadConfig.__doc__,
         )
-        parser.add_argument(
-            "--download-dir",
-            type=str,
-            default=EngineArgs.download_dir,
-            help="directory to download and load the weights, "
-            "default to the default cache dir of "
-            "huggingface",
+        load_group.add_argument("--load-format",
+                                choices=[f.value for f in LoadFormat],
+                                **load_kwargs["load_format"])
+        load_group.add_argument("--download-dir",
+                                **load_kwargs["download_dir"])
+        load_group.add_argument("--model-loader-extra-config",
+                                **load_kwargs["model_loader_extra_config"])
+        load_group.add_argument("--ignore-patterns",
+                                **load_kwargs["ignore_patterns"])
+        load_group.add_argument("--use-tqdm-on-load",
+                                **load_kwargs["use_tqdm_on_load"])
+        load_group.add_argument('--qlora-adapter-name-or-path',
+                                type=str,
+                                default=None,
+                                help='Name or path of the QLoRA adapter.')
+        load_group.add_argument('--pt-load-map-location',
+                                **load_kwargs["pt_load_map_location"])
+
+        # Guided decoding arguments
+        guided_decoding_kwargs = get_kwargs(DecodingConfig)
+        guided_decoding_group = parser.add_argument_group(
+            title="DecodingConfig",
+            description=DecodingConfig.__doc__,
         )
-        parser.add_argument(
-            "--load-format",
-            type=str,
-            default=EngineArgs.load_format,
-            choices=["auto", "pt", "safetensors", "npcache", "dummy"],
-            help="The format of the model weights to load. "
-            '"auto" will try to load the weights in the safetensors format '
-            "and fall back to the pytorch bin format if safetensors format "
-            "is not available. "
-            '"pt" will load the weights in the pytorch bin format. '
-            '"safetensors" will load the weights in the safetensors format. '
-            '"npcache" will load the weights in pytorch format and store '
-            "a numpy cache to speed up the loading. "
-            '"dummy" will initialize the weights with random values, '
-            "which is mainly for profiling.",
-        )
-        parser.add_argument(
-            "--dtype",
-            type=str,
-            default=EngineArgs.dtype,
-            choices=[
-                "auto", "half", "float16", "bfloat16", "float", "float32"
-            ],
-            help="data type for model weights and activations. "
-            'The "auto" option will use FP16 precision '
-            "for FP32 and FP16 models, and BF16 precision "
-            "for BF16 models.",
-        )
-        parser.add_argument(
-            "--kv-cache-dtype",
-            type=str,
-            # choices=["auto", "fp8_e5m2", "int8"],
-            choices=['auto', 'fp8_e5m2'],
-            default=EngineArgs.kv_cache_dtype,
-            help='Data type for kv cache storage. If "auto", will use model '
-            "data type. Note FP8 is not supported when cuda version is "
-            "lower than 11.8.",
-        )
-        # parser.add_argument(
-        #     "--kv-quant-params-path",
-        #     type=str,
-        #     default=EngineArgs.kv_quant_params_path,
-        #     help="Path to scales and zero points of KV cache "
-        #     "quantization. Only applicable when kv-cache-dtype "
-        #     "is int8.",
-        # )
-        parser.add_argument(
-            "--max-model-len",
-            type=int,
-            default=EngineArgs.max_model_len,
-            help="model context length. If unspecified, "
-            "will be automatically derived from the model.",
-        )
+        guided_decoding_group.add_argument("--guided-decoding-backend",
+                                           **guided_decoding_kwargs["backend"])
+        guided_decoding_group.add_argument(
+            "--guided-decoding-disable-fallback",
+            **guided_decoding_kwargs["disable_fallback"])
+        guided_decoding_group.add_argument(
+            "--guided-decoding-disable-any-whitespace",
+            **guided_decoding_kwargs["disable_any_whitespace"])
+        guided_decoding_group.add_argument(
+            "--guided-decoding-disable-additional-properties",
+            **guided_decoding_kwargs["disable_additional_properties"])
+        guided_decoding_group.add_argument(
+            "--enable-reasoning",
+            action=argparse.BooleanOptionalAction,
+            help="[DEPRECATED] The `--enable-reasoning` flag is deprecated as "
+            "of v0.8.6. Use `--reasoning-parser` to specify the reasoning "
+            "parser backend insteadThis flag (`--enable-reasoning`) will be "
+            "removed in v0.10.0. When `--reasoning-parser` is specified, "
+            "reasoning mode is automatically enabled.")
+        guided_decoding_group.add_argument(
+            "--reasoning-parser",
+            # This choices is a special case because it's not static
+            choices=list(ReasoningParserManager.reasoning_parsers),
+            **guided_decoding_kwargs["reasoning_backend"])
+
         # Parallel arguments
-        parser.add_argument(
-            "--worker-use-ray",
-            action="store_true",
-            help="use Ray for distributed serving, will be "
-            "automatically set when using more than 1 GPU",
+        parallel_kwargs = get_kwargs(ParallelConfig)
+        parallel_group = parser.add_argument_group(
+            title="ParallelConfig",
+            description=ParallelConfig.__doc__,
         )
-        parser.add_argument(
-            "--pipeline-parallel-size",
-            "-pp",
-            type=int,
-            default=EngineArgs.pipeline_parallel_size,
-            help="number of pipeline stages",
-        )
-        parser.add_argument(
-            "--tensor-parallel-size",
-            "-tp",
-            type=int,
-            default=EngineArgs.tensor_parallel_size,
-            help="number of tensor parallel replicas",
-        )
-        parser.add_argument(
+        parallel_group.add_argument(
+            "--distributed-executor-backend",
+            **parallel_kwargs["distributed_executor_backend"])
+        parallel_group.add_argument(
+            "--pipeline-parallel-size", "-pp",
+            **parallel_kwargs["pipeline_parallel_size"])
+        parallel_group.add_argument("--tensor-parallel-size", "-tp",
+                                    **parallel_kwargs["tensor_parallel_size"])
+        parallel_group.add_argument("--data-parallel-size", "-dp",
+                                    **parallel_kwargs["data_parallel_size"])
+        parallel_group.add_argument(
+            "--enable-expert-parallel",
+            **parallel_kwargs["enable_expert_parallel"])
+        parallel_group.add_argument(
             "--max-parallel-loading-workers",
-            type=int,
-            default=EngineArgs.max_parallel_loading_workers,
-            help="load model sequentially in multiple batches, "
-            "to avoid RAM OOM when using tensor "
-            "parallel and large models",
-        )
-        parser.add_argument(
+            **parallel_kwargs["max_parallel_loading_workers"])
+        parallel_group.add_argument(
             "--ray-workers-use-nsight",
-            action="store_true",
-            help="If specified, use nsight to profile ray workers",
-        )
-        # KV cache arguments
-        parser.add_argument(
-            "--block-size",
-            type=int,
-            default=EngineArgs.block_size,
-            choices=[8, 16, 32, 128],
-            help="token block size",
-        )
-        parser.add_argument(
-            "--context-shift",
-            action="store_true",
-            help="Enable context shifting.",
-        )
-        parser.add_argument("--seed",
-                            type=int,
-                            default=EngineArgs.seed,
-                            help="random seed")
-        parser.add_argument(
-            "--swap-space",
-            type=int,
-            default=EngineArgs.swap_space,
-            help="CPU swap space size (GiB) per GPU",
-        )
-        parser.add_argument(
-            "--gpu-memory-utilization",
-            "-gmu",
-            type=float,
-            default=EngineArgs.gpu_memory_utilization,
-            help="the fraction of GPU memory to be used for "
-            "the model executor, which can range from 0 to 1."
-            "If unspecified, will use the default value of 0.9.",
-        )
-        parser.add_argument(
-            "--max-num-batched-tokens",
-            type=int,
-            default=EngineArgs.max_num_batched_tokens,
-            help="maximum number of batched tokens per "
-            "iteration",
-        )
-        parser.add_argument(
-            "--max-num-seqs",
-            type=int,
-            default=EngineArgs.max_num_seqs,
-            help="maximum number of sequences per iteration",
-        )
-        parser.add_argument(
-            "--max-log-probs",
-            type=int,
-            default=EngineArgs.max_log_probs,
-            help="maximum number of log probabilities to "
-            "return.",
-        )
-        parser.add_argument(
-            "--disable-log-stats",
-            action="store_true",
-            help="disable logging statistics",
-        )
-        # Quantization settings.
-        parser.add_argument(
-            "--quantization",
-            "-q",
-            type=str,
-            choices=[
-                "aqlm",
-                "awq",
-                "bnb",
-                "exl2",
-                "gguf",
-                "gptq",
-                "quip",
-                "squeezellm",
-                "marlin",
-                None,
-            ],
-            default=EngineArgs.quantization,
-            help="Method used to quantize the weights. If "
-            "None, we first check the `quantization_config` "
-            "attribute in the model config file. If that is "
-            "None, we assume the model weights are not "
-            "quantized and use `dtype` to determine the data "
-            "type of the weights.",
-        )
-        parser.add_argument(
-            "--load-in-4bit",
-            action="store_true",
-            help="Load the FP16 model in 4-bit format. Also "
-            "works with AWQ models. Throughput at 2.5x of "
-            "FP16.",
-        )
-        parser.add_argument(
-            "--load-in-8bit",
-            action="store_true",
-            help="Load the FP16 model in 8-bit format. "
-            "Throughput at 0.3x of FP16.",
-        )
-        parser.add_argument(
-            "--load-in-smooth",
-            action="store_true",
-            help="Load the FP16 model in smoothquant "
-            "8bit format. Throughput at 0.7x of FP16. ",
-        )
-        parser.add_argument(
-            "--enforce-eager",
-            type=lambda x: (str(x).lower() == 'true'),
-            default=EngineArgs.enforce_eager,
-            help="Always use eager-mode PyTorch. If False, "
-            "will use eager mode and CUDA graph in hybrid "
-            "for maximal performance and flexibility.",
-        )
-        parser.add_argument(
-            "--max-context-len-to-capture",
-            type=int,
-            default=EngineArgs.max_context_len_to_capture,
-            help="maximum context length covered by CUDA "
-            "graphs. When a sequence has context length "
-            "larger than this, we fall back to eager mode.",
-        )
-        parser.add_argument(
+            **parallel_kwargs["ray_workers_use_nsight"])
+        parallel_group.add_argument(
             "--disable-custom-all-reduce",
-            action="store_true",
-            default=EngineArgs.disable_custom_all_reduce,
-            help="See ParallelConfig",
+            **parallel_kwargs["disable_custom_all_reduce"])
+        parallel_group.add_argument("--worker-cls",
+                                    **parallel_kwargs["worker_cls"])
+        parallel_group.add_argument("--worker-extension-cls",
+                                    **parallel_kwargs["worker_extension_cls"])
+
+        # KV cache arguments
+        cache_kwargs = get_kwargs(CacheConfig)
+        cache_group = parser.add_argument_group(
+            title="CacheConfig",
+            description=CacheConfig.__doc__,
         )
-        parser.add_argument("--tokenizer-pool-size",
-                            type=int,
-                            default=EngineArgs.tokenizer_pool_size,
-                            help="Size of tokenizer pool to use for "
-                            "asynchronous tokenization. If 0, will "
-                            "use synchronous tokenization.")
-        parser.add_argument("--tokenizer-pool-type",
-                            type=str,
-                            default=EngineArgs.tokenizer_pool_type,
-                            help="The type of tokenizer pool to use for "
-                            "asynchronous tokenization. Ignored if "
-                            "tokenizer_pool_size is 0.")
-        parser.add_argument("--tokenizer-pool-extra-config",
-                            type=str,
-                            default=EngineArgs.tokenizer_pool_extra_config,
-                            help="Extra config for tokenizer pool. "
-                            "This should be a JSON string that will be "
-                            "parsed into a dictionary. Ignored if "
-                            "tokenizer_pool_size is 0.")
+        cache_group.add_argument("--block-size", **cache_kwargs["block_size"])
+        cache_group.add_argument("--gpu-memory-utilization", "-gmu",
+                                 **cache_kwargs["gpu_memory_utilization"])
+        cache_group.add_argument("--swap-space", **cache_kwargs["swap_space"])
+        cache_group.add_argument("--kv-cache-dtype",
+                                 **cache_kwargs["cache_dtype"])
+        cache_group.add_argument("--num-gpu-blocks-override",
+                                 **cache_kwargs["num_gpu_blocks_override"])
+        cache_group.add_argument("--enable-prefix-caching",
+                                 **cache_kwargs["enable_prefix_caching"])
+        cache_group.add_argument("--prefix-caching-hash-algo",
+                                 **cache_kwargs["prefix_caching_hash_algo"])
+        cache_group.add_argument("--cpu-offload-gb",
+                                 **cache_kwargs["cpu_offload_gb"])
+        cache_group.add_argument("--calculate-kv-scales",
+                                 **cache_kwargs["calculate_kv_scales"])
+
+        # Tokenizer arguments
+        tokenizer_kwargs = get_kwargs(TokenizerPoolConfig)
+        tokenizer_group = parser.add_argument_group(
+            title="TokenizerPoolConfig",
+            description=TokenizerPoolConfig.__doc__,
+        )
+        tokenizer_group.add_argument("--tokenizer-pool-size",
+                                     **tokenizer_kwargs["pool_size"])
+        tokenizer_group.add_argument("--tokenizer-pool-type",
+                                     **tokenizer_kwargs["pool_type"])
+        tokenizer_group.add_argument("--tokenizer-pool-extra-config",
+                                     **tokenizer_kwargs["extra_config"])
+
+        # Multimodal related configs
+        multimodal_kwargs = get_kwargs(MultiModalConfig)
+        multimodal_group = parser.add_argument_group(
+            title="MultiModalConfig",
+            description=MultiModalConfig.__doc__,
+        )
+        multimodal_group.add_argument("--limit-mm-per-prompt",
+                                      **multimodal_kwargs["limit_per_prompt"])
+        multimodal_group.add_argument(
+            "--mm-processor-kwargs",
+            **multimodal_kwargs["mm_processor_kwargs"])
+        multimodal_group.add_argument(
+            "--disable-mm-preprocessor-cache",
+            **multimodal_kwargs["disable_mm_preprocessor_cache"])
+
         # LoRA related configs
-        parser.add_argument(
+        lora_kwargs = get_kwargs(LoRAConfig)
+        lora_group = parser.add_argument_group(
+            title="LoRAConfig",
+            description=LoRAConfig.__doc__,
+        )
+        lora_group.add_argument(
             "--enable-lora",
-            action="store_true",
-            help="If True, enable handling of LoRA adapters.",
-        )
-        parser.add_argument(
-            "--max-loras",
-            type=int,
-            default=EngineArgs.max_loras,
-            help="Max number of LoRAs in a single batch.",
-        )
-        parser.add_argument(
-            "--max-lora-rank",
-            type=int,
-            default=EngineArgs.max_lora_rank,
-            help="Max LoRA rank.",
-        )
-        parser.add_argument(
-            "--lora-extra-vocab-size",
-            type=int,
-            default=EngineArgs.lora_extra_vocab_size,
-            help=("Maximum size of extra vocabulary that can be "
-                  "present in a LoRA adapter (added to the base "
-                  "model vocabulary)."),
-        )
-        parser.add_argument(
+            action=argparse.BooleanOptionalAction,
+            help="If True, enable handling of LoRA adapters.")
+        lora_group.add_argument("--enable-lora-bias",
+                                **lora_kwargs["bias_enabled"])
+        lora_group.add_argument("--max-loras", **lora_kwargs["max_loras"])
+        lora_group.add_argument("--max-lora-rank",
+                                **lora_kwargs["max_lora_rank"])
+        lora_group.add_argument("--lora-extra-vocab-size",
+                                **lora_kwargs["lora_extra_vocab_size"])
+        lora_group.add_argument(
             "--lora-dtype",
-            type=str,
-            default=EngineArgs.lora_dtype,
-            choices=["auto", "float16", "bfloat16", "float32"],
-            help=("Data type for LoRA. If auto, will default to "
-                  "base model dtype."),
+            **lora_kwargs["lora_dtype"],
         )
-        parser.add_argument(
-            "--max-cpu-loras",
-            type=int,
-            default=EngineArgs.max_cpu_loras,
-            help=("Maximum number of LoRAs to store in CPU memory. "
-                  "Must be >= than max_num_seqs. "
-                  "Defaults to max_num_seqs."),
+        lora_group.add_argument("--long-lora-scaling-factors",
+                                **lora_kwargs["long_lora_scaling_factors"])
+        lora_group.add_argument("--max-cpu-loras",
+                                **lora_kwargs["max_cpu_loras"])
+        lora_group.add_argument("--fully-sharded-loras",
+                                **lora_kwargs["fully_sharded_loras"])
+
+        # PromptAdapter related configs
+        prompt_adapter_kwargs = get_kwargs(PromptAdapterConfig)
+        prompt_adapter_group = parser.add_argument_group(
+            title="PromptAdapterConfig",
+            description=PromptAdapterConfig.__doc__,
         )
-        parser.add_argument(
-            "--device",
-            type=str,
-            default=EngineArgs.device,
-            choices=["cuda"],
-            help=("Device to use for model execution. "
-                  'Currently, only "cuda" is supported.'),
+        prompt_adapter_group.add_argument(
+            "--enable-prompt-adapter",
+            action=argparse.BooleanOptionalAction,
+            help="If True, enable handling of PromptAdapters.")
+        prompt_adapter_group.add_argument(
+            "--max-prompt-adapters",
+            **prompt_adapter_kwargs["max_prompt_adapters"])
+        prompt_adapter_group.add_argument(
+            "--max-prompt-adapter-token",
+            **prompt_adapter_kwargs["max_prompt_adapter_token"])
+
+        # Device arguments
+        device_kwargs = get_kwargs(DeviceConfig)
+        device_group = parser.add_argument_group(
+            title="DeviceConfig",
+            description=DeviceConfig.__doc__,
         )
+        device_group.add_argument("--device", **device_kwargs["device"])
+
+        # Speculative arguments
+        speculative_group = parser.add_argument_group(
+            title="SpeculativeConfig",
+            description=SpeculativeConfig.__doc__,
+        )
+        speculative_group.add_argument(
+            "--speculative-config",
+            type=json.loads,
+            default=None,
+            help="The configurations for speculative decoding. Should be a "
+            "JSON string.")
+
+        # Observability arguments
+        observability_kwargs = get_kwargs(ObservabilityConfig)
+        observability_group = parser.add_argument_group(
+            title="ObservabilityConfig",
+            description=ObservabilityConfig.__doc__,
+        )
+        observability_group.add_argument(
+            "--show-hidden-metrics-for-version",
+            **observability_kwargs["show_hidden_metrics_for_version"])
+        observability_group.add_argument(
+            "--otlp-traces-endpoint",
+            **observability_kwargs["otlp_traces_endpoint"])
+        # TODO: generalise this special case
+        choices = observability_kwargs["collect_detailed_traces"]["choices"]
+        metavar = f"{{{','.join(choices)}}}"
+        observability_kwargs["collect_detailed_traces"]["metavar"] = metavar
+        observability_kwargs["collect_detailed_traces"]["choices"] += [
+            ",".join(p)
+            for p in permutations(get_args(DetailedTraceModules), r=2)
+        ]
+        observability_group.add_argument(
+            "--collect-detailed-traces",
+            **observability_kwargs["collect_detailed_traces"])
+
+        # Scheduler arguments
+        scheduler_kwargs = get_kwargs(SchedulerConfig)
+        scheduler_group = parser.add_argument_group(
+            title="SchedulerConfig",
+            description=SchedulerConfig.__doc__,
+        )
+        scheduler_group.add_argument(
+            "--max-num-batched-tokens",
+            **scheduler_kwargs["max_num_batched_tokens"])
+        scheduler_group.add_argument("--max-num-seqs",
+                                     **scheduler_kwargs["max_num_seqs"])
+        scheduler_group.add_argument(
+            "--max-num-partial-prefills",
+            **scheduler_kwargs["max_num_partial_prefills"])
+        scheduler_group.add_argument(
+            "--max-long-partial-prefills",
+            **scheduler_kwargs["max_long_partial_prefills"])
+        scheduler_group.add_argument('--cuda-graph-sizes',
+                                     **scheduler_kwargs["cuda_graph_sizes"])
+        scheduler_group.add_argument(
+            "--long-prefill-token-threshold",
+            **scheduler_kwargs["long_prefill_token_threshold"])
+        scheduler_group.add_argument("--num-lookahead-slots",
+                                     **scheduler_kwargs["num_lookahead_slots"])
+        scheduler_group.add_argument("--scheduler-delay-factor",
+                                     **scheduler_kwargs["delay_factor"])
+        scheduler_group.add_argument("--preemption-mode",
+                                     **scheduler_kwargs["preemption_mode"])
+        scheduler_group.add_argument("--num-scheduler-steps",
+                                     **scheduler_kwargs["num_scheduler_steps"])
+        scheduler_group.add_argument(
+            "--multi-step-stream-outputs",
+            **scheduler_kwargs["multi_step_stream_outputs"])
+        scheduler_group.add_argument("--scheduling-policy",
+                                     **scheduler_kwargs["policy"])
+        scheduler_group.add_argument(
+            "--enable-chunked-prefill",
+            **scheduler_kwargs["enable_chunked_prefill"])
+        scheduler_group.add_argument(
+            "--disable-chunked-mm-input",
+            **scheduler_kwargs["disable_chunked_mm_input"])
+        scheduler_group.add_argument("--scheduler-cls",
+                                     **scheduler_kwargs["scheduler_cls"])
+
+        # Compilation arguments
+        # compilation_kwargs = get_kwargs(CompilationConfig)
+        compilation_group = parser.add_argument_group(
+            title="CompilationConfig",
+            description=CompilationConfig.__doc__,
+        )
+        compilation_group.add_argument(
+            "--compilation-config",
+            "-O",
+            type=CompilationConfig.from_cli,
+            default=None,
+            help="torch.compile configuration for the model. "
+            "When it is a number (0, 1, 2, 3), it will be "
+            "interpreted as the optimization level.\n"
+            "NOTE: level 0 is the default level without "
+            "any optimization. level 1 and 2 are for internal "
+            "testing only. level 3 is the recommended level "
+            "for production.\n"
+            "To specify the full compilation config, "
+            "use a JSON string, e.g. ``{\"level\": 3, "
+            "\"cudagraph_capture_sizes\": [1, 2, 4, 8]}``\n"
+            "Following the convention of traditional "
+            "compilers, using ``-O`` without space is also "
+            "supported. ``-O3`` is equivalent to ``-O 3``.")
+
+        # KVTransfer arguments
+        # kv_transfer_kwargs = get_kwargs(KVTransferConfig)
+        kv_transfer_group = parser.add_argument_group(
+            title="KVTransferConfig",
+            description=KVTransferConfig.__doc__,
+        )
+        kv_transfer_group.add_argument(
+            "--kv-transfer-config",
+            type=KVTransferConfig.from_cli,
+            default=None,
+            help="The configurations for distributed KV cache "
+            "transfer. Should be a JSON string.")
+        kv_transfer_group.add_argument(
+            '--kv-events-config',
+            type=KVEventsConfig.from_cli,
+            default=None,
+            help='The configurations for event publishing.')
+
+        # Aphrodite arguments
+        # aphrodite_kwargs = get_kwargs(AphroditeConfig)
+        aphrodite_group = parser.add_argument_group(
+            title="AphroditeConfig",
+            description=AphroditeConfig.__doc__,
+        )
+        aphrodite_group.add_argument(
+            "--additional-config",
+            type=json.loads,
+            default=None,
+            help="Additional config for specified platform in JSON format. "
+            "Different platforms may support different configs. Make sure the "
+            "configs are valid for the platform you are using. The input format"
+            " is like '{\"config_key\":\"config_value\"}'")
+
+        # Other arguments
+        parser.add_argument('--use-v2-block-manager',
+                            action='store_true',
+                            default=True,
+                            help='[DEPRECATED] block manager v1 has been '
+                            'removed and SelfAttnBlockSpaceManager (i.e. '
+                            'block manager v2) is now the default. '
+                            'Setting this flag to True or False'
+                            ' has no effect on Aphrodite behavior.')
+        parser.add_argument('--disable-log-stats',
+                            action='store_true',
+                            help='Disable logging statistics.')
+        parser.add_argument('--single-user-mode',
+                            action='store_true',
+                            help='Enable single user mode. When enabled, '
+                            'the engine only allocates enough memory for a '
+                            'single sequence, and disables batching.')
+        parser.add_argument('--deepspeed-fp-bits',
+                            type=int,
+                            help='Set the FP bits for DeepSpeed.')
+        parser.add_argument('--quant-llm-fp-bits',
+                            type=int,
+                            help='Set the FP bits for the LLM.')
+        parser.add_argument('--quant-llm-exp-bits',
+                            type=int,
+                            help='Set the exponent bits for the LLM.')
+
         return parser
 
     @classmethod
-    def from_cli_args(cls, args: argparse.Namespace) -> "EngineArgs":
+    def from_cli_args(cls, args: argparse.Namespace):
         # Get the list of attributes of this dataclass.
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         # Set the attributes from the parsed arguments.
         engine_args = cls(**{attr: getattr(args, attr) for attr in attrs})
         return engine_args
 
-    def create_engine_configs(
+    def create_model_config(self) -> ModelConfig:
+        # gguf file needs a specific model loader and doesn't use hf_repo
+        if check_gguf_file(self.model):
+            self.quantization = self.load_format = "gguf"
+
+        # NOTE: This is to allow model loading from S3 in CI
+        if (not isinstance(self, AsyncEngineArgs) and envs.APHRODITE_CI_USE_S3
+                and self.model in MODELS_ON_S3
+                and self.load_format == LoadFormat.AUTO):  # noqa: E501
+            self.model = f"{MODEL_WEIGHTS_S3_BUCKET}/{self.model}"
+            self.load_format = LoadFormat.RUNAI_STREAMER
+
+        return ModelConfig(
+            model=self.model,
+            hf_config_path=self.hf_config_path,
+            task=self.task,
+            tokenizer=self.tokenizer,
+            tokenizer_mode=self.tokenizer_mode,
+            trust_remote_code=self.trust_remote_code,
+            allowed_local_media_path=self.allowed_local_media_path,
+            dtype=self.dtype,
+            seed=self.seed,
+            revision=self.revision,
+            code_revision=self.code_revision,
+            rope_scaling=self.rope_scaling,
+            rope_theta=self.rope_theta,
+            hf_token=self.hf_token,
+            hf_overrides=self.hf_overrides,
+            tokenizer_revision=self.tokenizer_revision,
+            max_model_len=self.max_model_len,
+            quantization=self.quantization,
+            enforce_eager=self.enforce_eager,
+            max_seq_len_to_capture=self.max_seq_len_to_capture,
+            max_logprobs=self.max_logprobs,
+            disable_sliding_window=self.disable_sliding_window,
+            disable_cascade_attn=self.disable_cascade_attn,
+            skip_tokenizer_init=self.skip_tokenizer_init,
+            served_model_name=self.served_model_name,
+            limit_mm_per_prompt=self.limit_mm_per_prompt,
+            use_async_output_proc=not self.disable_async_output_proc,
+            config_format=self.config_format,
+            mm_processor_kwargs=self.mm_processor_kwargs,
+            disable_mm_preprocessor_cache=self.disable_mm_preprocessor_cache,
+            override_neuron_config=self.override_neuron_config,
+            override_pooler_config=self.override_pooler_config,
+            logits_processor_pattern=self.logits_processor_pattern,
+            generation_config=self.generation_config,
+            override_generation_config=self.override_generation_config,
+            enable_sleep_mode=self.enable_sleep_mode,
+            model_impl=self.model_impl,
+            quant_llm_fp_bits=self.quant_llm_fp_bits,
+            quant_llm_exp_bits=self.quant_llm_exp_bits,
+            deepspeed_fp_bits=self.deepspeed_fp_bits,
+        )
+
+    def create_load_config(self) -> LoadConfig:
+
+        if(self.qlora_adapter_name_or_path is not None) and \
+            self.quantization != "bitsandbytes":
+            raise ValueError(
+                "QLoRA adapter only support "
+                f"'bitsandbytes' quantization, but got {self.quantization}")
+
+        if self.quantization == "bitsandbytes":
+            self.load_format = "bitsandbytes"
+
+        return LoadConfig(
+            load_format=self.load_format,
+            download_dir=self.download_dir,
+            model_loader_extra_config=self.model_loader_extra_config,
+            ignore_patterns=self.ignore_patterns,
+            use_tqdm_on_load=self.use_tqdm_on_load,
+            pt_load_map_location=self.pt_load_map_location,
+        )
+
+    def create_speculative_config(
         self,
-    ) -> Tuple[ModelConfig, CacheConfig, ParallelConfig, SchedulerConfig,
-               DeviceConfig, Optional[LoRAConfig], ]:
-        device_config = DeviceConfig(self.device)
-        model_config = ModelConfig(
-            self.model,
-            self.tokenizer,
-            self.tokenizer_mode,
-            self.trust_remote_code,
-            self.download_dir,
-            self.load_format,
-            self.dtype,
-            self.seed,
-            self.revision,
-            self.code_revision,
-            self.tokenizer_revision,
-            self.max_model_len,
-            self.quantization,
-            self.load_in_4bit,
-            self.load_in_8bit,
-            self.load_in_smooth,
-            self.enforce_eager,
-            self.max_context_len_to_capture,
-            self.max_log_probs,
-        )
+        target_model_config: ModelConfig,
+        target_parallel_config: ParallelConfig,
+        enable_chunked_prefill: bool,
+        disable_log_stats: bool,
+    ) -> Optional["SpeculativeConfig"]:
+        """Initializes and returns a SpeculativeConfig object based on
+        `speculative_config`.
+
+        This function utilizes `speculative_config` to create a
+        SpeculativeConfig object. The `speculative_config` can either be
+        provided as a JSON string input via CLI arguments or directly as a
+        dictionary from the engine.
+        """
+        if self.speculative_config is None:
+            return None
+
+        # Note(Shangming): These parameters are not obtained from the cli arg
+        # '--speculative-config' and must be passed in when creating the engine
+        # config.
+        self.speculative_config.update({
+            "target_model_config": target_model_config,
+            "target_parallel_config": target_parallel_config,
+            "enable_chunked_prefill": enable_chunked_prefill,
+            "disable_log_stats": disable_log_stats,
+        })
+        speculative_config = SpeculativeConfig.from_dict(
+            self.speculative_config)
+
+        return speculative_config
+
+    def create_engine_config(
+        self,
+        usage_context: Optional[UsageContext] = None,
+    ) -> AphroditeConfig:
+        """
+        Create the AphroditeConfig.
+
+        NOTE: for autoselection of V0 vs V1 engine, we need to
+        create the ModelConfig first, since ModelConfig's attrs
+        (e.g. the model arch) are needed to make the decision.
+
+        This function set APHRODITE_USE_V1=X if APHRODITE_USE_V1 is
+        unspecified by the user.
+
+        If APHRODITE_USE_V1 is specified by the user but the AphroditeConfig
+        is incompatible, we raise an error.
+        """
+        from aphrodite.platforms import current_platform
+        current_platform.pre_register_and_update()
+
+        device_config = DeviceConfig(device=self.device)
+        model_config = self.create_model_config()
+
+        # * If APHRODITE_USE_V1 is unset, we enable V1 for "supported features"
+        #   and fall back to V0 for experimental or unsupported features.
+        # * If APHRODITE_USE_V1=1, we enable V1 for supported + experimental
+        #   features and raise error for unsupported features.
+        # * If APHRODITE_USE_V1=0, we disable V1.
+        use_v1 = False
+        try_v1 = envs.APHRODITE_USE_V1 or not envs.is_set("APHRODITE_USE_V1")
+        if try_v1 and self._is_v1_supported_oracle(model_config):
+            use_v1 = True
+
+        # If user explicitly set APHRODITE_USE_V1, sanity check we respect it.
+        if envs.is_set("APHRODITE_USE_V1"):
+            assert use_v1 == envs.APHRODITE_USE_V1
+        # Otherwise, set the APHRODITE_USE_V1 variable globally.
+        else:
+            envs.set_aphrodite_use_v1(use_v1)
+
+        # Set default arguments for V0 or V1 Engine.
+        if use_v1:
+            self._set_default_args_v1(usage_context)
+        else:
+            self._set_default_args_v0(model_config)
+
+        assert self.enable_chunked_prefill is not None
+
         cache_config = CacheConfig(
-            self.block_size,
-            self.gpu_memory_utilization,
-            self.swap_space,
-            self.kv_cache_dtype,
-            # self.kv_quant_params_path,
-            model_config.get_sliding_window(),
-            self.context_shift,
+            block_size=self.block_size,
+            gpu_memory_utilization=self.gpu_memory_utilization,
+            swap_space=self.swap_space,
+            cache_dtype=self.kv_cache_dtype,
+            is_attention_free=model_config.is_attention_free,
+            num_gpu_blocks_override=self.num_gpu_blocks_override,
+            sliding_window=model_config.get_sliding_window(),
+            enable_prefix_caching=self.enable_prefix_caching,
+            prefix_caching_hash_algo=self.prefix_caching_hash_algo,
+            cpu_offload_gb=self.cpu_offload_gb,
+            calculate_kv_scales=self.calculate_kv_scales,
         )
+
+        # Get the current placement group if Ray is initialized and
+        # we are in a Ray actor. If so, then the placement group will be
+        # passed to spawned processes.
+        placement_group = None
+        if is_in_ray_actor():
+            import ray
+
+            # This call initializes Ray automatically if it is not initialized,
+            # but we should not do this here.
+            placement_group = ray.util.get_current_placement_group()
+
         parallel_config = ParallelConfig(
-            self.pipeline_parallel_size,
-            self.tensor_parallel_size,
-            self.worker_use_ray,
-            self.max_parallel_loading_workers,
-            self.disable_custom_all_reduce,
-            TokenizerPoolConfig.create_config(
-                self.tokenizer_pool_size,
-                self.tokenizer_pool_type,
-                self.tokenizer_pool_extra_config,
-            ),
-            self.ray_workers_use_nsight,
+            pipeline_parallel_size=self.pipeline_parallel_size,
+            tensor_parallel_size=self.tensor_parallel_size,
+            data_parallel_size=self.data_parallel_size,
+            enable_expert_parallel=self.enable_expert_parallel,
+            max_parallel_loading_workers=self.max_parallel_loading_workers,
+            disable_custom_all_reduce=self.disable_custom_all_reduce,
+            ray_workers_use_nsight=self.ray_workers_use_nsight,
+            placement_group=placement_group,
+            distributed_executor_backend=self.distributed_executor_backend,
+            worker_cls=self.worker_cls,
+            worker_extension_cls=self.worker_extension_cls,
         )
+
+        speculative_config = self.create_speculative_config(
+            target_model_config=model_config,
+            target_parallel_config=parallel_config,
+            enable_chunked_prefill=self.enable_chunked_prefill,
+            disable_log_stats=self.disable_log_stats,
+        )
+
+        # Reminder: Please update docs/source/features/compatibility_matrix.md
+        # If the feature combo become valid
+        if self.num_scheduler_steps > 1:
+            if speculative_config is not None:
+                raise ValueError("Speculative decoding is not supported with "
+                                 "multi-step (--num-scheduler-steps > 1)")
+            if self.enable_chunked_prefill and self.pipeline_parallel_size > 1:
+                raise ValueError("Multi-Step Chunked-Prefill is not supported "
+                                 "for pipeline-parallel-size > 1")
+            from aphrodite.platforms import current_platform
+            if current_platform.is_cpu():
+                logger.warning("Multi-Step (--num-scheduler-steps > 1) is "
+                               "currently not supported for CPUs and has been "
+                               "disabled.")
+                self.num_scheduler_steps = 1
+
+        # make sure num_lookahead_slots is set the higher value depending on
+        # if we are using speculative decoding or multi-step
+        num_lookahead_slots = max(self.num_lookahead_slots,
+                                  self.num_scheduler_steps - 1)
+        num_lookahead_slots = num_lookahead_slots \
+            if speculative_config is None \
+            else speculative_config.num_lookahead_slots
+
         scheduler_config = SchedulerConfig(
-            self.max_num_batched_tokens,
-            self.max_num_seqs,
-            model_config.max_model_len,
+            runner_type=model_config.runner_type,
+            max_num_batched_tokens=self.max_num_batched_tokens,
+            max_num_seqs=self.max_num_seqs,
+            max_model_len=model_config.max_model_len,
+            cuda_graph_sizes=self.cuda_graph_sizes,
+            num_lookahead_slots=num_lookahead_slots,
+            delay_factor=self.scheduler_delay_factor,
+            enable_chunked_prefill=self.enable_chunked_prefill,
+            disable_chunked_mm_input=self.disable_chunked_mm_input,
+            is_multimodal_model=model_config.is_multimodal_model,
+            preemption_mode=self.preemption_mode,
+            num_scheduler_steps=self.num_scheduler_steps,
+            multi_step_stream_outputs=self.multi_step_stream_outputs,
+            send_delta_data=(envs.APHRODITE_USE_RAY_SPMD_WORKER
+                             and parallel_config.use_ray),
+            policy=self.scheduling_policy,
+            scheduler_cls=self.scheduler_cls,
+            max_num_partial_prefills=self.max_num_partial_prefills,
+            max_long_partial_prefills=self.max_long_partial_prefills,
+            long_prefill_token_threshold=self.long_prefill_token_threshold,
+            single_user_mode=self.single_user_mode,
         )
-        lora_config = (LoRAConfig(
+
+        lora_config = LoRAConfig(
+            bias_enabled=self.enable_lora_bias,
             max_lora_rank=self.max_lora_rank,
             max_loras=self.max_loras,
+            fully_sharded_loras=self.fully_sharded_loras,
             lora_extra_vocab_size=self.lora_extra_vocab_size,
+            long_lora_scaling_factors=self.long_lora_scaling_factors,
             lora_dtype=self.lora_dtype,
-            max_cpu_loras=self.max_cpu_loras
-            if self.max_cpu_loras and self.max_cpu_loras > 0 else None,
-        ) if self.enable_lora else None)
-        return (
-            model_config,
-            cache_config,
-            parallel_config,
-            scheduler_config,
-            device_config,
-            lora_config,
+            max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
+            and self.max_cpu_loras > 0 else None) if self.enable_lora else None
+
+        if self.qlora_adapter_name_or_path is not None and \
+            self.qlora_adapter_name_or_path != "":
+            self.model_loader_extra_config[
+                "qlora_adapter_name_or_path"] = self.qlora_adapter_name_or_path
+
+        # bitsandbytes pre-quantized model need a specific model loader
+        if model_config.quantization == "bitsandbytes":
+            self.quantization = self.load_format = "bitsandbytes"
+
+        load_config = self.create_load_config()
+
+        prompt_adapter_config = PromptAdapterConfig(
+            max_prompt_adapters=self.max_prompt_adapters,
+            max_prompt_adapter_token=self.max_prompt_adapter_token) \
+                                        if self.enable_prompt_adapter else None
+
+        decoding_config = DecodingConfig(
+            backend=self.guided_decoding_backend,
+            disable_fallback=self.guided_decoding_disable_fallback,
+            disable_any_whitespace=self.guided_decoding_disable_any_whitespace,
+            disable_additional_properties=\
+                self.guided_decoding_disable_additional_properties,
+            reasoning_backend=self.reasoning_parser
         )
+
+        observability_config = ObservabilityConfig(
+            show_hidden_metrics_for_version=self.
+            show_hidden_metrics_for_version,
+            otlp_traces_endpoint=self.otlp_traces_endpoint,
+            collect_detailed_traces=self.collect_detailed_traces,
+        )
+
+        config = AphroditeConfig(
+            model_config=model_config,
+            cache_config=cache_config,
+            parallel_config=parallel_config,
+            scheduler_config=scheduler_config,
+            device_config=device_config,
+            lora_config=lora_config,
+            speculative_config=speculative_config,
+            load_config=load_config,
+            decoding_config=decoding_config,
+            observability_config=observability_config,
+            prompt_adapter_config=prompt_adapter_config,
+            compilation_config=self.compilation_config,
+            kv_transfer_config=self.kv_transfer_config,
+            kv_events_config=self.kv_events_config,
+            additional_config=self.additional_config,
+        )
+
+        return config
+
+    def _is_v1_supported_oracle(self, model_config: ModelConfig) -> bool:
+        """Oracle for whether to use V0 or V1 Engine by default."""
+
+        #############################################################
+        # Unsupported Feature Flags on V1.
+
+        if (self.load_format == LoadFormat.TENSORIZER.value
+                or self.load_format == LoadFormat.SHARDED_STATE.value):
+            _raise_or_fallback(
+                feature_name=f"--load_format {self.load_format}",
+                recommend_to_remove=False)
+            return False
+
+        if (self.logits_processor_pattern
+                != EngineArgs.logits_processor_pattern):
+            _raise_or_fallback(feature_name="--logits-processor-pattern",
+                               recommend_to_remove=False)
+            return False
+
+        if self.preemption_mode != SchedulerConfig.preemption_mode:
+            _raise_or_fallback(feature_name="--preemption-mode",
+                               recommend_to_remove=True)
+            return False
+
+        if (self.disable_async_output_proc
+                != EngineArgs.disable_async_output_proc):
+            _raise_or_fallback(feature_name="--disable-async-output-proc",
+                               recommend_to_remove=True)
+            return False
+
+        if self.scheduling_policy != SchedulerConfig.policy:
+            _raise_or_fallback(feature_name="--scheduling-policy",
+                               recommend_to_remove=False)
+            return False
+
+        if self.num_scheduler_steps != SchedulerConfig.num_scheduler_steps:
+            _raise_or_fallback(feature_name="--num-scheduler-steps",
+                               recommend_to_remove=True)
+            return False
+
+        if self.scheduler_delay_factor != SchedulerConfig.delay_factor:
+            _raise_or_fallback(feature_name="--scheduler-delay-factor",
+                               recommend_to_remove=True)
+            return False
+
+        if self.guided_decoding_backend not in get_args(
+                GuidedDecodingBackendV1):
+            _raise_or_fallback(
+                feature_name=
+                f"--guided-decoding-backend={self.guided_decoding_backend}",
+                recommend_to_remove=False)
+            return False
+
+        # Need at least Ampere for now (FA support required).
+        # Skip this check if we are running on a non-GPU platform,
+        # or if the device capability is not available
+        # (e.g. in a Ray actor without GPUs).
+        from aphrodite.platforms import current_platform
+        if (current_platform.is_cuda()
+                and current_platform.get_device_capability()
+                and current_platform.get_device_capability().major < 8):
+            _raise_or_fallback(feature_name="Compute Capability < 8.0",
+                               recommend_to_remove=False)
+            return False
+
+        # No Fp8 KV cache so far.
+        if self.kv_cache_dtype != "auto":
+            fp8_attention = self.kv_cache_dtype.startswith("fp8")
+            will_use_fa = (
+                current_platform.is_cuda()
+                and not envs.is_set("APHRODITE_ATTENTION_BACKEND")
+            ) or envs.APHRODITE_ATTENTION_BACKEND == "FLASH_ATTN_APHRODITE_V1"
+            supported = False
+            if fp8_attention and will_use_fa:
+                from aphrodite.attention.utils.fa_utils import (
+                    flash_attn_supports_fp8)
+                supported = flash_attn_supports_fp8()
+            if not supported:
+                _raise_or_fallback(feature_name="--kv-cache-dtype",
+                                   recommend_to_remove=False)
+                return False
+
+        # No Prompt Adapter so far.
+        if self.enable_prompt_adapter:
+            _raise_or_fallback(feature_name="--enable-prompt-adapter",
+                               recommend_to_remove=False)
+            return False
+
+        # Only Fp16 and Bf16 dtypes since we only support FA.
+        V1_SUPPORTED_DTYPES = [torch.bfloat16, torch.float16]
+        if model_config.dtype not in V1_SUPPORTED_DTYPES:
+            _raise_or_fallback(feature_name=f"--dtype {model_config.dtype}",
+                               recommend_to_remove=False)
+            return False
+
+        # No Embedding Models so far.
+        if model_config.task not in ["generate"]:
+            _raise_or_fallback(feature_name=f"--task {model_config.task}",
+                               recommend_to_remove=False)
+            return False
+
+        # No Mamba or Encoder-Decoder so far.
+        if not model_config.is_v1_compatible:
+            _raise_or_fallback(feature_name=model_config.architectures,
+                               recommend_to_remove=False)
+            return False
+
+        # No Concurrent Partial Prefills so far.
+        if (self.max_num_partial_prefills
+                != SchedulerConfig.max_num_partial_prefills
+                or self.max_long_partial_prefills
+                != SchedulerConfig.max_long_partial_prefills):
+            _raise_or_fallback(feature_name="Concurrent Partial Prefill",
+                               recommend_to_remove=False)
+            return False
+
+        # No OTLP observability so far.
+        if (self.otlp_traces_endpoint or self.collect_detailed_traces):
+            _raise_or_fallback(feature_name="--otlp-traces-endpoint",
+                               recommend_to_remove=False)
+            return False
+
+        # Only Ngram speculative decoding so far.
+        is_ngram_enabled = False
+        is_eagle_enabled = False
+        if self.speculative_config is not None:
+            # This is supported but experimental (handled below).
+            speculative_method = self.speculative_config.get("method")
+            if speculative_method:
+                if speculative_method in ("ngram", "[ngram]"):
+                    is_ngram_enabled = True
+                elif speculative_method in ("eagle", "eagle3"):
+                    is_eagle_enabled = True
+            else:
+                speculative_model = self.speculative_config.get("model")
+                if speculative_model in ("ngram", "[ngram]"):
+                    is_ngram_enabled = True
+            if not (is_ngram_enabled or is_eagle_enabled):
+                # Other speculative decoding methods are not supported yet.
+                _raise_or_fallback(feature_name="Speculative Decoding",
+                                   recommend_to_remove=False)
+                return False
+
+        # No XFormers so far.
+        V1_BACKENDS = [
+            "FLASH_ATTN_APHRODITE_V1",
+            "FLASH_ATTN",
+            "PALLAS",
+            "PALLAS_APHRODITE_V1",
+            "TRITON_ATTN_APHRODITE_V1",
+            "TRITON_MLA",
+            "FLASHMLA",
+            "FLASHINFER",
+            "FLASHINFER_APHRODITE_V1",
+        ]
+        if (envs.is_set("APHRODITE_ATTENTION_BACKEND")
+                and envs.APHRODITE_ATTENTION_BACKEND not in V1_BACKENDS):
+            name = f"APHRODITE_ATTENTION_BACKEND={envs.APHRODITE_ATTENTION_BACKEND}"
+            _raise_or_fallback(feature_name=name, recommend_to_remove=True)
+            return False
+
+        # Platforms must decide if they can support v1 for this model
+        if not current_platform.supports_v1(model_config=model_config):
+            _raise_or_fallback(
+                feature_name=f"device type={current_platform.device_type}",
+                recommend_to_remove=False)
+            return False
+        #############################################################
+        # Experimental Features - allow users to opt in.
+
+        # Signal Handlers requires running in main thread.
+        if (threading.current_thread() != threading.main_thread()
+                and _warn_or_fallback("Engine in background thread")):
+            return False
+
+        # PP is supported on V1 with Ray distributed executor,
+        # but off for MP distributed executor for now.
+        if (self.pipeline_parallel_size > 1
+                and self.distributed_executor_backend != "ray"):
+            name = "Pipeline Parallelism without Ray distributed executor"
+            _raise_or_fallback(feature_name=name, recommend_to_remove=False)
+            return False
+
+        # ngram is supported on V1, but off by default for now.
+        if is_ngram_enabled and _warn_or_fallback("ngram"):
+            return False
+
+        # Eagle is under development, so we don't support it yet.
+        if is_eagle_enabled and _warn_or_fallback("Eagle"):
+            return False
+
+        # Non-CUDA is supported on V1, but off by default for now.
+        not_cuda = not current_platform.is_cuda()
+        if not_cuda and _warn_or_fallback(  # noqa: SIM103
+                current_platform.device_name):
+            return False
+        #############################################################
+
+        return True
+
+    def _set_default_args_v0(self, model_config: ModelConfig) -> None:
+        """Set Default Arguments for V0 Engine."""
+
+        max_model_len = model_config.max_model_len
+        use_long_context = max_model_len > 32768
+        if self.enable_chunked_prefill is None:
+            # Chunked prefill not supported for Multimodal or MLA in V0.
+            if model_config.is_multimodal_model or model_config.use_mla:
+                self.enable_chunked_prefill = False
+
+            # Enable chunked prefill by default for long context (> 32K)
+            # models to avoid OOM errors in initial memory profiling phase.
+            elif use_long_context:
+                from aphrodite.platforms import current_platform
+                is_gpu = current_platform.is_cuda()
+                use_sliding_window = (model_config.get_sliding_window()
+                                      is not None)
+                use_spec_decode = self.speculative_config is not None
+
+                if (is_gpu and not use_sliding_window and not use_spec_decode
+                        and not self.enable_lora
+                        and not self.enable_prompt_adapter
+                        and model_config.runner_type != "pooling"):
+                    self.enable_chunked_prefill = True
+                    logger.warning(
+                        "Chunked prefill is enabled by default for models "
+                        "with max_model_len > 32K. Chunked prefill might "
+                        "not work with some features or models. If you "
+                        "encounter any issues, please disable by launching "
+                        "with --enable-chunked-prefill=False.")
+
+            if self.enable_chunked_prefill is None:
+                self.enable_chunked_prefill = False
+
+        if not self.enable_chunked_prefill and use_long_context:
+            logger.warning(
+                "The model has a long context length ({}). This may cause"
+                "OOM during the initial memory profiling phase, or result "
+                "in low performance due to small KV cache size. Consider "
+                "setting --max-model-len to a smaller value.", max_model_len)
+        elif (self.enable_chunked_prefill
+              and model_config.runner_type == "pooling"):
+            msg = "Chunked prefill is not supported for pooling models"
+            raise ValueError(msg)
+
+        # if using prefix caching, we must set a hash algo
+        if self.enable_prefix_caching:
+            # Disable prefix caching for multimodal models for APHRODITE_V0.
+            if model_config.is_multimodal_model:
+                logger.warning(
+                    "--enable-prefix-caching is not supported for multimodal "
+                    "models in V0 and has been disabled.")
+                self.enable_prefix_caching = False
+
+            # APHRODITE_V0 only supports builtin hash algo for prefix caching.
+            if self.prefix_caching_hash_algo == "sha256":
+                raise ValueError(
+                    "sha256 is not supported for prefix caching in V0 engine. "
+                    "Please use 'builtin'.")
+
+        # Set max_num_seqs to 256 for APHRODITE_V0.
+        if self.max_num_seqs is None:
+            self.max_num_seqs = 256
+
+    def _set_default_args_v1(self, usage_context: UsageContext) -> None:
+        """Set Default Arguments for V1 Engine."""
+
+        # V1 always uses chunked prefills.
+        self.enable_chunked_prefill = True
+
+        # V1 enables prefix caching by default.
+        if self.enable_prefix_caching is None:
+            self.enable_prefix_caching = True
+
+        # V1 should use the new scheduler by default.
+        # Swap it only if this arg is set to the original V0 default
+        if self.scheduler_cls == EngineArgs.scheduler_cls:
+            self.scheduler_cls = "aphrodite.v1.core.sched.scheduler.Scheduler"
+
+        # When no user override, set the default values based on the usage
+        # context.
+        # Use different default values for different hardware.
+
+        # Try to query the device name on the current platform. If it fails,
+        # it may be because the platform that imports Aphrodite is not the same
+        # as the platform that Aphrodite is running on (e.g. the case of scaling
+        # Aphrodite with Ray) and has no GPUs. In this case we use the default
+        # values for non-H100/H200 GPUs.
+        try:
+            from aphrodite.platforms import current_platform
+            device_memory = current_platform.get_device_total_memory()
+        except Exception:
+            # This is only used to set default_max_num_batched_tokens
+            device_memory = 0
+
+        if device_memory >= 70 * GiB_bytes:
+            # For GPUs like H100 and MI300x, use larger default values.
+            default_max_num_batched_tokens = {
+                UsageContext.LLM_CLASS: 16384,
+                UsageContext.OPENAI_API_SERVER: 8192,
+            }
+            default_max_num_seqs = 1024
+        else:
+            # TODO(woosuk): Tune the default values for other hardware.
+            default_max_num_batched_tokens = {
+                UsageContext.LLM_CLASS: 8192,
+                UsageContext.OPENAI_API_SERVER: 2048,
+            }
+            default_max_num_seqs = 256
+
+        use_context_value = usage_context.value if usage_context else None
+        if (self.max_num_batched_tokens is None
+                and usage_context in default_max_num_batched_tokens):
+            self.max_num_batched_tokens = default_max_num_batched_tokens[
+                usage_context]
+            logger.debug(
+                "Setting max_num_batched_tokens to {} for {} usage context.",
+                self.max_num_batched_tokens, use_context_value)
+
+        if self.max_num_seqs is None:
+            self.max_num_seqs = default_max_num_seqs
+
+            logger.debug("Setting max_num_seqs to {} for {} usage context.",
+                         self.max_num_seqs, use_context_value)
 
 
 @dataclass
 class AsyncEngineArgs(EngineArgs):
     """Arguments for asynchronous Aphrodite engine."""
-
-    engine_use_ray: bool = False
     disable_log_requests: bool = False
-    max_log_len: int = 0
 
     @staticmethod
-    def add_cli_args(
-            parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-        parser = EngineArgs.add_cli_args(parser)
-        parser.add_argument(
-            "--engine-use-ray",
-            action="store_true",
-            help="use Ray to start the LLM engine in a "
-            "separate process as the server process.",
-        )
-        parser.add_argument(
-            "--disable-log-requests",
-            action="store_true",
-            help="disable logging requests",
-        )
-        parser.add_argument(
-            "--max-log-len",
-            type=int,
-            default=0,
-            help="max number of prompt characters or prompt "
-            "ID numbers being printed in log. "
-            "Default: unlimited.",
-        )
+    def add_cli_args(parser: FlexibleArgumentParser,
+                     async_args_only: bool = False) -> FlexibleArgumentParser:
+        # Initialize plugin to update the parser, for example, The plugin may
+        # adding a new kind of quantization method to --quantization argument or
+        # a new device to --device argument.
+        load_general_plugins()
+        if not async_args_only:
+            parser = EngineArgs.add_cli_args(parser)
+        parser.add_argument('--disable-log-requests',
+                            action='store_true',
+                            help='Disable logging requests.')
+        from aphrodite.platforms import current_platform
+        current_platform.pre_register_and_update(parser)
         return parser
+
+
+def _raise_or_fallback(feature_name: str, recommend_to_remove: bool):
+    if envs.is_set("APHRODITE_USE_V1") and envs.APHRODITE_USE_V1:
+        raise NotImplementedError(
+            f"APHRODITE_USE_V1=1 is not supported with {feature_name}.")
+    msg = f"{feature_name} is not supported by the V1 Engine. "
+    msg += "Falling back to V0. "
+    if recommend_to_remove:
+        msg += f"We recommend to remove {feature_name} from your config "
+        msg += "in favor of the V1 Engine."
+    logger.warning(msg)
+
+
+def _warn_or_fallback(feature_name: str) -> bool:
+    if envs.is_set("APHRODITE_USE_V1") and envs.APHRODITE_USE_V1:
+        logger.warning(
+            "Detected APHRODITE_USE_V1=1 with {}. Usage should "
+            "be considered experimental. Please report any "
+            "issues on Github.", feature_name)
+        should_exit = False
+    else:
+        logger.info(
+            "{} is experimental on APHRODITE_USE_V1=1. "
+            "Falling back to V0 Engine.", feature_name)
+        should_exit = True
+    return should_exit
+
+
+def human_readable_int(value):
+    """Parse human-readable integers like '1k', '2M', etc.
+    Including decimal values with decimal multipliers.
+
+    Examples:
+    - '1k' -> 1,000
+    - '1K' -> 1,024
+    - '25.6k' -> 25,600
+    """
+    value = value.strip()
+    match = re.fullmatch(r'(\d+(?:\.\d+)?)([kKmMgGtT])', value)
+    if match:
+        decimal_multiplier = {
+            'k': 10**3,
+            'm': 10**6,
+            'g': 10**9,
+        }
+        binary_multiplier = {
+            'K': 2**10,
+            'M': 2**20,
+            'G': 2**30,
+        }
+
+        number, suffix = match.groups()
+        if suffix in decimal_multiplier:
+            mult = decimal_multiplier[suffix]
+            return int(float(number) * mult)
+        elif suffix in binary_multiplier:
+            mult = binary_multiplier[suffix]
+            # Do not allow decimals with binary multipliers
+            try:
+                return int(number) * mult
+            except ValueError as e:
+                raise argparse.ArgumentTypeError("Decimals are not allowed " \
+                f"with binary suffixes like {suffix}. Did you mean to use " \
+                f"{number}{suffix.lower()} instead?") from e
+
+    # Regular plain number.
+    return int(value)
+
+
+# These functions are used by sphinx to build the documentation
+def _engine_args_parser():
+    return EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+
+def _async_engine_args_parser():
+    return AsyncEngineArgs.add_cli_args(FlexibleArgumentParser(),
+                                        async_args_only=True)

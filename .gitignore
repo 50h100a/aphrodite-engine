@@ -6,12 +6,12 @@ repos
 *.so
 .conda
 build
-dist*
 .VSCodeCounter
 conda/
 umamba.exe
 bin/
 *.whl
+aphrodite/commit_id.py
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -39,6 +39,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+/.deps/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -201,3 +202,16 @@ keys/
 kv_cache_states/*
 quant_params/*
 .ruff_cache/
+images/
+
+*.pdb
+
+# triton compiled files
+*.exp
+*.lib
+*.obj
+
+# generated files
+**/generated/**
+aphrodite/_version.py
+shellcheck-stable/

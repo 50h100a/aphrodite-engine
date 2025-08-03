@@ -1,18 +1,19 @@
 name: aphrodite
 channels:
   - nvidia
-  - pytorch
-  - nvidia/label/cuda-12.1.1
+  - nvidia/label/cuda-12.4.1
   - conda-forge
   - defaults
 dependencies:
   - python=3.11.*
-  - pytorch=2.2.*
-  - pytorch-cuda=12.1
-  - cuda-nvcc=12.1
-  - cuda-libraries-dev=12.1
+  - cuda-nvcc=12.4.*
+  - cuda-libraries-dev=12.4.*
+  - cuda=12.4.*
+  - cuda-version=12.4.*
+  - nccl
   - cxx-compiler
   - gxx=11.3
   - pip
   - git=2.35.1
   - ninja
+  - ccache

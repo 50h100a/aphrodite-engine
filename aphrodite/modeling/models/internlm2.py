@@ -1,37 +1,38 @@
-# -*- coding: utf-8 -*-
-from typing import Any, Dict, List, Optional, Tuple
+from functools import partial
+from typing import Any, Dict, Iterable, Optional, Set, Tuple, Type, Union
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from aphrodite.modeling.metadata import InputMetadata
+from aphrodite.attention import Attention
+from aphrodite.common.config import AphroditeConfig, CacheConfig
+from aphrodite.common.sequence import IntermediateTensors, PoolerOutput
+from aphrodite.compilation.decorators import support_torch_compile
+from aphrodite.distributed import (get_pp_group,
+                                   get_tensor_model_parallel_rank,
+                                   get_tensor_model_parallel_world_size,
+                                   split_tensor_along_last_dim,
+                                   tensor_model_parallel_all_gather)
 from aphrodite.modeling.layers.activation import SiluAndMul
-from aphrodite.modeling.layers.attention import Attention
 from aphrodite.modeling.layers.layernorm import RMSNorm
-from aphrodite.modeling.layers.linear import (
-    LinearMethodBase,
-    ColumnParallelLinear,
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from aphrodite.modeling.layers.linear import (MergedColumnParallelLinear,
+                                              QKVParallelLinear,
+                                              RowParallelLinear)
+from aphrodite.modeling.layers.logits_processor import LogitsProcessor
+from aphrodite.modeling.layers.pooler import Pooler, PoolingType
 from aphrodite.modeling.layers.rotary_embedding import get_rope
-from aphrodite.modeling.layers.sampler import Sampler, QuantSampler
 from aphrodite.modeling.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding,
-    ParallelLMHead,
-)
-from aphrodite.modeling.megatron.parallel_state import (
-    get_tensor_model_parallel_world_size, )
+    ParallelLMHead, VocabParallelEmbedding)
+from aphrodite.modeling.model_loader.weight_utils import default_weight_loader
+from aphrodite.modeling.pooling_metadata import PoolingMetadata
 from aphrodite.modeling.sampling_metadata import SamplingMetadata
-from aphrodite.modeling.hf_downloader import (
-    default_weight_loader,
-    hf_model_weights_iterator,
-)
-from aphrodite.common.sequence import SamplerOutput
+from aphrodite.quantization import QuantizationConfig
 
-KVCache = Tuple[torch.Tensor, torch.Tensor]
+from .interfaces import SupportsLoRA, SupportsPP
+from .utils import (is_pp_missing_parameter,
+                    make_empty_intermediate_tensors_factory, make_layers,
+                    maybe_prefix)
 
 
 class InternLM2MLP(nn.Module):
@@ -41,37 +42,23 @@ class InternLM2MLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
-        linear_method: Optional[LinearMethodBase] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
-        if (linear_method is not None
-                and not linear_method.quant_config.merge_weight()):
-            self.merge_weight = False
-            self.w1 = ColumnParallelLinear(
-                hidden_size,
-                intermediate_size,
-                bias=False,
-                linear_method=linear_method,
-            )
-            self.w3 = ColumnParallelLinear(
-                hidden_size,
-                intermediate_size,
-                bias=False,
-                linear_method=linear_method,
-            )
-        else:
-            self.merge_weight = True
-            self.gate_up_proj = MergedColumnParallelLinear(
-                hidden_size,
-                [intermediate_size] * 2,
-                bias=False,
-                linear_method=linear_method,
-            )
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
         self.w2 = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
-            linear_method=linear_method,
+            quant_config=quant_config,
+            prefix=f"{prefix}.w2",
         )
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
@@ -79,12 +66,7 @@ class InternLM2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        if self.merge_weight:
-            gate_up, _ = self.gate_up_proj(x)
-        else:
-            up, _ = self.up_proj(x)
-            gate, _ = self.gate_proj(x)
-            gate_up = torch.cat([gate, up], dim=-1)
+        gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.w2(x)
         return x
@@ -100,27 +82,31 @@ class InternLM2Attention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
-        linear_method: Optional[LinearMethodBase] = None,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        assert self.total_num_heads % self.tp_size == 0
+        self.num_heads = self.total_num_heads // self.tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
+        if self.total_num_kv_heads >= self.tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
+            assert self.total_num_kv_heads % self.tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            assert self.tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
         self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
+        self.key_value_groups = int(self.num_heads / self.num_kv_heads)
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -131,13 +117,15 @@ class InternLM2Attention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=False,
-            linear_method=linear_method,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wqkv",
         )
         self.wo = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
-            linear_method=linear_method,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wo",
         )
 
         self.rotary_emb = get_rope(
@@ -152,20 +140,44 @@ class InternLM2Attention(nn.Module):
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn",
         )
+
+    def split_qkv(self, qkv: torch.Tensor):
+        seq_len = qkv.shape[0]
+        if self.tp_size > 1:
+            qkv_map = [self.q_size, self.kv_size, self.kv_size] * self.tp_size
+            qkv = tensor_model_parallel_all_gather(qkv)
+            qkv = torch.split(qkv, qkv_map, dim=-1)
+            qkv = qkv[::3] + qkv[1::3] + qkv[2::3]
+            qkv = torch.cat(qkv, dim=-1)
+
+        qkv = qkv.view(seq_len, self.total_num_kv_heads,
+                       self.key_value_groups + 2, self.head_dim)
+        q, k, v = torch.split(qkv, [self.key_value_groups, 1, 1], dim=-2)
+        q = q.reshape(seq_len, self.q_size * self.tp_size)
+        k = k.reshape(seq_len, self.kv_size * self.tp_size)
+        v = v.reshape(seq_len, self.kv_size * self.tp_size)
+
+        if self.tp_size > 1:
+            splitter = partial(split_tensor_along_last_dim,
+                               num_partitions=self.tp_size)
+            q = splitter(q)[self.tp_rank]
+            k = splitter(k)[self.tp_rank]
+            v = splitter(v)[self.tp_rank]
+        return q, k, v
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: KVCache,
-        input_metadata: InputMetadata,
     ) -> torch.Tensor:
         qkv, _ = self.wqkv(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = self.split_qkv(qkv)
         q, k = self.rotary_emb(positions, q, k)
-        k_cache, v_cache = kv_cache
-        attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata)
+        attn_output = self.attn(q, k, v)
         output, _ = self.wo(attn_output)
         return output
 
@@ -175,7 +187,9 @@ class InternLMDecoderLayer(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        linear_method: Optional[LinearMethodBase] = None,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -190,13 +204,16 @@ class InternLMDecoderLayer(nn.Module):
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
-            linear_method=linear_method,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attention",
         )
         self.feed_forward = InternLM2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
-            linear_method=linear_method,
+            quant_config=quant_config,
+            prefix=f"{prefix}.feed_forward",
         )
         self.attention_norm = RMSNorm(config.hidden_size,
                                       eps=config.rms_norm_eps)
@@ -206,8 +223,6 @@ class InternLMDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: KVCache,
-        input_metadata: InputMetadata,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
@@ -220,8 +235,6 @@ class InternLMDecoderLayer(nn.Module):
         hidden_states = self.attention(
             positions=positions,
             hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            input_metadata=input_metadata,
         )
 
         # Fully Connected
@@ -230,120 +243,143 @@ class InternLMDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+@support_torch_compile
 class InternLM2Model(nn.Module):
 
     def __init__(
-        self,
-        config: PretrainedConfig,
-        linear_method: Optional[LinearMethodBase] = None,
-    ) -> None:
+            self,
+            *,
+            aphrodite_config: AphroditeConfig,
+            prefix: str = "",
+            layer_type: Type[InternLMDecoderLayer] = InternLMDecoderLayer):
         super().__init__()
+
+        config = aphrodite_config.model_config.hf_config
+        cache_config = aphrodite_config.cache_config
+        quant_config = aphrodite_config.quant_config
+
         self.config = config
-        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.tok_embeddings = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            linear_method=linear_method,
         )
-        self.layers = nn.ModuleList([
-            InternLMDecoderLayer(config, linear_method)
-            for _ in range(config.num_hidden_layers)
-        ])
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda prefix: layer_type(
+                config, cache_config, quant_config, prefix=prefix),
+            prefix=f"{prefix}.layers")
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.make_empty_intermediate_tensors = (
+            make_empty_intermediate_tensors_factory(
+                ["hidden_states", "residual"], config.hidden_size))
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.tok_embeddings(input_ids)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[KVCache],
-        input_metadata: InputMetadata,
-    ) -> torch.Tensor:
-        hidden_states = self.tok_embeddings(input_ids)
-        residual = None
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                kv_caches[i],
-                input_metadata,
-                residual,
-            )
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.get_input_embeddings(input_ids)
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+        for layer in self.layers[self.start_layer:self.end_layer]:
+            hidden_states, residual = layer(positions, hidden_states, residual)
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors({
+                "hidden_states": hidden_states,
+                "residual": residual
+            })
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
-class InternLM2ForCausalLM(nn.Module):
+class InternLM2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
+    packed_modules_mapping = {
+        "wqkv": ["wqkv"],
+        "gate_up_proj": ["w1", "w3"],
+    }
 
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        linear_method: Optional[LinearMethodBase] = None,
-    ) -> None:
+    def __init__(self,
+                 *,
+                 aphrodite_config: AphroditeConfig,
+                 prefix: str = "",
+                 model_type: Type[InternLM2Model] = InternLM2Model):
         super().__init__()
+        config = aphrodite_config.model_config.hf_config
+        quant_config = aphrodite_config.quant_config
+        lora_config = aphrodite_config.lora_config
+
         self.config = config
-        self.linear_method = linear_method
-        self.model = InternLM2Model(config, linear_method)
-        self.output = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            linear_method=linear_method,
-        )
-        self.sampler = Sampler(config.vocab_size)
-        self.quant_sampler = QuantSampler(config.vocab_size)
+        self.quant_config = quant_config
+        self.lora_config = lora_config
+
+        self.model = model_type(aphrodite_config=aphrodite_config,
+                                prefix=maybe_prefix(prefix, "model"))
+        self.output = ParallelLMHead(config.vocab_size,
+                                     config.hidden_size,
+                                     quant_config=quant_config,
+                                     prefix=maybe_prefix(prefix, "output"))
+        if self.config.tie_word_embeddings:
+            self.output.weight = self.model.tok_embeddings.weight
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors)
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.get_input_embeddings(input_ids)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[KVCache],
-        input_metadata: InputMetadata,
+        intermediate_tensors: Optional[IntermediateTensors],
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, kv_caches,
-                                   input_metadata)
+        hidden_states = self.model(input_ids, positions, intermediate_tensors,
+                                   inputs_embeds)
         return hidden_states
 
-    def sample(
+    def compute_logits(
         self,
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        if (self.linear_method is not None
-                and not self.linear_method.quant_config.merge_weight()):
-            next_tokens = self.quant_sampler(self.output(hidden_states),
-                                             sampling_metadata)
-        else:
-            next_tokens = self.sampler(self.output.weight, hidden_states,
+    ) -> Optional[torch.Tensor]:
+        logits = self.logits_processor(self.output, hidden_states,
                                        sampling_metadata)
-        return next_tokens
+        return logits
 
-    def load_weights(
-        self,
-        model_name_or_path: str,
-        cache_dir: Optional[str] = None,
-        load_format: str = "auto",
-        revision: Optional[str] = None,
-    ):
+    def load_weights(self, weights: Iterable[Tuple[str,
+                                                   torch.Tensor]]) -> Set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "w1", 0),
             ("gate_up_proj", "w3", 1),
         ]
-        if (self.linear_method is not None
-                and not self.linear_method.quant_config.merge_weight()):
-            stacked_params_mapping = []
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in hf_model_weights_iterator(
-                model_name_or_path, cache_dir, load_format, revision):
+        loaded_params: Set[str] = set()
+        for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
+            for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if is_pp_missing_parameter(name, self):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -353,25 +389,64 @@ class InternLM2ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                if is_pp_missing_parameter(name, self):
+                    continue
                 param = params_dict[name]
-                if "wqkv" in name:
-                    config = self.config
-                    kv_groups = (config.num_attention_heads //
-                                 config.num_key_value_heads)
-                    head_dim = config.hidden_size // config.num_attention_heads
-                    loaded_weight = loaded_weight.view(-1, 2 + kv_groups,
-                                                       head_dim,
-                                                       loaded_weight.shape[-1])
-                    wq, wk, wv = torch.split(loaded_weight, [kv_groups, 1, 1],
-                                             dim=1)
-                    wq = wq.reshape(-1, wq.shape[-1])
-                    wk = wk.reshape(-1, wk.shape[-1])
-                    wv = wv.reshape(-1, wv.shape[-1])
-                    weight_loader = param.weight_loader
-                    weight_loader(param, wq, "q")
-                    weight_loader(param, wk, "k")
-                    weight_loader(param, wv, "v")
-                else:
-                    weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
-                    weight_loader(param, loaded_weight)
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
+
+
+class InternLM2ForRewardModel(InternLM2ForCausalLM):
+
+    def __init__(
+        self,
+        *,
+        aphrodite_config: AphroditeConfig,
+        prefix: str = "",
+        model_type: Type[InternLM2Model] = InternLM2Model,
+    ):
+        super().__init__(aphrodite_config=aphrodite_config,
+                         prefix=prefix,
+                         model_type=model_type)
+
+        for attr in ("output", "logits_processor"):
+            delattr(self, attr)
+
+        config = aphrodite_config.model_config.hf_config
+        self.v_head = RowParallelLinear(
+            config.hidden_size,
+            1,
+            bias=False,
+            input_is_parallel=False,
+            prefix=maybe_prefix(prefix, "v_head"),
+        )
+
+        pooler_config = aphrodite_config.model_config.pooler_config
+        self._pooler = Pooler.from_config_with_defaults(
+            pooler_config,
+            pooling_type=PoolingType.ALL,
+            normalize=False,
+            softmax=False,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        hidden_states = self.model(input_ids, positions, intermediate_tensors,
+                                   inputs_embeds)
+        logits, _ = self.v_head(hidden_states)
+        return logits
+
+    def pooler(
+        self,
+        hidden_states: torch.Tensor,
+        pooling_metadata: PoolingMetadata,
+    ) -> Optional[PoolerOutput]:
+        return self._pooler(hidden_states, pooling_metadata)

@@ -1,7 +1,5 @@
-# coding=utf-8
 # Adapted from
 # https://huggingface.co/microsoft/phi-1_5/blob/main/modeling_phi.py
-# Copyright 2023 The PygmalionAI team.
 # Copyright 2023 The vLLM team.
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
@@ -35,48 +33,44 @@
 # CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-"""Inference-only Phi model compatible with HuggingFace weights."""
-
-from typing import List, Optional, Tuple
+"""Inference-only Phi-1.5 model compatible with HuggingFace weights."""
+from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import PhiConfig
 
-from aphrodite.modeling.metadata import InputMetadata
+from aphrodite.attention import Attention
+from aphrodite.common.config import AphroditeConfig, CacheConfig
+from aphrodite.common.sequence import IntermediateTensors
+from aphrodite.compilation.decorators import support_torch_compile
+from aphrodite.distributed import (get_pp_group,
+                                   get_tensor_model_parallel_world_size)
 from aphrodite.modeling.layers.activation import get_act_fn
-from aphrodite.modeling.layers.attention import Attention
-from aphrodite.modeling.layers.linear import (
-    ColumnParallelLinear,
-    LinearMethodBase,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from aphrodite.modeling.layers.linear import (ColumnParallelLinear,
+                                              QKVParallelLinear,
+                                              RowParallelLinear)
+from aphrodite.modeling.layers.logits_processor import LogitsProcessor
 from aphrodite.modeling.layers.rotary_embedding import get_rope
-from aphrodite.modeling.layers.sampler import Sampler, QuantSampler
 from aphrodite.modeling.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding,
-    ParallelLMHead,
-)
-from aphrodite.modeling.megatron.parallel_state import (
-    get_tensor_model_parallel_world_size, )
+    ParallelLMHead, VocabParallelEmbedding)
+from aphrodite.modeling.model_loader.weight_utils import default_weight_loader
 from aphrodite.modeling.sampling_metadata import SamplingMetadata
-from aphrodite.modeling.hf_downloader import (
-    default_weight_loader,
-    hf_model_weights_iterator,
-)
-from aphrodite.common.sequence import SamplerOutput
+from aphrodite.quantization import QuantizationConfig
 
-KVCache = Tuple[torch.Tensor, torch.Tensor]
+from .interfaces import SupportsLoRA, SupportsPP
+from .utils import (AutoWeightsLoader, is_pp_missing_parameter,
+                    make_empty_intermediate_tensors_factory, make_layers,
+                    maybe_prefix)
 
 
 class PhiAttention(nn.Module):
 
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        linear_method: Optional[LinearMethodBase] = None,
-    ):
+    def __init__(self,
+                 config: PhiConfig,
+                 cache_config: Optional[CacheConfig] = None,
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = ""):
         super().__init__()
         self.total_num_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
@@ -89,40 +83,17 @@ class PhiAttention(nn.Module):
                           tensor_model_parallel_world_size)
 
         # pylint: disable=C0103
-        if (linear_method is not None
-                and not linear_method.quant_config.merge_weight()):
-            self.merge_weight = False
-            self.q_proj = ColumnParallelLinear(
-                self.hidden_size,
-                self.hidden_size,
-                bias=True,
-                linear_method=linear_method,
-            )
-            self.k_proj = ColumnParallelLinear(
-                self.hidden_size,
-                self.hidden_size,
-                bias=True,
-                linear_method=linear_method,
-            )
-            self.v_proj = ColumnParallelLinear(
-                self.hidden_size,
-                self.hidden_size,
-                bias=True,
-                linear_method=linear_method,
-            )
-        else:
-            self.merge_weight = True
-            self.qkv_proj = QKVParallelLinear(
-                self.hidden_size,
-                self.head_size,
-                self.total_num_heads,
-                bias=True,
-                linear_method=linear_method,
-            )
+        self.qkv_proj = QKVParallelLinear(
+            self.hidden_size,
+            self.head_size,
+            self.total_num_heads,
+            bias=True,
+            quant_config=quant_config,
+        )
         self.dense = RowParallelLinear(
             self.hidden_size,
             self.hidden_size,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
 
         scaling = self.head_size**-0.5
@@ -133,48 +104,40 @@ class PhiAttention(nn.Module):
         # pylint: disable=C0301
         # Refer to:
         # https://huggingface.co/microsoft/phi-1_5/blob/d212a789620c380ff32ca1d1ee9943a777360987/modeling_phi.py#L518
-        rope_theta = 10000
-        max_position_embeddings = getattr(config, "n_positions", 2048)
-        is_neox_style = (True if linear_method is None
-                         or linear_method.quant_config.rope_style() is None
-                         else linear_method.quant_config.rope_style())
+        rope_theta = getattr(config, "rope_theta", 10000.0)
+        max_position_embeddings = getattr(config, "max_position_embeddings",
+                                          2048)
         self.rotary_emb = get_rope(
             self.head_size,
             rotary_dim=rotary_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
-            is_neox_style=is_neox_style,
         )
-        self.attn = Attention(self.num_heads, self.head_size, scaling)
+        self.attn = Attention(self.num_heads,
+                              self.head_size,
+                              scaling,
+                              cache_config=cache_config,
+                              quant_config=quant_config,
+                              prefix=f"{prefix}.attn")
 
     def forward(
         self,
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: KVCache,
-        input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        if self.merge_weight:
-            qkv, _ = self.qkv_proj(hidden_states)
-            q, k, v = qkv.chunk(chunks=3, dim=-1)
-        else:
-            q, _ = self.q_proj(hidden_states)
-            k, _ = self.k_proj(hidden_states)
-            v, _ = self.v_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.chunk(chunks=3, dim=-1)
         q, k = self.rotary_emb(position_ids, q, k)
-        k_cache, v_cache = kv_cache
-        attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata)
+        attn_output = self.attn(q, k, v)
         output, _ = self.dense(attn_output)
         return output
 
 
 class PhiMLP(nn.Module):
 
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        linear_method: Optional[LinearMethodBase] = None,
-    ):
+    def __init__(self,
+                 config: PhiConfig,
+                 quant_config: Optional[QuantizationConfig] = None):
         super().__init__()
 
         n_inner = getattr(config, "n_inner", None)
@@ -183,15 +146,14 @@ class PhiMLP(nn.Module):
         self.fc1 = ColumnParallelLinear(
             config.hidden_size,
             n_inner,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
         self.fc2 = RowParallelLinear(
             n_inner,
             config.hidden_size,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
-        quant_config = getattr(linear_method, "quant_config", None)
-        self.act = get_act_fn(config.hidden_act, quant_config, n_inner)
+        self.act = get_act_fn(config.hidden_act)
 
     def forward(self, hidden_states):
         hidden_states, _ = self.fc1(hidden_states)
@@ -202,157 +164,112 @@ class PhiMLP(nn.Module):
 
 class PhiLayer(nn.Module):
 
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        linear_method: Optional[LinearMethodBase] = None,
-    ):
+    def __init__(self,
+                 config: PhiConfig,
+                 cache_config: Optional[CacheConfig] = None,
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = ""):
         super().__init__()
         self.input_layernorm = nn.LayerNorm(config.hidden_size,
                                             eps=config.layer_norm_eps)
-        self.self_attn = PhiAttention(config, linear_method)
-        self.mlp = PhiMLP(config, linear_method)
+        self.self_attn = PhiAttention(config,
+                                      cache_config,
+                                      quant_config,
+                                      prefix=f"{prefix}.self_attn")
+        self.mlp = PhiMLP(config, quant_config)
 
     def forward(
         self,
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: KVCache,
-        input_metadata: InputMetadata,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         attn_outputs = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            input_metadata=input_metadata,
         )
         feed_forward_hidden_states = self.mlp(hidden_states)
         hidden_states = attn_outputs + feed_forward_hidden_states + residual
         return hidden_states
 
 
+@support_torch_compile
 class PhiModel(nn.Module):
 
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        linear_method: Optional[LinearMethodBase] = None,
-    ):
+    def __init__(self, *, aphrodite_config: AphroditeConfig, prefix: str = ""):
         super().__init__()
+
+        config = aphrodite_config.model_config.hf_config
+        cache_config = aphrodite_config.cache_config
+        quant_config = aphrodite_config.quant_config
+
         self.config = config
-        self.linear_method = linear_method
+        self.quant_config = quant_config
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size,
-                                                   config.hidden_size,
-                                                   linear_method=linear_method)
-        self.layers = nn.ModuleList([
-            PhiLayer(config, linear_method)
-            for _ in range(config.num_hidden_layers)
-        ])
+                                                   config.hidden_size)
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda prefix: PhiLayer(
+                config, cache_config, quant_config, prefix=prefix),
+            prefix=f"{prefix}.layers")
         self.final_layernorm = nn.LayerNorm(config.hidden_size,
                                             eps=config.layer_norm_eps)
+        self.make_empty_intermediate_tensors = (
+            make_empty_intermediate_tensors_factory(["hidden_states"],
+                                                    config.hidden_size))
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[KVCache],
-        input_metadata: InputMetadata,
-    ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
-        for i in range(self.config.num_hidden_layers):
-            layer = self.layers[i]
-            hidden_states = layer(
-                positions,
-                hidden_states,
-                kv_caches[i],
-                input_metadata,
-            )
+        intermediate_tensors: Optional[IntermediateTensors],
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.get_input_embeddings(input_ids)
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+        for layer in self.layers[self.start_layer:self.end_layer]:
+            hidden_states = layer(positions, hidden_states)
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors({"hidden_states": hidden_states})
 
         hidden_states = self.final_layernorm(hidden_states)
 
         return hidden_states
 
-
-class PhiForCausalLM(nn.Module):
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        linear_method: Optional[LinearMethodBase] = None,
-    ):
-        super().__init__()
-        self.config = config
-        self.linear_method = linear_method
-
-        self.model = PhiModel(config, linear_method)
-
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            bias=True,
-            linear_method=linear_method,
-        )
-        self.sampler = Sampler(config.vocab_size)
-        self.quant_sampler = QuantSampler(config.vocab_size)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        kv_caches: List[KVCache],
-        input_metadata: InputMetadata,
-    ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, kv_caches,
-                                   input_metadata)
-
-        return hidden_states
-
-    def sample(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        if (self.linear_method is not None
-                and not self.linear_method.quant_config.merge_weight()):
-            next_tokens = self.quant_sampler(self.lm_head(hidden_states),
-                                             sampling_metadata)
-        else:
-            next_tokens = self.sampler(self.lm_head.weight, hidden_states,
-                                       sampling_metadata)
-        return next_tokens
-
-    def load_weights(
-        self,
-        model_name_or_path: str,
-        cache_dir: Optional[str] = None,
-        load_format: str = "auto",
-        revision: Optional[str] = None,
-    ):
+    def load_weights(self, weights: Iterable[Tuple[str,
+                                                   torch.Tensor]]) -> Set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
+            ("qkv_proj", "v_proj", "v")
         ]
-        if (self.linear_method is not None
-                and not self.linear_method.quant_config.merge_weight()):
-            stacked_params_mapping = []
         params_dict = dict(self.named_parameters())
+        loaded_params: Set[str] = set()
 
-        for name, loaded_weight in hf_model_weights_iterator(
-                model_name_or_path, cache_dir, load_format, revision,
-                self.config):
+        for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            for param_name, weight_name, shard_id in stacked_params_mapping:
+            for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if is_pp_missing_parameter(name, self):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -364,7 +281,73 @@ class PhiForCausalLM(nn.Module):
                     continue
                 # pylint: disable=E1136
 
+                if is_pp_missing_parameter(name, self):
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
+
+
+class PhiForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ]
+    }
+
+    def __init__(self, *, aphrodite_config: AphroditeConfig, prefix: str = ""):
+        super().__init__()
+        config = aphrodite_config.model_config.hf_config
+        quant_config = aphrodite_config.quant_config
+        lora_config = aphrodite_config.lora_config
+        self.config = config
+        # lm_head use bias, cannot share word embeddings
+        assert not config.tie_word_embeddings
+        self.lora_config = lora_config
+
+        self.quant_config = quant_config
+
+        self.model = PhiModel(aphrodite_config=aphrodite_config,
+                              prefix=maybe_prefix(prefix, "model"))
+
+        self.lm_head = ParallelLMHead(config.vocab_size,
+                                      config.hidden_size,
+                                      bias=True,
+                                      quant_config=quant_config)
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors)
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.get_input_embeddings(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        hidden_states = self.model(input_ids, positions, intermediate_tensors,
+                                   inputs_embeds)
+
+        return hidden_states
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> Optional[torch.Tensor]:
+        logits = self.logits_processor(self.lm_head, hidden_states,
+                                       sampling_metadata, self.lm_head.bias)
+        return logits
+
+    def load_weights(self, weights: Iterable[Tuple[str,
+                                                   torch.Tensor]]) -> Set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
