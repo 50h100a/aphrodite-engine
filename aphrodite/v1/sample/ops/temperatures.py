@@ -2,8 +2,8 @@ import torch
 
 _SAMPLING_EPS = 1e-5
 
-def _tens_or_zeros(tens, like_shape):
-    return tens if tens is not None else torch.zeros_like(like_shape)
+def _tensor_or_zeros(tens, like_tensor):
+    return tens if tens is not None else torch.zeros_like(like_tensor)
 
 
 def apply_all_temperatures(
@@ -11,11 +11,9 @@ def apply_all_temperatures(
     sampling_metadata,
 ) -> torch.Tensor:
     temp = sampling_metadata.temperature
-    dynatemp_mins = dynatemp_maxs = dynatemp_exps = torch.zeros_like(temp)
-
-    dynatemp_mins = _tens_or_zeros(sampling_metadata.dynatemp_min, temp)
-    dynatemp_maxs = _tens_or_zeros(sampling_metadata.dynatemp_max, temp)
-    dynatemp_exps = _tens_or_zeros(sampling_metadata.dynatemp_exp, temp)
+    dynatemp_mins = _tensor_or_zeros(sampling_metadata.dynatemp_min, temp)
+    dynatemp_maxs = _tensor_or_zeros(sampling_metadata.dynatemp_max, temp)
+    dynatemp_exps = _tensor_or_zeros(sampling_metadata.dynatemp_exp, temp)
 
     dynatemp_mask = (dynatemp_mins != 0) | (dynatemp_maxs != 0)
     dynatemp_mins = dynatemp_mins[dynatemp_mask]

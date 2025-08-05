@@ -214,8 +214,7 @@ class Sampler(nn.Module):
 
     def _init_sampling_tensors(
         self,
-        embedding: torch.Tensor,
-        hidden_states: torch.Tensor,
+        logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ):
         """The goal here is to reuse sampling tensors between similar decode
