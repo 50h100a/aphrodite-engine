@@ -1,4 +1,5 @@
 from typing import Callable, Union, Dict, List
+from abc import ABC, abstractmethod
 
 import torch
 
@@ -121,7 +122,7 @@ class NoBadWordsLogitsProcessor:
 
 
 
-class LogitsProcessor(ABC):
+class LogitsProcessorBase(ABC):
 
     @abstractmethod
     def __call__(self, logits: torch.Tensor,
@@ -130,7 +131,7 @@ class LogitsProcessor(ABC):
         pass
 
 
-class BiasLogitsProcessor(LogitsProcessor):
+class BiasLogitsProcessor(LogitsProcessorBase):
     """This is to enable logit_bias in the OpenAI server,
     an additive bias on the original logit values.
     Args:
@@ -158,7 +159,7 @@ class BiasLogitsProcessor(LogitsProcessor):
         logits[0, keys] += values
 
 
-class BanEOSUntil(LogitsProcessor):
+class BanEOSUntil(LogitsProcessorBase):
     """Bans the EOS token until a certain condition is met.
     In this case, 'number of output tokens'.
 
