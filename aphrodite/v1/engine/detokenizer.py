@@ -13,6 +13,7 @@ from aphrodite.transformers_utils.detokenizer_utils import (
     AnyTokenizer, convert_prompt_ids_to_tokens, detokenize_incrementally)
 from aphrodite.v1.engine import EngineCoreRequest
 
+INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
 
 class IncrementalDetokenizer:
 
@@ -153,6 +154,8 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
         super().__init__(request)
 
         sampling_params = request.sampling_params
+        self.request_id = request.request_id
+        self.skip_special_tokens = sampling_params.skip_special_tokens
         self.stream = DecodeStream(
             skip_special_tokens=sampling_params.skip_special_tokens)
 
@@ -170,7 +173,7 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
         # Prime the stream.
         for tid in prompt_suffix:
-            self.stream.step(self.tokenizer, tid)
+            self._protected_step(tid)
 
         self.spaces_between_special_tokens = (
             sampling_params.skip_special_tokens
@@ -195,7 +198,7 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
                 self.spaces_between_special_tokens = True
 
     def decode_next(self, next_token_id: int) -> str:
-        token = self.stream.step(self.tokenizer, next_token_id)
+        token = self._protected_step(next_token_id)
 
         if not self.spaces_between_special_tokens:
             special_token = self.added_token_ids.get(next_token_id)
@@ -206,6 +209,23 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
             self.last_special = is_special
 
         return token or ""
+
+    def _protected_step(self, next_token_id: int) -> Optional[str]:
+        try:
+            token = self.stream.step(self.tokenizer, next_token_id)
+        except Exception as e:
+            if str(e) != INVALID_PREFIX_ERR_MSG:
+                raise e
+            # Recover from edge case where tokenizer can produce non-monotonic,
+            # invalid UTF-8 output, which breaks the internal state of
+            # tokenizers' DecodeStream.
+            # See https://github.com/vllm-project/vllm/issues/17448.
+            logger.warning(
+                "Encountered invalid prefix detokenization error"
+                " for request %s, resetting decode stream.", self.request_id)
+            self.stream = DecodeStream(self.skip_special_tokens)
+            token = self.stream.step(self.tokenizer, next_token_id)
+        return token
 
 
 class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
