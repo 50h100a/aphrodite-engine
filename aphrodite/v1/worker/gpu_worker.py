@@ -174,7 +174,7 @@ class Worker(WorkerBase):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        _, total_gpu_memory = torch.cuda.mem_get_info()
+        pre_free_mem, total_gpu_memory = torch.cuda.mem_get_info()
 
         # In single user mode, we only need to profile for one sequence
         # instead of the maximum possible sequences
@@ -197,29 +197,25 @@ class Worker(WorkerBase):
         if self.scheduler_config.single_user_mode:
             self.model_runner.max_num_tokens = original_max_num_tokens
 
-        free_gpu_memory, _ = torch.cuda.mem_get_info()
+        post_free_mem, _ = torch.cuda.mem_get_info()
         # NOTE: Here we assume that the other processes using the same
         # GPU did not change their memory usage during the profiling.
-        assert self.init_gpu_memory > free_gpu_memory, (
+        assert self.init_gpu_memory > post_free_mem, (
             "Error in memory profiling. "
             f"Initial free memory {self.init_gpu_memory}, current free memory"
-            f" {free_gpu_memory}. This happens when the GPU memory was not "
+            f" {post_free_mem}. This happens when the GPU memory was not "
             "properly cleaned up before initializing the Aphrodite instance.")
 
         # Get the peak memory allocation recorded by torch
-        peak_memory = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        # ('free memory' will go down, thus subtracting post from pre.)
+        peak_memory = pre_free_mem - post_free_mem
 
         # Check for any memory left around that may have been allocated on the
         # gpu outside of `torch`. NCCL operations, for example, can use a few
         # GB during a forward pass
         torch.cuda.empty_cache()
-        torch_allocated_bytes = torch.cuda.memory_stats(
-        )["allocated_bytes.all.current"]
-        total_allocated_bytes = torch.cuda.mem_get_info(
-        )[1] - torch.cuda.mem_get_info()[0]
-        non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
-        if non_torch_allocations > 0:
-            peak_memory += non_torch_allocations
+        torch_allocated_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        peak_memory += torch_allocated_bytes
 
         # Calculate memory per sequence for comparison
         tokens_per_block = self.cache_config.block_size
