@@ -13,6 +13,14 @@ from aphrodite.transformers_utils.detokenizer_utils import (
     AnyTokenizer, convert_prompt_ids_to_tokens, detokenize_incrementally)
 from aphrodite.v1.engine import EngineCoreRequest
 
+# Only tokenizers >= 0.21.1 supports DecodeStream used for
+# FastIncrementalDetokenizer.
+USE_FAST_DETOKENIZER = version.parse(
+    tokenizers.__version__) >= version.parse("0.21.1")
+
+# Error string from https://github.com/huggingface/tokenizers/blob/909fdde2a4ffedd9295206f705eb612be2a91b12/tokenizers/src/tokenizer/mod.rs#L1042
+INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
+
 INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
 
 class IncrementalDetokenizer:
@@ -39,14 +47,15 @@ class IncrementalDetokenizer:
         request: EngineCoreRequest,
     ) -> "IncrementalDetokenizer":
 
+        assert request.sampling_params is not None
+
         if tokenizer is None:
             # No tokenizer => skipping detokenization.
             return IncrementalDetokenizer()
 
-        if (isinstance(tokenizer, PreTrainedTokenizerFast) and version.parse(
-                tokenizers.__version__) >= version.parse("0.21.1")):
+        if USE_FAST_DETOKENIZER and isinstance(tokenizer,
+                                               PreTrainedTokenizerFast):
             # Fast tokenizer => use tokenizers library DecodeStream.
-            # And only tokenizers >= 0.21.1 supports Fast Detokenizer.
             return FastIncrementalDetokenizer(tokenizer, request)
 
         # Fall back to slow python-based incremental detokenization.
@@ -60,6 +69,7 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
 
         # Stop strings
         params = request.sampling_params
+        assert params is not None
         self.stop = stop = params.stop
         self.include_stop_str_in_output = params.include_stop_str_in_output
 
@@ -96,7 +106,7 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             skipped_stop_token_id = None
 
         # 1) Detokenize the new token ids incrementally.
-        # TODO: This method becomes very inefficient when the number of
+        # TODO(woosuk): This method becomes very inefficient when the number of
         # new_token_ids is more than 1. We need to optimize this.
         offset_before = len(self.output_text)
         for new_token_id in new_token_ids:
@@ -154,10 +164,12 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
         super().__init__(request)
 
         sampling_params = request.sampling_params
+        assert sampling_params is not None
+
         self.request_id = request.request_id
         self.skip_special_tokens = sampling_params.skip_special_tokens
         self.stream = DecodeStream(
-            skip_special_tokens=sampling_params.skip_special_tokens)
+            skip_special_tokens=self.skip_special_tokens)
 
         self.tokenizer: Tokenizer = tokenizer._tokenizer
 
@@ -219,10 +231,10 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
             # Recover from edge case where tokenizer can produce non-monotonic,
             # invalid UTF-8 output, which breaks the internal state of
             # tokenizers' DecodeStream.
-            # See https://github.com/vllm-project/vllm/issues/17448.
+            # See https://github.com/aphrodite-project/aphrodite/issues/17448.
             logger.warning(
                 "Encountered invalid prefix detokenization error"
-                " for request %s, resetting decode stream.", self.request_id)
+                " for request {}, resetting decode stream.", self.request_id)
             self.stream = DecodeStream(self.skip_special_tokens)
             token = self.stream.step(self.tokenizer, next_token_id)
         return token
@@ -234,20 +246,20 @@ class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
         super().__init__(request)
 
         self.tokenizer = tokenizer
+        params = request.sampling_params
+        assert params is not None
 
         # Metadata for incremental detokenization.
         self.tokens, self.prefix_offset, self.read_offset = (
             convert_prompt_ids_to_tokens(
                 tokenizer=tokenizer,
                 prompt_ids=request.prompt_token_ids,
-                skip_special_tokens=request.sampling_params.
-                skip_special_tokens,
+                skip_special_tokens=params.skip_special_tokens,
             ))
 
         self.token_ids.extend(request.prompt_token_ids)
         self.prompt_len = len(request.prompt_token_ids)
 
-        params = request.sampling_params
         self.skip_special_tokens = params.skip_special_tokens
         self.spaces_between_special_tokens = (
             params.spaces_between_special_tokens)

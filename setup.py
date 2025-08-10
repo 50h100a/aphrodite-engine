@@ -286,7 +286,7 @@ class cmake_build_ext(build_ext):
             # CMake, this is currently true for current extensions but may not
             # always be the case.
             prefix = outdir
-            if '.' in ext.name:
+            for _ in range(ext.name.count('.')):
                 prefix = prefix.parent
 
             # prefix here should actually be the same for all components
@@ -559,12 +559,14 @@ if not envs.APHRODITE_USE_PRECOMPILED:
         ext_modules.append(CMakeExtension(name="aphrodite._rocm_C"))
 
     if _is_cuda():
-        ext_modules.append(CMakeExtension(name="aphrodite._aphrodite_fa2_C"))
+        ext_modules.append(CMakeExtension(
+            name="aphrodite.aphrodite_flash_attn._vllm_fa2_C"))
         major, minor = torch.cuda.get_device_capability()
-        if get_nvcc_cuda_version() >= Version("12.3") and major >= 9:
-            # FA3 requires CUDA 12.3 or later
+        if get_nvcc_cuda_version() >= Version("12.0") and major >= 8:
+            # FA3 requires CUDA 12.0 or later and compute capability >= 8.0
             ext_modules.append(
-                CMakeExtension(name="aphrodite._aphrodite_fa3_C"))
+                CMakeExtension(
+                    name="aphrodite.aphrodite_flash_attn._vllm_fa3_C"))
             # Optional since this doesn't get built (produce an .so file) when
             # not targeting a hopper system
             ext_modules.append(
@@ -592,11 +594,16 @@ setup(
     version=get_aphrodite_version(),
     install_requires=get_requirements(),
     extras_require={
-        "tensorizer": ["tensorizer>=2.9.0"],
+        "bench": ["pandas", "datasets"],
+        "tensorizer": ["tensorizer==2.10.1"],
         "fastsafetensors": ["fastsafetensors >= 0.1.10"],
-        "runai": ["runai-model-streamer", "runai-model-streamer-s3", "boto3"],
-        "audio": ["librosa", "soundfile"],  # Required for audio processing
-        "video": []  # Kept for backwards compatibility
+        "runai":
+        ["runai-model-streamer >= 0.13.3", "runai-model-streamer-s3", "boto3"],
+        "audio": ["librosa", "soundfile",
+                  "mistral_common[audio]"],  # Required for audio processing
+        "video": [],  # Kept for backwards compatibility
+        # FlashInfer should be updated together with the Dockerfile
+        "flashinfer": ["flashinfer-python==0.2.9"],
     },
     ext_modules=ext_modules,
     cmdclass={"build_ext": cmake_build_ext} if len(ext_modules) > 0 else {},
