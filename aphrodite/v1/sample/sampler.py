@@ -13,6 +13,7 @@ from aphrodite.v1.sample.metadata import SamplingMetadata
 from aphrodite.v1.sample.ops import SamplingOps
 from aphrodite.v1.sample.ops.temperatures import apply_all_temperatures
 from aphrodite.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
+from aphrodite.v1.sample.ops.logprobs import batched_count_greater_than
 
 _SAMPLING_EPS = 1e-5
 
