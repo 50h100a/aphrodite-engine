@@ -88,6 +88,9 @@ class SamplingMetadata:
     # Loaded logits processors
     logitsprocs: LogitsProcessorManager
 
+    # Logit Bias
+    logit_bias: dict[int, dict[int, float]]
+
     # Sampler priority and temperature_last for priority-based execution
     sampler_priority: Optional[List[SamplerID]] = None
     temperature_last: bool = False
