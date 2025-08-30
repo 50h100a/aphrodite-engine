@@ -225,7 +225,8 @@ class MultiprocExecutor(Executor):
 
                 if status != WorkerProc.ResponseStatus.SUCCESS:
                     raise RuntimeError(
-                        f"Worker failed with error '{result}', please check the"
+                        f"Worker failed:\n{result[1]}\n\n"
+                        f"Worker failed with error '{result[0]}', please check the"
                         " stack trace above for the root cause")
                 return result
 
@@ -595,7 +596,7 @@ class WorkerProc:
                 # string, only for logging purpose.
                 if output_rank is None or self.rank == output_rank:
                     self.worker_response_mq.enqueue(
-                        (WorkerProc.ResponseStatus.FAILURE, str(e)))
+                        (WorkerProc.ResponseStatus.FAILURE, (str(e), traceback.format_exc())))
                 continue
 
             if output_rank is None or self.rank == output_rank:

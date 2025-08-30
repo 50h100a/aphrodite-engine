@@ -495,6 +495,8 @@ class InputBatch:
         # req_index -> bad_words_token_ids
         self.bad_words_token_ids: dict[int, list[list[int]]] = {}
 
+        self.logit_bias: dict[int, dict[int, float]] = {}
+
         self.logits_processing_needs_token_ids = np.zeros(max_num_reqs,
                                                           dtype=bool)
 
@@ -716,6 +718,9 @@ class InputBatch:
                 self.bad_words_token_ids[
                     req_index] = sampling_params.bad_words_token_ids
 
+            if sampling_params.logit_bias:
+                self.logit_bias[req_index] = sampling_params.logit_bias
+
         # Add request lora ID
         if request.lora_request:
             lora_id = request.lora_request.lora_int_id
@@ -788,6 +793,7 @@ class InputBatch:
             # False means we don't fill with -inf.
             self.allowed_token_ids_mask_cpu_tensor[req_index].fill_(False)
         self.bad_words_token_ids.pop(req_index, None)
+        self.logit_bias.pop(req_index, None)
         self.pooling_params.pop(req_id, None)
 
         # Clean up persistent data
@@ -893,6 +899,7 @@ class InputBatch:
 
         swap_dict_values(self.generators, i1, i2)
         swap_dict_values(self.bad_words_token_ids, i1, i2)
+        swap_dict_values(self.logit_bias, i1, i2)
 
         self.request_lora_mapping[i1], self.request_lora_mapping[i2] =\
             self.request_lora_mapping[i2], self.request_lora_mapping[i1]
@@ -1048,6 +1055,11 @@ class InputBatch:
                 last_req_index, None)
             if bad_words_token_ids is not None:
                 self.bad_words_token_ids[empty_index] = bad_words_token_ids
+            
+            logit_bias = self.logit_bias.pop(last_req_index, None)
+            if logit_bias is not None:
+                self.logit_bias[empty_index] = logit_bias
+            
             # Decrement last_req_index since it is now empty.
             last_req_index -= 1
 
@@ -1245,6 +1257,7 @@ class InputBatch:
             no_penalties=self.no_penalties,
             allowed_token_ids_mask=allowed_token_ids_mask,
             bad_words_token_ids=self.bad_words_token_ids,
+            logit_bias=self.logit_bias,
             sampler_priority=sampler_priority_processed,
             temperature_last=any(self.temperature_last[:num_reqs]),
             logitsprocs=self.logitsprocs,
