@@ -425,25 +425,26 @@ class OpenAIServing:
         self,
         request: AnyRequest,
     ) -> Optional[ErrorResponse]:
+        return None
 
-        error_response = None
+        # error_response = None
 
-        if self._is_model_supported(request.model):
-            return None
-        if request.model in self.models.lora_requests:
-            return None
-        if envs.APHRODITE_ALLOW_RUNTIME_LORA_UPDATING and request.model and (
-                load_result := await self.models.resolve_lora(request.model)):
-            if isinstance(load_result, LoRARequest):
-                return None
-            if isinstance(load_result, ErrorResponse) and \
-                load_result.error.code == HTTPStatus.BAD_REQUEST.value:
-                error_response = load_result
+        # if self._is_model_supported(request.model):
+        #     return None
+        # if request.model in self.models.lora_requests:
+        #     return None
+        # if envs.APHRODITE_ALLOW_RUNTIME_LORA_UPDATING and request.model and (
+        #         load_result := await self.models.resolve_lora(request.model)):
+        #     if isinstance(load_result, LoRARequest):
+        #         return None
+        #     if isinstance(load_result, ErrorResponse) and \
+        #         load_result.error.code == HTTPStatus.BAD_REQUEST.value:
+        #         error_response = load_result
 
-        return error_response or self.create_error_response(
-            message=f"The model `{request.model}` does not exist.",
-            err_type="NotFoundError",
-            status_code=HTTPStatus.NOT_FOUND)
+        # return error_response or self.create_error_response(
+        #     message=f"The model `{request.model}` does not exist.",
+        #     err_type="NotFoundError",
+        #     status_code=HTTPStatus.NOT_FOUND)
 
     def _get_active_default_mm_loras(
             self, request: AnyRequest) -> Optional[LoRARequest]:

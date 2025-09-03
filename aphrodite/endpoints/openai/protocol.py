@@ -388,7 +388,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: list[ChatCompletionMessageParam]
-    model: str
+    model: Optional[str] = None
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[dict[str, float]] = None
     logprobs: Optional[bool] = False
@@ -417,6 +417,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # NOTE this will be ignored by Aphrodite - the model determines the behavior
     parallel_tool_calls: Optional[bool] = False
     user: Optional[str] = None
+    max_context_tokens: Optional[int] = None
 
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None
@@ -1027,7 +1028,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
 class CompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
-    model: str
+    model: Optional[str] = None
     prompt: Optional[Union[list[int], list[list[int]], str, list[str]]] = None
     prompt_embeds: Optional[Union[bytes, list[bytes]]] = None
     best_of: Optional[int] = None

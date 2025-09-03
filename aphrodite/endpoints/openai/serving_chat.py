@@ -241,6 +241,10 @@ class OpenAIServingChat(OpenAIServing):
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(f"{e} {e.__cause__}")
 
+        if request.max_context_tokens:
+            if len(engine_prompts[0]['prompt_token_ids']) > request.max_context_tokens:
+                return self.create_error_response("Prompt too large", status_code=406)
+
         request_id = "chatcmpl-" \
                      f"{self._base_request_id(raw_request, request.request_id)}"
 
