@@ -4,7 +4,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from typing import Optional, Union, cast
 
-import jinja2
+import jinja2, json
 from fastapi import Request
 from loguru import logger
 from typing_extensions import assert_never
@@ -336,6 +336,11 @@ class OpenAIServingCompletion(OpenAIServing):
                 if first_iteration:
                     num_cached_tokens = res.num_cached_tokens
                     first_iteration = False
+                    perfinfo = {
+                        'dur_processing': res.metrics.first_token_time - res.metrics.first_scheduled_time,
+                        'object': 'mancer.firstevent'
+                    }
+                    yield f"data: {json.dumps(perfinfo)}\n\n"
 
                 if res.prompt is not None:
                     prompt_text = res.prompt
@@ -398,7 +403,7 @@ class OpenAIServingCompletion(OpenAIServing):
                             num_output_top_logprobs=request.logprobs,
                             tokenizer=tokenizer,
                             initial_text_offset=previous_text_lens[i],
-                            return_as_token_id=request.
+                            return_as_token_id=self.
                             return_tokens_as_token_ids,
                         )
                     else:
@@ -528,7 +533,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         top_logprobs=out_logprobs,
                         tokenizer=tokenizer,
                         num_output_top_logprobs=request.logprobs,
-                        return_as_token_id=request.return_tokens_as_token_ids,
+                        return_as_token_id=self.return_tokens_as_token_ids,
                     )
                 else:
                     logprobs = None

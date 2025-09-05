@@ -584,6 +584,11 @@ class OpenAIServingChat(OpenAIServing):
                                 total_tokens=num_prompt_tokens)
 
                         data = chunk.model_dump_json(exclude_unset=True)
+                        perfinfo = {
+                            'dur_processing': res.metrics.first_token_time - res.metrics.first_scheduled_time,
+                            'object': 'mancer.firstevent'
+                        }
+                        yield f"data: {json.dumps(perfinfo)}\n\n"
                         yield f"data: {data}\n\n"
 
                     # Send response to echo the input portion of the
@@ -635,7 +640,7 @@ class OpenAIServingChat(OpenAIServing):
                             top_logprobs=output.logprobs,
                             tokenizer=tokenizer,
                             num_output_top_logprobs=request.top_logprobs,
-                            return_as_token_id=request.
+                            return_as_token_id=self.
                             return_tokens_as_token_ids,
                         )
                     else:
@@ -1094,7 +1099,7 @@ class OpenAIServingChat(OpenAIServing):
                     top_logprobs=out_logprobs,
                     num_output_top_logprobs=request.top_logprobs,
                     tokenizer=tokenizer,
-                    return_as_token_id=request.return_tokens_as_token_ids,
+                    return_as_token_id=self.return_tokens_as_token_ids,
                 )
             else:
                 logprobs = None
