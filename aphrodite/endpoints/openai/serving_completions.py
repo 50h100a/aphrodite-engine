@@ -412,7 +412,7 @@ class OpenAIServingCompletion(OpenAIServing):
                             # Chunked prefill case, don't return empty chunks
                             continue
 
-                    if request.logprobs is not None:
+                    if len(delta_token_ids) and request.logprobs is not None:
                         assert out_logprobs is not None, (
                             "Did not output logprobs")
                         logprobs = self._create_completion_logprobs(
