@@ -1,7 +1,7 @@
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import nullcontext
-from typing import Optional, TypedDict, Union, cast
+from typing import Literal, Optional, TypedDict, Union, cast
 
 import numpy as np
 import torch
@@ -14,7 +14,7 @@ from transformers.models.whisper.modeling_whisper import sinusoids
 from aphrodite.attention import Attention, AttentionType
 from aphrodite.attention.layer import MultiHeadAttention
 from aphrodite.config import (AphroditeConfig, CacheConfig, ModelConfig,
-                                     SpeechToTextConfig)
+                              SpeechToTextConfig)
 from aphrodite.distributed import get_tensor_model_parallel_world_size
 from aphrodite.inputs.data import PromptType
 from aphrodite.modeling.layers.activation import get_act_fn
@@ -29,7 +29,7 @@ from aphrodite.modeling.sampling_metadata import SamplingMetadata
 from aphrodite.multimodal import MULTIMODAL_REGISTRY, NestedTensors
 from aphrodite.multimodal.inputs import (MultiModalDataDict,
                                          MultiModalFieldConfig,
-                                         MultiModalKwargs)
+                                         MultiModalKwargsItems)
 from aphrodite.multimodal.parse import (MultiModalDataItems,
                                         MultiModalDataParser)
 from aphrodite.multimodal.processing import (BaseProcessingInfo,
@@ -724,7 +724,7 @@ class WhisperMultiModalProcessor(
         self,
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
-        out_mm_kwargs: MultiModalKwargs,
+        out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
         num_tokens = self.info.get_num_audio_tokens()
         return [
@@ -779,8 +779,9 @@ class WhisperForConditionalGeneration(nn.Module, SupportsTranscription,
             model_config: ModelConfig,  # not needed here
             stt_config: SpeechToTextConfig,
             language: Optional[str],
-            task_type: str,
-            request_prompt: str) -> PromptType:
+            task_type: Literal["transcribe", "translate"],
+            request_prompt: str,
+            to_language: Optional[str]) -> PromptType:
         if language is None:
             raise ValueError(
                 "Language must be specified when creating the Whisper prompt")

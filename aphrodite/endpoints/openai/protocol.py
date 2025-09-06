@@ -3,7 +3,8 @@
 import json
 import time
 from http import HTTPStatus
-from typing import Annotated, Any, ClassVar, Literal, Optional, Union
+from typing import (Annotated, Any, ClassVar, Generic, Literal, Optional,
+                    TypeVar, Union)
 
 import regex as re
 import torch
@@ -18,7 +19,15 @@ from openai.types.chat.chat_completion_message import (
 from openai.types.responses import (ResponseFunctionToolCall,
                                     ResponseInputItemParam, ResponseOutputItem,
                                     ResponsePrompt, ResponseReasoningItem,
-                                    ResponseStatus, ResponseTextConfig)
+                                    ResponseStatus)
+
+# Backward compatibility for OpenAI client versions
+try:  # For older openai versions (< 1.100.0)
+    from openai.types.responses import ResponseTextConfig
+except ImportError:  # For newer openai versions (>= 1.100.0)
+    from openai.types.responses import (ResponseFormatTextConfig as
+                                        ResponseTextConfig)
+
 from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
@@ -32,11 +41,11 @@ from aphrodite.common.sampling_params import (BeamSearchParams,
                                               GuidedDecodingParams,
                                               RequestOutputKind,
                                               SamplingParams)
-from aphrodite.common.sequence import Logprob
 from aphrodite.endpoints.chat_utils import (ChatCompletionMessageParam,
-                                            random_tool_call_id)
+                                            make_tool_call_id)
 from aphrodite.endpoints.score_utils import (ScoreContentPartParam,
                                              ScoreMultiModalParam)
+from aphrodite.logprobs import Logprob
 from aphrodite.transformers_utils.tokenizer import AnyTokenizer
 from aphrodite.utils import (generate_phrase_variants, random_uuid,
                              resolve_obj_by_qualname)
@@ -348,12 +357,21 @@ class ResponsesRequest(OpenAIBaseModel):
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
-            logprobs=self.top_logprobs,
+            logprobs=self.top_logprobs
+            if self.is_include_output_logprobs() else None,
             stop_token_ids=stop_token_ids,
             output_kind=(RequestOutputKind.DELTA
                          if self.stream else RequestOutputKind.FINAL_ONLY),
             guided_decoding=guided_decoding,
         )
+
+    def is_include_output_logprobs(self) -> bool:
+        """Check if the request includes output logprobs."""
+        if self.include is None:
+            return False
+        return isinstance(
+            self.include,
+            list) and "message.output_text.logprobs" in self.include
 
     @model_validator(mode="before")
     def validate_background(cls, data):
@@ -440,7 +458,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     stop_token_ids: Optional[list[int]] = []
     skip_special_tokens: Optional[bool] = True
     spaces_between_special_tokens: Optional[bool] = True
-    truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+    truncate_prompt_tokens: Optional[Annotated[int, Field(ge=-1)]] = None
     temperature_last: Optional[bool] = False
     prompt_logprobs: Optional[int] = None
     xtc_threshold: Optional[float] = 0.1
@@ -603,6 +621,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description=("Additional request parameters with string or "
                      "numeric values, used by custom extensions."),
     )
+    return_token_ids: Optional[bool] = Field(
+        default=None,
+        description=(
+            "If specified, the result will include token IDs alongside the "
+            "generated text. In streaming mode, prompt_token_ids is included "
+            "only in the first chunk, and token_ids contains the delta tokens "
+            "for each chunk. This is useful for debugging or when you "
+            "need to map generated text back to input tokens."))
 
     # doc: end-chat-completion-extra-params
 
@@ -1071,7 +1097,7 @@ class CompletionRequest(OpenAIBaseModel):
     min_tokens: Optional[int] = 0
     skip_special_tokens: Optional[bool] = True
     spaces_between_special_tokens: Optional[bool] = True
-    truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+    truncate_prompt_tokens: Optional[Annotated[int, Field(ge=-1)]] = None
     allowed_token_ids: Optional[list[int]] = None
     include_stop_str_in_output: Optional[bool] = False
     add_special_tokens: Optional[bool] = False
@@ -1181,6 +1207,14 @@ class CompletionRequest(OpenAIBaseModel):
             "If specified with 'logprobs', tokens are represented "
             " as strings of the form 'token_id:{token_id}' so that tokens "
             "that are not JSON-encodable can be identified."))
+    return_token_ids: Optional[bool] = Field(
+        default=None,
+        description=(
+            "If specified, the result will include token IDs alongside the "
+            "generated text. In streaming mode, prompt_token_ids is included "
+            "only in the first chunk, and token_ids contains the delta tokens "
+            "for each chunk. This is useful for debugging or when you "
+            "need to map generated text back to input tokens."))
     cache_salt: Optional[str] = Field(
         default=None,
         description=(
@@ -1528,8 +1562,10 @@ class EmbeddingCompletionRequest(OpenAIBaseModel):
     # doc: end-embedding-extra-params
 
     def to_pooling_params(self):
-        return PoolingParams(dimensions=self.dimensions,
-                             normalize=self.normalize)
+        return PoolingParams(
+            truncate_prompt_tokens=self.truncate_prompt_tokens,
+            dimensions=self.dimensions,
+            normalize=self.normalize)
 
 
 class EmbeddingChatRequest(OpenAIBaseModel):
@@ -1596,15 +1632,57 @@ class EmbeddingChatRequest(OpenAIBaseModel):
         return data
 
     def to_pooling_params(self):
-        return PoolingParams(dimensions=self.dimensions,
-                             normalize=self.normalize)
+        return PoolingParams(
+            truncate_prompt_tokens=self.truncate_prompt_tokens,
+            dimensions=self.dimensions,
+            normalize=self.normalize)
 
 
 EmbeddingRequest = Union[EmbeddingCompletionRequest, EmbeddingChatRequest]
 
 PoolingCompletionRequest = EmbeddingCompletionRequest
 PoolingChatRequest = EmbeddingChatRequest
-PoolingRequest = Union[PoolingCompletionRequest, PoolingChatRequest]
+
+T = TypeVar("T")
+
+
+class IOProcessorRequest(OpenAIBaseModel, Generic[T]):
+    model: Optional[str] = None
+
+    priority: int = Field(default=0)
+    """
+    The priority of the request (lower means earlier handling;
+    default: 0). Any priority other than 0 will raise an error
+    if the served model does not use priority scheduling.
+    """
+    data: T
+    """
+    When using plugins IOProcessor plugins, the actual input is processed
+    by the plugin itself. Hence, we use a generic type for the request data
+    """
+    softmax: bool = True
+
+    def to_pooling_params(self):
+        return PoolingParams(task="encode", softmax=self.softmax)
+
+
+class IOProcessorResponse(OpenAIBaseModel, Generic[T]):
+
+    request_id: Optional[str] = None
+    """
+    The request_id associated with this response
+    """
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+
+    data: T
+    """
+    When using plugins IOProcessor plugins, the actual output is generated
+    by the plugin itself. Hence, we use a generic type for the response data
+    """
+
+
+PoolingRequest = Union[PoolingCompletionRequest, PoolingChatRequest,
+                       IOProcessorRequest]
 
 
 class ScoreRequest(OpenAIBaseModel):
@@ -1634,7 +1712,9 @@ class ScoreRequest(OpenAIBaseModel):
     # --8<-- [end:score-extra-params]
 
     def to_pooling_params(self):
-        return PoolingParams(activation=self.activation)
+        return PoolingParams(
+            truncate_prompt_tokens=self.truncate_prompt_tokens,
+            activation=self.activation)
 
 
 class RerankRequest(OpenAIBaseModel):
@@ -1666,7 +1746,9 @@ class RerankRequest(OpenAIBaseModel):
     # doc: end-rerank-extra-params
 
     def to_pooling_params(self):
-        return PoolingParams(activation=self.activation)
+        return PoolingParams(
+            truncate_prompt_tokens=self.truncate_prompt_tokens,
+            activation=self.activation)
 
 
 class RerankDocument(BaseModel):
@@ -1712,7 +1794,9 @@ class CompletionResponseChoice(OpenAIBaseModel):
             "to stop, None if the completion finished for some other reason "
             "including encountering the EOS token"),
     )
+    token_ids: Optional[list[int]] = None  # For response
     prompt_logprobs: Optional[list[Optional[dict[int, Logprob]]]] = None
+    prompt_token_ids: Optional[list[int]] = None  # For prompt
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -1743,6 +1827,10 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
             "to stop, None if the completion finished for some other reason "
             "including encountering the EOS token"),
     )
+    # not part of the OpenAI spec but for tracing the tokens
+    # prompt tokens is put into choice to align with CompletionResponseChoice
+    prompt_token_ids: Optional[list[int]] = None
+    token_ids: Optional[list[int]] = None
 
 
 class CompletionStreamResponse(OpenAIBaseModel):
@@ -1819,7 +1907,9 @@ class ClassificationRequest(OpenAIBaseModel):
     # --8<-- [end:classification-extra-params]
 
     def to_pooling_params(self):
-        return PoolingParams(activation=self.activation)
+        return PoolingParams(
+            truncate_prompt_tokens=self.truncate_prompt_tokens,
+            activation=self.activation)
 
 
 class ClassificationData(OpenAIBaseModel):
@@ -1844,7 +1934,7 @@ class FunctionCall(OpenAIBaseModel):
 
 
 class ToolCall(OpenAIBaseModel):
-    id: str = Field(default_factory=random_tool_call_id)
+    id: str = Field(default_factory=make_tool_call_id)
     type: Literal["function"] = "function"
     function: FunctionCall
 
@@ -1912,6 +2002,9 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     finish_reason: Optional[str] = "stop"
     # not part of the OpenAI spec but included in Aphrodite for legacy reasons
     stop_reason: Optional[Union[int, str]] = None
+    # not part of the OpenAI spec but is useful for tracing the tokens
+    # in agent scenarios
+    token_ids: Optional[list[int]] = None
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -1927,6 +2020,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
 
     # Aphrodite-specific fields that are not in OpenAI spec
     prompt_logprobs: Optional[list[Optional[dict[int, Logprob]]]] = None
+    prompt_token_ids: Optional[list[int]] = None
     kv_transfer_params: Optional[dict[str, Any]] = Field(
         default=None, description="KVTransfer parameters.")
 
@@ -1944,6 +2038,8 @@ class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
     logprobs: Optional[ChatCompletionLogProbs] = None
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = None
+    # not part of the OpenAI spec but for tracing the tokens
+    token_ids: Optional[list[int]] = None
 
 
 class ChatCompletionStreamResponse(OpenAIBaseModel):
@@ -1953,6 +2049,8 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     model: str
     choices: list[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = Field(default=None)
+    # not part of the OpenAI spec but for tracing the tokens
+    prompt_token_ids: Optional[list[int]] = None
 
 
 class TranscriptionResponseStreamChoice(OpenAIBaseModel):
@@ -2010,7 +2108,7 @@ class ResponsesResponse(OpenAIBaseModel):
     service_tier: Literal["auto", "default", "flex", "scale", "priority"]
     status: ResponseStatus
     text: Optional[ResponseTextConfig] = None
-    top_logprobs: int
+    top_logprobs: Optional[int] = None
     truncation: Literal["auto", "disabled"]
     usage: Optional[ResponseUsage] = None
     user: Optional[str] = None
@@ -2317,6 +2415,12 @@ class TranscriptionRequest(OpenAIBaseModel):
     )
     # doc: end-transcription-extra-params
 
+    to_language: Optional[str] = None
+    """The language of the output audio we transcribe to.
+    Please note that this is not currently used by supported models at this
+    time, but it is a placeholder for future use, matching translation api.
+    """
+
     # doc: begin-transcription-sampling-params
     temperature: float = Field(default=0.0)
     """The sampling temperature, between 0 and 1.
@@ -2422,9 +2526,15 @@ class TranscriptionRequest(OpenAIBaseModel):
 
 
 # Transcription response objects
+class TranscriptionUsageAudio(OpenAIBaseModel):
+    type: Literal["duration"] = "duration"
+    seconds: int
+
+
 class TranscriptionResponse(OpenAIBaseModel):
     text: str
     """The transcribed text."""
+    usage: TranscriptionUsageAudio
 
 
 class TranscriptionWord(OpenAIBaseModel):
@@ -2539,6 +2649,9 @@ class TranslationRequest(OpenAIBaseModel):
     `verbose_json`, or `vtt`.
     """
 
+    seed: Optional[int] = Field(None, ge=_LONG_INFO.min, le=_LONG_INFO.max)
+    """The seed to use for sampling."""
+
     # TODO support additional sampling parameters
     # --8<-- [start:translation-sampling-params]
     temperature: float = Field(default=0.0)
@@ -2556,6 +2669,13 @@ class TranslationRequest(OpenAIBaseModel):
     Supplying the input language in
     [ISO-639-1](https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes) format
     will improve accuracy.
+    """
+
+    to_language: Optional[str] = None
+    """The language of the input audio we translate to.
+    Please note that this is not supported by all models, refer to the specific
+    model documentation for more details.
+    For instance, Whisper only supports `to_language=en`.
     """
 
     stream: Optional[bool] = False
@@ -2589,6 +2709,7 @@ class TranslationRequest(OpenAIBaseModel):
 
         return SamplingParams.from_optional(temperature=temperature,
                                             max_tokens=max_tokens,
+                                            seed=self.seed,
                                             output_kind=RequestOutputKind.DELTA
                                             if self.stream \
                                             else RequestOutputKind.FINAL_ONLY)

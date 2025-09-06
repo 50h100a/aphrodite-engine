@@ -1,6 +1,7 @@
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any, Optional, TypedDict, Union, cast
+from typing import Any, Literal, Optional, TypedDict, Union, cast
 
+import numpy as np
 import torch
 from loguru import logger
 from torch import nn
@@ -13,35 +14,34 @@ from transformers.models.gemma3n import (Gemma3nAudioConfig,
 from transformers.models.siglip import SiglipImageProcessorFast
 
 from aphrodite.common.sequence import IntermediateTensors
-from aphrodite.config import AphroditeConfig
+from aphrodite.config import AphroditeConfig, ModelConfig, SpeechToTextConfig
+from aphrodite.inputs.data import PromptType
 from aphrodite.modeling.layers.layernorm import RMSNorm
 from aphrodite.modeling.layers.linear import RowParallelLinear
 from aphrodite.modeling.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding)
 from aphrodite.modeling.models.gemma3n import Gemma3nForCausalLM
 from aphrodite.modeling.models.module_mapping import MultiModelKeys
+from aphrodite.modeling.models.whisper import ISO639_1_SUPPORTED_LANGS
 from aphrodite.modeling.sampling_metadata import SamplingMetadata
 from aphrodite.multimodal import MULTIMODAL_REGISTRY
 from aphrodite.multimodal.inputs import (MultiModalDataDict,
                                          MultiModalFieldConfig,
-                                         MultiModalKwargs)
+                                         MultiModalKwargsItems)
 from aphrodite.multimodal.parse import (ImageProcessorItems,
                                         MultiModalDataItems,
                                         MultiModalDataParser)
 # yapf: disable
-from aphrodite.multimodal.processing import (BaseMultiModalProcessor,
-                                             BaseProcessingInfo,
-                                             BoundPromptUpdate,
-                                             PlaceholderFeaturesInfo,
-                                             PromptReplacement,
-                                             PromptTargetMatch, PromptUpdate,
-                                             PromptUpdateDetails,
-                                             find_mm_placeholders,
-                                             replace_token_matches)
+from aphrodite.multimodal.processing import (
+    BaseMultiModalProcessor, BaseProcessingInfo, MultiModalPromptUpdates,
+    MultiModalPromptUpdatesApplyResult, PlaceholderFeaturesInfo,
+    PromptReplacement, PromptUpdate, PromptUpdateDetails,
+    replace_token_matches)
 # yapf: enable
 from aphrodite.multimodal.profiling import BaseDummyInputsBuilder
 
-from .interfaces import MultiModalEmbeddings, SupportsMultiModal
+from .interfaces import (MultiModalEmbeddings, SupportsMultiModal,
+                         SupportsTranscription)
 from .utils import (AutoWeightsLoader, WeightsMapper, flatten_bn,
                     init_aphrodite_registered_model, maybe_prefix,
                     merge_multimodal_embeddings)
@@ -57,7 +57,8 @@ class Gemma3nImagePixelInputs(TypedDict):
 
 
 class Gemma3nAudioInputs(TypedDict):
-    input_features: torch.Tensor
+    input_features: Union[torch.Tensor, list[torch.Tensor]]
+    input_features_padded: torch.Tensor
     """Shape: `(batch_size * num_audio, seq_length, num_features)`"""
     input_features_mask: torch.Tensor
     """Shape: `(batch_size * num_audio, seq_length)`"""
@@ -92,7 +93,7 @@ class Gemma3nProcessingInfo(BaseProcessingInfo):
     ) -> str:
         """
         Get the replacement text for image tokens.
-
+        
         For Gemma3n, this should return the full_image_sequence which includes
         BOI token, repeated image tokens, and EOI token.
         """
@@ -109,7 +110,7 @@ class Gemma3nProcessingInfo(BaseProcessingInfo):
     ) -> str:
         """
         Get the replacement text for audio tokens.
-
+        
         For Gemma3n, this should return the full_audio_sequence which includes
         BOA token, repeated audio tokens, and EOA token.
         """
@@ -184,7 +185,11 @@ class Gemma3nMultiModalProcessor(BaseMultiModalProcessor[Gemma3nProcessingInfo]
             tok_kwargs,
         )
         if 'input_features' in processed_outputs:
-            # Avoid padding since we need the output of each item to be
+            # Padding enables audio_tower to run in batched mode
+            processed_outputs["input_features_padded"] = \
+                processed_outputs["input_features"]
+
+            # Unpad features here since we need the output of each item to be
             # independent of other items for the cache to work correctly
             unpadded_features = [
                 f[mask] for f, mask in zip(
@@ -201,15 +206,17 @@ class Gemma3nMultiModalProcessor(BaseMultiModalProcessor[Gemma3nProcessingInfo]
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
 
-        return dict(pixel_values=MultiModalFieldConfig.batched("image"),
-                    input_features=MultiModalFieldConfig.batched("audio"),
-                    input_features_mask=MultiModalFieldConfig.batched("audio"))
+        return dict(
+            pixel_values=MultiModalFieldConfig.batched("image"),
+            input_features=MultiModalFieldConfig.batched("audio"),
+            input_features_padded=MultiModalFieldConfig.batched("audio"),
+            input_features_mask=MultiModalFieldConfig.batched("audio"))
 
     def _get_prompt_updates(
         self,
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, Any],
-        out_mm_kwargs: MultiModalKwargs,
+        out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
         hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
 
@@ -254,14 +261,10 @@ class Gemma3nMultiModalProcessor(BaseMultiModalProcessor[Gemma3nProcessingInfo]
     def _apply_token_matches(
         self,
         prompt: list[int],
-        mm_matches: Mapping[str, Sequence[PromptTargetMatch]],
-        mm_item_counts: Mapping[str, int],
-    ) -> list[int]:
-        token_ids = super()._apply_token_matches(
-            prompt,
-            mm_matches,
-            mm_item_counts,
-        )
+        mm_prompt_updates: MultiModalPromptUpdates,
+    ) -> tuple[list[int], MultiModalPromptUpdatesApplyResult]:
+        token_ids, res = super()._apply_token_matches(prompt,
+                                                      mm_prompt_updates)
 
         # "\n\n\n" and "\n\n\n\n" are single tokens
         # Since our replacement can insert "\n\n" next to "\n"
@@ -290,13 +293,12 @@ class Gemma3nMultiModalProcessor(BaseMultiModalProcessor[Gemma3nProcessingInfo]
             [newline_4],
         )
 
-        return token_ids
+        return token_ids, res
 
     def _find_mm_placeholders(
         self,
-        mm_prompt_updates: Mapping[str, Sequence[BoundPromptUpdate]],
         new_token_ids: list[int],
-        mm_item_counts: Mapping[str, int],
+        mm_prompt_updates: MultiModalPromptUpdates,
     ) -> Mapping[str, list[PlaceholderFeaturesInfo]]:
         # We need to detect "\n\n" inside "\n\n\n" and "\n\n\n\n"
         tokenizer = self.info.get_tokenizer()
@@ -321,8 +323,8 @@ class Gemma3nMultiModalProcessor(BaseMultiModalProcessor[Gemma3nProcessingInfo]
             repl_token_ids.extend(repl_toks)
             repl_orig_idxs.extend(orig_idx for _ in range(len(repl_toks)))
 
-        repls = find_mm_placeholders(mm_prompt_updates, repl_token_ids,
-                                     mm_item_counts)
+        repls = super()._find_mm_placeholders(repl_token_ids,
+                                              mm_prompt_updates)
 
         return {
             modality: [
@@ -414,7 +416,9 @@ class Gemma3nMultimodalEmbedder(nn.Module):
 @MULTIMODAL_REGISTRY.register_processor(Gemma3nMultiModalProcessor,
                                         info=Gemma3nProcessingInfo,
                                         dummy_inputs=Gemma3nDummyInputsBuilder)
-class Gemma3nForConditionalGeneration(nn.Module, SupportsMultiModal):
+class Gemma3nForConditionalGeneration(nn.Module, SupportsMultiModal,
+                                      SupportsTranscription):
+    supported_languages = ISO639_1_SUPPORTED_LANGS
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -513,9 +517,14 @@ class Gemma3nForConditionalGeneration(nn.Module, SupportsMultiModal):
         if input_features_mask is None:
             return None
 
+        input_features_padded = kwargs.pop("input_features_padded", None)
+        if input_features_padded is None:
+            return None
+
         return Gemma3nAudioInputs(
             input_features=input_features,
             input_features_mask=input_features_mask,
+            input_features_padded=input_features_padded,
         )
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
@@ -561,7 +570,8 @@ class Gemma3nForConditionalGeneration(nn.Module, SupportsMultiModal):
         audio_input: Gemma3nAudioInputs,
     ) -> list[torch.Tensor]:
         assert self.audio_tower is not None
-        input_features = audio_input["input_features"].squeeze(1)
+        # Run on padded features to enable batching
+        input_features = audio_input["input_features_padded"].squeeze(1)
         input_features_mask = audio_input["input_features_mask"].squeeze(1)
         audio_outputs, audio_mask = self.audio_tower(input_features,
                                                      ~input_features_mask)
@@ -698,3 +708,53 @@ class Gemma3nForConditionalGeneration(nn.Module, SupportsMultiModal):
             return "<audio_soft_token>"
         else:
             raise ValueError(f"Unsupported modality: {modality}")
+
+    @classmethod
+    def get_generation_prompt(cls, audio: np.ndarray,
+                              stt_config: SpeechToTextConfig,
+                              model_config: ModelConfig,
+                              language: Optional[str],
+                              task_type: Literal["transcribe", "translate"],
+                              request_prompt: str,
+                              to_language: Optional[str]) -> PromptType:
+        """
+        Gemma3n supports "free-form" transcription.
+        We fix its prompt here to standardize transcriptions/translations
+        requests.
+        """
+        # Transcribe this audio [into <>] | for transcription
+        # Translate this audio [from <> into <>] | for translation
+        prompt = "<start_of_turn>user\n"
+        prompt += "Transcribe" if task_type == "transcribe" else "Translate"
+        prompt += " this audio"
+
+        # We assume the language is a valid ISO 639-1 code.
+        full_lang_name = cls.supported_languages.get(language, "")
+        # Translation only for now
+        full_lang_name_to = cls.supported_languages.get(to_language, "")
+
+        if task_type == "transcribe" and full_lang_name:
+            prompt += f" into {full_lang_name}"
+        elif task_type == "translate":
+            if full_lang_name:
+                prompt += f" from {full_lang_name}"
+            if full_lang_name_to:
+                prompt += f" into {full_lang_name_to}"
+
+        prompt += ": <audio_soft_token><end_of_turn>\n<start_of_turn>model\n"
+
+        audio = (audio, stt_config.sample_rate)
+        prompts_dict = {"multi_modal_data": {"audio": audio}, "prompt": prompt}
+        return cast(PromptType, prompts_dict)
+
+    @classmethod
+    def get_speech_to_text_config(cls, model_config: ModelConfig,
+                                  task_type: str) -> SpeechToTextConfig:
+        return SpeechToTextConfig(
+            # Let's set this to 30 as suggested in the docs for now, although
+            # the model is only limited by its context length.
+            max_audio_clip_s=30,
+            sample_rate=16000,
+            # TODO enable chunking after more thorough testing.
+            min_energy_split_window_size=None,
+        )

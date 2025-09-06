@@ -1,24 +1,23 @@
 import asyncio
 from abc import ABC, abstractmethod
-from typing import AsyncGenerator, Mapping, Optional
+from typing import Any, AsyncGenerator, Iterable, Mapping, Optional, Union
 
 from aphrodite.common.beam_search import (BeamSearchSequence,
                                           create_sort_beams_key_function)
-from aphrodite.config import (AphroditeConfig, DecodingConfig,
-                                     ModelConfig)
 from aphrodite.common.outputs import (CompletionOutput, PoolingRequestOutput,
                                       RequestOutput)
 from aphrodite.common.pooling_params import PoolingParams
 from aphrodite.common.sampling_params import BeamSearchParams, SamplingParams
-from aphrodite.utils import (Device, collect_from_async_generator,
-                                    random_uuid)
+from aphrodite.config import AphroditeConfig, DecodingConfig, ModelConfig
 from aphrodite.inputs.data import PromptType, TokensPrompt
 from aphrodite.inputs.parse import is_explicit_encoder_decoder_prompt
 from aphrodite.inputs.preprocess import InputPreprocessor
 from aphrodite.lora.request import LoRARequest
 from aphrodite.modeling.layers.sampler import SamplerOutput
+from aphrodite.plugins.io_processors.interface import IOProcessor
 from aphrodite.processing.scheduler import SchedulerOutputs
 from aphrodite.transformers_utils.tokenizer import AnyTokenizer
+from aphrodite.utils import Device, collect_from_async_generator, random_uuid
 
 
 class EngineClient(ABC):
@@ -221,16 +220,18 @@ class EngineClient(ABC):
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
+        tokenization_kwargs: Optional[dict[str, Any]] = None,
     ) -> AsyncGenerator[PoolingRequestOutput, None]:
         """Generate outputs for a request from a pooling model."""
         ...
 
     @abstractmethod
-    async def abort(self, request_id: str) -> None:
+    async def abort(self, request_id: Union[str, Iterable[str]]) -> None:
         """Abort a request.
 
         Args:
-            request_id: The unique id of the request.
+            request_id: The unique id of the request,
+                        or an iterable of such ids.
         """
         ...
 
@@ -261,6 +262,9 @@ class EngineClient(ABC):
     ) -> AnyTokenizer:
         """Get the appropriate tokenizer for the request"""
         ...
+
+    async def get_io_processor(self) -> IOProcessor:
+        raise NotImplementedError
 
     @abstractmethod
     async def is_tracing_enabled(self) -> bool:
@@ -316,7 +320,7 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
-    async def add_lora(self, lora_request: LoRARequest) -> None:
+    async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
         ...
 
@@ -324,4 +328,12 @@ class EngineClient(ABC):
                                new_data_parallel_size: int,
                                drain_timeout: int = 300) -> None:
         """Scale the engine"""
+        raise NotImplementedError
+
+    async def collective_rpc(self,
+                             method: str,
+                             timeout: Optional[float] = None,
+                             args: tuple = (),
+                             kwargs: Optional[dict] = None):
+        """Perform a collective RPC call to the given path."""
         raise NotImplementedError

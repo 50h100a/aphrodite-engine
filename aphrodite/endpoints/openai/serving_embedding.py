@@ -93,7 +93,6 @@ class EmbeddingMixin(OpenAIServing):
                     # so there is no need to append extra tokens to the input
                     add_generation_prompt=False,
                     continue_final_message=False,
-                    truncate_prompt_tokens=ctx.truncate_prompt_tokens,
                     add_special_tokens=ctx.request.add_special_tokens,
                 )
             else:
@@ -102,7 +101,6 @@ class EmbeddingMixin(OpenAIServing):
                      ctx.request,
                      tokenizer,
                      ctx.request.input,
-                     truncate_prompt_tokens=ctx.truncate_prompt_tokens,
                      add_special_tokens=ctx.request.add_special_tokens,
                  )
             return None
@@ -589,11 +587,13 @@ class OpenAIServingEmbedding(EmbeddingMixin):
         request_logger: Optional[RequestLogger],
         chat_template: Optional[str],
         chat_template_content_format: ChatTemplateContentFormatOption,
+        log_error_stack: bool = False,
     ) -> None:
         super().__init__(engine_client=engine_client,
                          model_config=model_config,
                          models=models,
-                         request_logger=request_logger)
+                         request_logger=request_logger,
+                         log_error_stack=log_error_stack)
 
         self.chat_template = chat_template
         self.chat_template_content_format: Final = chat_template_content_format
@@ -624,18 +624,6 @@ class OpenAIServingEmbedding(EmbeddingMixin):
         )
 
         return await super().handle(ctx)  # type: ignore
-
-    @override
-    def _validate_request(
-        self,
-        ctx: ServeContext[EmbeddingRequest],
-    ) -> Optional[ErrorResponse]:
-        if error := super()._validate_request(ctx):
-            return error
-
-        ctx.truncate_prompt_tokens = ctx.request.truncate_prompt_tokens
-
-        return None
 
     @override
     def _create_pooling_params(

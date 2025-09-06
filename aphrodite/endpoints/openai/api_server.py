@@ -63,6 +63,7 @@ from aphrodite.endpoints.openai.protocol import (AnthropicMessagesRequest,
                                                  EmbeddingRequest,
                                                  EmbeddingResponse, ErrorInfo,
                                                  ErrorResponse,
+                                                 IOProcessorResponse,
                                                  KAIGenerationInputSchema,
                                                  LoadLoRAAdapterRequest,
                                                  PoolingRequest,
@@ -139,7 +140,7 @@ async def lifespan(app: FastAPI):
 
             async def _force_log():
                 while True:
-                    await asyncio.sleep(10.)
+                    await asyncio.sleep(envs.APHRODITE_LOG_STATS_INTERVAL)
                     await engine_client.do_log_stats()
 
             task = asyncio.create_task(_force_log())
@@ -649,7 +650,11 @@ async def create_responses(request: ResponsesRequest, raw_request: Request):
         return base(raw_request).create_error_response(
             message="The model does not support Responses API")
 
-    generator = await handler.create_responses(request, raw_request)
+    try:
+        generator = await handler.create_responses(request, raw_request)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                            detail=str(e)) from e
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
@@ -666,7 +671,11 @@ async def retrieve_responses(response_id: str, raw_request: Request):
         return base(raw_request).create_error_response(
             message="The model does not support Responses API")
 
-    response = await handler.retrieve_responses(response_id)
+    try:
+        response = await handler.retrieve_responses(response_id)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                            detail=str(e)) from e
 
     if isinstance(response, ErrorResponse):
         return JSONResponse(content=response.model_dump(),
@@ -681,7 +690,11 @@ async def cancel_responses(response_id: str, raw_request: Request):
         return base(raw_request).create_error_response(
             message="The model does not support Responses API")
 
-    response = await handler.cancel_responses(response_id)
+    try:
+        response = await handler.cancel_responses(response_id)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                            detail=str(e)) from e
 
     if isinstance(response, ErrorResponse):
         return JSONResponse(content=response.model_dump(),
@@ -716,7 +729,11 @@ async def create_chat_completion(request: ChatCompletionRequest,
         return base(raw_request).create_error_response(
             message="The model does not support Chat Completions API")
 
-    generator = await handler.create_chat_completion(request, raw_request)
+    try:
+        generator = await handler.create_chat_completion(request, raw_request)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                            detail=str(e)) from e
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
@@ -829,7 +846,11 @@ async def create_embedding(request: EmbeddingRequest, raw_request: Request):
         return base(raw_request).create_error_response(
             message="The model does not support Embeddings API")
 
-    generator = await handler.create_embedding(request, raw_request)
+    try:
+        generator = await handler.create_embedding(request, raw_request)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                            detail=str(e)) from e
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
@@ -858,11 +879,16 @@ async def create_pooling(request: PoolingRequest, raw_request: Request):
         return base(raw_request).create_error_response(
             message="The model does not support Pooling API")
 
-    generator = await handler.create_pooling(request, raw_request)
+    try:
+        generator = await handler.create_pooling(request, raw_request)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                            detail=str(e)) from e
+
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
                             status_code=generator.error.code)
-    elif isinstance(generator, PoolingResponse):
+    elif isinstance(generator, (PoolingResponse, IOProcessorResponse)):
         return JSONResponse(content=generator.model_dump())
 
     assert_never(generator)
@@ -878,7 +904,12 @@ async def create_classify(request: ClassificationRequest,
         return base(raw_request).create_error_response(
             message="The model does not support Classification API")
 
-    generator = await handler.create_classify(request, raw_request)
+    try:
+        generator = await handler.create_classify(request, raw_request)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                            detail=str(e)) from e
+
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
                             status_code=generator.error.code)
@@ -907,7 +938,12 @@ async def create_score(request: ScoreRequest, raw_request: Request):
         return base(raw_request).create_error_response(
             message="The model does not support Score API")
 
-    generator = await handler.create_score(request, raw_request)
+    try:
+        generator = await handler.create_score(request, raw_request)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                            detail=str(e)) from e
+
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
                             status_code=generator.error.code)
@@ -965,12 +1001,17 @@ async def create_transcriptions(raw_request: Request,
             message="The model does not support Transcriptions API")
 
     audio_data = await request.file.read()
-    generator = await handler.create_transcription(audio_data, request,
-                                                   raw_request)
+
+    try:
+        generator = await handler.create_transcription(audio_data, request,
+                                                       raw_request)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                            detail=str(e)) from e
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
-                            status_code=response.error.code)
+                            status_code=generator.error.code)
 
     elif isinstance(generator, TranscriptionResponse):
         return JSONResponse(content=generator.model_dump())
@@ -1006,12 +1047,17 @@ async def create_translations(request: Annotated[TranslationRequest,
             message="The model does not support Translations API")
 
     audio_data = await request.file.read()
-    generator = await handler.create_translation(audio_data, request,
-                                                 raw_request)
+
+    try:
+        generator = await handler.create_translation(audio_data, request,
+                                                     raw_request)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                            detail=str(e)) from e
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
-                            status_code=response.error.code)
+                            status_code=generator.error.code)
 
     elif isinstance(generator, TranslationResponse):
         return JSONResponse(content=generator.model_dump())
@@ -1036,10 +1082,16 @@ async def do_rerank(request: RerankRequest, raw_request: Request):
     if handler is None:
         return base(raw_request).create_error_response(
             message="The model does not support Rerank (Score) API")
-    generator = await handler.do_rerank(request, raw_request)
+
+    try:
+        generator = await handler.do_rerank(request, raw_request)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                            detail=str(e)) from e
+
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
-                            status_code=response.error.code)
+                            status_code=generator.error.code)
     elif isinstance(generator, RerankResponse):
         return JSONResponse(content=generator.model_dump())
 
@@ -1134,6 +1186,34 @@ if envs.APHRODITE_SERVER_DEV_MODE:
         logger.info("check whether the engine is sleeping")
         is_sleeping = await engine_client(raw_request).is_sleeping()
         return JSONResponse(content={"is_sleeping": is_sleeping})
+
+    @router.post("/collective_rpc")
+    async def collective_rpc(raw_request: Request):
+        try:
+            body = await raw_request.json()
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                                detail=f"JSON decode error: {e}") from e
+        method = body.get("method")
+        if method is None:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                                detail="Missing 'method' in request body")
+        # For security reason, only serialized string args/kwargs are passed.
+        # User-defined `method` is responsible for deserialization if needed.
+        args: list[str] = body.get("args", [])
+        kwargs: dict[str, str] = body.get("kwargs", {})
+        timeout: Optional[float] = body.get("timeout")
+        results = await engine_client(raw_request).collective_rpc(
+            method=method, timeout=timeout, args=tuple(args), kwargs=kwargs)
+        if results is None:
+            return Response(status_code=200)
+        response: list[Any] = []
+        for result in results:
+            if result is None or isinstance(result, (dict, list)):
+                response.append(result)
+            else:
+                response.append(str(result))
+        return JSONResponse(content={"results": response})
 
 
 @router.post("/scale_elastic_ep",
@@ -2004,6 +2084,8 @@ async def init_app_state(
         reasoning_parser=args.reasoning_parser,
         enable_prompt_tokens_details=args.enable_prompt_tokens_details,
         enable_force_include_usage=args.enable_force_include_usage,
+        enable_log_outputs=args.enable_log_outputs,
+        log_error_stack=args.log_error_stack,
     ) if "generate" in supported_tasks else None
     state.openai_serving_chat = OpenAIServingChat(
         engine_client,
@@ -2021,6 +2103,8 @@ async def init_app_state(
         reasoning_parser=args.reasoning_parser,
         enable_prompt_tokens_details=args.enable_prompt_tokens_details,
         enable_force_include_usage=args.enable_force_include_usage,
+        enable_log_outputs=args.enable_log_outputs,
+        log_error_stack=args.log_error_stack,
     ) if "generate" in supported_tasks else None
     state.openai_serving_completion = OpenAIServingCompletion(
         engine_client,
@@ -2030,14 +2114,16 @@ async def init_app_state(
         return_tokens_as_token_ids=args.return_tokens_as_token_ids,
         enable_prompt_tokens_details=args.enable_prompt_tokens_details,
         enable_force_include_usage=args.enable_force_include_usage,
+        log_error_stack=args.log_error_stack,
     ) if "generate" in supported_tasks else None
     state.openai_serving_pooling = OpenAIServingPooling(
         engine_client,
-        model_config,
+        aphrodite_config,
         state.openai_serving_models,
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
+        log_error_stack=args.log_error_stack,
     ) if "encode" in supported_tasks else None
     state.openai_serving_embedding = OpenAIServingEmbedding(
         engine_client,
@@ -2046,22 +2132,23 @@ async def init_app_state(
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
+        log_error_stack=args.log_error_stack,
     ) if "embed" in supported_tasks else None
     state.openai_serving_classification = ServingClassification(
         engine_client,
         model_config,
         state.openai_serving_models,
         request_logger=request_logger,
+        enable_log_outputs=args.enable_log_outputs,
     ) if "classify" in supported_tasks else None
 
-    enable_serving_reranking = ("classify" in supported_tasks and getattr(
-        model_config.hf_config, "num_labels", 0) == 1)
     state.openai_serving_scores = ServingScores(
         engine_client,
         model_config,
         state.openai_serving_models,
         request_logger=request_logger,
-    ) if ("embed" in supported_tasks or enable_serving_reranking) else None
+        log_error_stack=args.log_error_stack,
+    ) if ("embed" in supported_tasks or "score" in supported_tasks) else None
 
     state.openai_serving_tokenization = OpenAIServingTokenization(
         engine_client,
@@ -2070,18 +2157,21 @@ async def init_app_state(
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
+        log_error_stack=args.log_error_stack,
     )
     state.openai_serving_transcription = OpenAIServingTranscription(
         engine_client,
         model_config,
         state.openai_serving_models,
         request_logger=request_logger,
+        log_error_stack=args.log_error_stack,
     ) if "transcription" in supported_tasks else None
     state.openai_serving_translation = OpenAIServingTranslation(
         engine_client,
         model_config,
         state.openai_serving_models,
         request_logger=request_logger,
+        log_error_stack=args.log_error_stack,
     ) if "transcription" in supported_tasks else None
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
@@ -2290,6 +2380,8 @@ async def run_server_worker(listen_address,
             ssl_certfile=args.ssl_certfile,
             ssl_ca_certs=args.ssl_ca_certs,
             ssl_cert_reqs=args.ssl_cert_reqs,
+            h11_max_incomplete_event_size=args.h11_max_incomplete_event_size,
+            h11_max_header_count=args.h11_max_header_count,
             **uvicorn_kwargs,
         )
 

@@ -1,4 +1,5 @@
 """Utilities for downloading and initializing model weights."""
+import concurrent.futures
 import fnmatch
 import glob
 import hashlib
@@ -20,8 +21,8 @@ from loguru import logger
 from safetensors.torch import load_file, safe_open, save_file
 from tqdm.auto import tqdm
 
-from aphrodite.config import LoadConfig, ModelConfig
 from aphrodite.common.logger import log_once
+from aphrodite.config import LoadConfig, ModelConfig
 from aphrodite.distributed import get_tensor_model_parallel_rank
 from aphrodite.platforms import current_platform
 from aphrodite.quantization import QuantizationConfig, get_quantization_config
@@ -29,9 +30,7 @@ from aphrodite.utils import PlaceholderModule
 
 try:
     from runai_model_streamer import SafetensorsStreamer
-except (ImportError, OSError):
-    # see https://github.com/run-ai/runai-model-streamer/issues/26
-    # OSError will be raised on arm64 platform
+except ImportError:
     runai_model_streamer = PlaceholderModule(
         "runai_model_streamer")  # type: ignore[assignment]
     SafetensorsStreamer = runai_model_streamer.placeholder_attr(
@@ -276,33 +275,48 @@ def download_weights_from_hf(
     Returns:
         str: The path to the downloaded model weights.
     """
+    assert len(allow_patterns) > 0
     local_only = huggingface_hub.constants.HF_HUB_OFFLINE
     if not local_only:
-        # Before we download we look at that is available:
-        fs = HfFileSystem()
-        file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
+        # Attempt to reduce allow_patterns to a single pattern
+        # so we only have to call snapshot_download once.
+        try:
+            fs = HfFileSystem()
+            file_list = fs.ls(model_name_or_path,
+                              detail=False,
+                              revision=revision)
 
-        # depending on what is available we download different things
-        for pattern in allow_patterns:
-            matching = fnmatch.filter(file_list, pattern)
-            if len(matching) > 0:
-                allow_patterns = [pattern]
+            # Use the first pattern found in the HF repo's files.
+            for pattern in allow_patterns:
+                matching = fnmatch.filter(file_list, pattern)
+                if len(matching) > 0:
+                    allow_patterns = [pattern]
                 break
+        except Exception as e:
+            logger.warning(
+                "Failed to get file list for '{}'. Trying each pattern in "
+                "allow_patterns individually until weights have been "
+                "downloaded. Error: {}", model_name_or_path, e)
 
     logger.info("Using model weights format {}", allow_patterns)
     # Use file lock to prevent multiple processes from
     # downloading the same model weights at the same time.
     with get_lock(model_name_or_path, cache_dir):
         start_time = time.perf_counter()
-        hf_folder = snapshot_download(
-            model_name_or_path,
-            allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns,
-            cache_dir=cache_dir,
-            tqdm_class=DisabledTqdm,
-            revision=revision,
-            local_files_only=local_only,
-        )
+        for allow_pattern in allow_patterns:
+            hf_folder = snapshot_download(
+                model_name_or_path,
+                allow_patterns=allow_pattern,
+                ignore_patterns=ignore_patterns,
+                cache_dir=cache_dir,
+                tqdm_class=DisabledTqdm,
+                revision=revision,
+                local_files_only=local_only,
+            )
+            # If we have downloaded weights for this allow_pattern,
+            # we don't need to check the rest.
+            if any(Path(hf_folder).glob(allow_pattern)):
+                break
         time_taken = time.perf_counter() - start_time
         if time_taken > 0.5:
             logger.info("Time spent downloading weights for {}: {:.2f} seconds",
@@ -472,6 +486,36 @@ def safetensors_weights_iterator(
                 yield name, param
 
 
+def multi_thread_safetensors_weights_iterator(
+    hf_weights_files: list[str],
+    use_tqdm_on_load: bool,
+    max_workers: int = 4,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Multi-Thread iterate over the weights in the model safetensor files."""
+
+    def _load_file(st_file: str):
+        result = load_file(st_file, device="cpu")
+        return result
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max_workers
+    ) as executor:
+        futures = [executor.submit(_load_file, st_file) for st_file in
+                   hf_weights_files]
+        futures_iter = tqdm(
+            concurrent.futures.as_completed(futures),
+            total=len(hf_weights_files),
+            desc="Multi-thread loading shards",
+            disable=True,
+            bar_format=_BAR_FORMAT,
+        )
+
+        for future in futures_iter:
+            state_dict = future.result()
+            for name, param in state_dict.items():
+                yield name, param
+
+
 def runai_safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -552,6 +596,38 @@ def pt_weights_iterator(
         del state
 
 
+def multi_thread_pt_weights_iterator(
+    hf_weights_files: list[str],
+    use_tqdm_on_load: bool,
+    pt_load_map_location: Union[str, dict[str, str]] = "cpu",
+    max_workers: int = 4,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Multi-Thread iterate over the weights in the model bin/pt files."""
+    def _load_file(bin_file: str):
+        return torch.load(
+            bin_file, map_location=pt_load_map_location,
+            weights_only=True)
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max_workers
+    ) as executor:
+        futures = [
+            executor.submit(_load_file, bin_file) for bin_file in
+            hf_weights_files]
+        futures_iter = tqdm(
+            concurrent.futures.as_completed(futures),
+            total=len(hf_weights_files),
+            desc="Multi-thread loading pt checkpoint shards",
+            disable=True,
+            bar_format=_BAR_FORMAT,
+        )
+
+        for future in futures_iter:
+            state = future.result()
+            yield from state.items()
+            del state
+
+
 def get_gguf_extra_tensor_names(
         gguf_file: str, gguf_to_hf_name_map: dict[str, str]) -> list[str]:
     reader = gguf.GGUFReader(gguf_file)
@@ -559,6 +635,18 @@ def get_gguf_extra_tensor_names(
     exact_gguf_keys = set([tensor.name for tensor in reader.tensors])
     extra_keys = expected_gguf_keys - exact_gguf_keys
     return [gguf_to_hf_name_map[key] for key in extra_keys]
+
+
+def get_gguf_weight_type_map(
+        gguf_file: str, gguf_to_hf_name_map: dict[str, str]) -> dict[str, str]:
+    """
+    Return GGUF mapped weight's name and its quant type
+    """
+    reader = gguf.GGUFReader(gguf_file)
+    return {
+        gguf_to_hf_name_map[tensor.name]: tensor.tensor_type.name
+        for tensor in reader.tensors if tensor.name in gguf_to_hf_name_map
+    }
 
 
 def gguf_quant_weights_iterator(
