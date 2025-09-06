@@ -334,12 +334,10 @@ class OpenAIServingCompletion(OpenAIServing):
                 prompt_logprobs = res.prompt_logprobs
 
                 if first_iteration:
-                    if res.metrics.first_token_time is None:
-                        continue
                     num_cached_tokens = res.num_cached_tokens
                     first_iteration = False
                     perfinfo = {
-                        'dur_processing': res.metrics.first_token_time - res.metrics.first_scheduled_time,
+                        'dur_processing': res.metrics.last_token_time - res.metrics.arrival_time,
                         'cached_tokens': num_cached_tokens,
                         'object': 'mancer.firstevent'
                     }
