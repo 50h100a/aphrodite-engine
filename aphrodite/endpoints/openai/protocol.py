@@ -1049,6 +1049,7 @@ class CompletionRequest(OpenAIBaseModel):
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     user: Optional[str] = None
+    max_context_tokens: Optional[int] = None
 
     # doc: begin-completion-sampling-params
     use_beam_search: Optional[bool] = False
@@ -1691,6 +1692,7 @@ class RerankResponse(OpenAIBaseModel):
 
 
 class CompletionLogProbs(OpenAIBaseModel):
+    ids: list[int] = Field(default_factory=list)
     text_offset: list[int] = Field(default_factory=list)
     token_logprobs: list[Optional[float]] = Field(default_factory=list)
     tokens: list[str] = Field(default_factory=list)

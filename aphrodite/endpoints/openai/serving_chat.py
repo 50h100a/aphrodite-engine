@@ -553,6 +553,8 @@ class OpenAIServingChat(OpenAIServing):
                 # the result_generator, it needs to be sent as the FIRST
                 # response (by the try...catch).
                 if first_iteration:
+                    if res.metrics.first_token_time is None:
+                        continue
                     num_cached_tokens = res.num_cached_tokens
                     # Send first response for each request.n (index) with
                     # the role
@@ -586,6 +588,7 @@ class OpenAIServingChat(OpenAIServing):
                         data = chunk.model_dump_json(exclude_unset=True)
                         perfinfo = {
                             'dur_processing': res.metrics.first_token_time - res.metrics.first_scheduled_time,
+                            'cached_tokens': num_cached_tokens,
                             'object': 'mancer.firstevent'
                         }
                         yield f"data: {json.dumps(perfinfo)}\n\n"

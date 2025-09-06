@@ -334,10 +334,13 @@ class OpenAIServingCompletion(OpenAIServing):
                 prompt_logprobs = res.prompt_logprobs
 
                 if first_iteration:
+                    if res.metrics.first_token_time is None:
+                        continue
                     num_cached_tokens = res.num_cached_tokens
                     first_iteration = False
                     perfinfo = {
                         'dur_processing': res.metrics.first_token_time - res.metrics.first_scheduled_time,
+                        'cached_tokens': num_cached_tokens,
                         'object': 'mancer.firstevent'
                     }
                     yield f"data: {json.dumps(perfinfo)}\n\n"
@@ -589,6 +592,7 @@ class OpenAIServingCompletion(OpenAIServing):
         out_token_logprobs: list[Optional[float]] = []
         out_tokens: list[str] = []
         out_top_logprobs: list[Optional[dict[str, float]]] = []
+        out_token_ids:list[int] = []
 
         last_token_len = 0
 
@@ -596,6 +600,7 @@ class OpenAIServingCompletion(OpenAIServing):
                                      if return_as_token_id is not None else
                                      self.return_tokens_as_token_ids)
         for i, token_id in enumerate(token_ids):
+            out_token_ids.append(token_id)
             step_top_logprobs = top_logprobs[i]
             if step_top_logprobs is None:
                 token = tokenizer.decode(token_id)
@@ -644,6 +649,7 @@ class OpenAIServingCompletion(OpenAIServing):
             last_token_len = len(token)
 
         return CompletionLogProbs(
+            ids=out_token_ids,
             text_offset=out_text_offset,
             token_logprobs=out_token_logprobs,
             tokens=out_tokens,
