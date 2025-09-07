@@ -11,7 +11,7 @@ import regex as re
 from fastapi import Request
 from loguru import logger
 from openai_harmony import Message as OpenAIMessage
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from aphrodite.common.outputs import CompletionOutput, RequestOutput
 from aphrodite.common.sampling_params import BeamSearchParams, SamplingParams
@@ -243,6 +243,9 @@ class OpenAIServingChat(OpenAIServing):
                     request_prompts,
                     engine_prompts,
                 ) = self._make_request_with_harmony(request)
+        except ValidationError as ex:
+            logger.exception("Error in validating request")
+            return self.create_error_response(ex.json())
         except (ValueError, TypeError, RuntimeError,
                 jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
@@ -334,6 +337,7 @@ class OpenAIServingChat(OpenAIServing):
                 conversation, tokenizer, request_metadata)
         except ValueError as e:
             # TODO: Use a aphrodite-specific Validation Error
+            print(e)
             return self.create_error_response(str(e))
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
@@ -652,7 +656,7 @@ class OpenAIServingChat(OpenAIServing):
                     if finish_reason_sent[i]:
                         continue
 
-                    if request.logprobs and request.top_logprobs is not None:
+                    if len(output.token_ids) and request.logprobs and request.top_logprobs is not None:
                         assert output.logprobs is not None, (
                             "Did not output logprobs")
                         logprobs = self._create_chat_logprobs(
@@ -1125,7 +1129,7 @@ class OpenAIServingChat(OpenAIServing):
             token_ids = output.token_ids
             out_logprobs = output.logprobs
 
-            if len(token_ids) and request.logprobs and request.top_logprobs is not None:
+            if request.logprobs and request.top_logprobs is not None:
                 assert out_logprobs is not None, "Did not output logprobs"
                 logprobs = self._create_chat_logprobs(
                     token_ids=token_ids,
