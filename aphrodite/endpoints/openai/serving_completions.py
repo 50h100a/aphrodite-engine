@@ -4,7 +4,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from typing import Optional, Union, cast
 
-import jinja2
+import jinja2, json
 from fastapi import Request
 from loguru import logger
 from typing_extensions import assert_never
@@ -341,6 +341,12 @@ class OpenAIServingCompletion(OpenAIServing):
                 if first_iteration:
                     num_cached_tokens = res.num_cached_tokens
                     first_iteration = False
+                    perfinfo = {
+                        'dur_processing': res.metrics.last_token_time - res.metrics.arrival_time,
+                        'cached_tokens': num_cached_tokens,
+                        'object': 'mancer.firstevent'
+                    }
+                    yield f"data: {json.dumps(perfinfo)}\n\n"
 
                 if res.prompt is not None:
                     prompt_text = res.prompt
@@ -406,7 +412,7 @@ class OpenAIServingCompletion(OpenAIServing):
                             # Chunked prefill case, don't return empty chunks
                             continue
 
-                    if request.logprobs is not None:
+                    if len(delta_token_ids) and request.logprobs is not None:
                         assert out_logprobs is not None, (
                             "Did not output logprobs")
                         logprobs = self._create_completion_logprobs(
@@ -415,7 +421,7 @@ class OpenAIServingCompletion(OpenAIServing):
                             num_output_top_logprobs=request.logprobs,
                             tokenizer=tokenizer,
                             initial_text_offset=previous_text_lens[i],
-                            return_as_token_id=request.
+                            return_as_token_id=self.
                             return_tokens_as_token_ids,
                         )
                     else:
@@ -548,7 +554,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         top_logprobs=out_logprobs,
                         tokenizer=tokenizer,
                         num_output_top_logprobs=request.logprobs,
-                        return_as_token_id=request.return_tokens_as_token_ids,
+                        return_as_token_id=self.return_tokens_as_token_ids,
                     )
                 else:
                     logprobs = None
@@ -608,6 +614,7 @@ class OpenAIServingCompletion(OpenAIServing):
         out_token_logprobs: list[Optional[float]] = []
         out_tokens: list[str] = []
         out_top_logprobs: list[Optional[dict[str, float]]] = []
+        out_token_ids:list[int] = []
 
         last_token_len = 0
 
@@ -615,6 +622,7 @@ class OpenAIServingCompletion(OpenAIServing):
                                      if return_as_token_id is not None else
                                      self.return_tokens_as_token_ids)
         for i, token_id in enumerate(token_ids):
+            out_token_ids.append(token_id)
             step_top_logprobs = top_logprobs[i]
             if step_top_logprobs is None:
                 token = tokenizer.decode(token_id)
@@ -663,6 +671,7 @@ class OpenAIServingCompletion(OpenAIServing):
             last_token_len = len(token)
 
         return CompletionLogProbs(
+            ids=out_token_ids,
             text_offset=out_text_offset,
             token_logprobs=out_token_logprobs,
             tokens=out_tokens,

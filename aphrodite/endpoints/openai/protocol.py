@@ -406,7 +406,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: list[ChatCompletionMessageParam]
-    model: str
+    model: Optional[str] = None
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[dict[str, float]] = None
     logprobs: Optional[bool] = False
@@ -435,6 +435,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # NOTE this will be ignored by Aphrodite - the model determines the behavior
     parallel_tool_calls: Optional[bool] = False
     user: Optional[str] = None
+    max_context_tokens: Optional[int] = None
 
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None
@@ -1053,7 +1054,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
 class CompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
-    model: str
+    model: Optional[str] = None
     prompt: Optional[Union[list[int], list[list[int]], str, list[str]]] = None
     prompt_embeds: Optional[Union[bytes, list[bytes]]] = None
     best_of: Optional[int] = None
@@ -1074,6 +1075,7 @@ class CompletionRequest(OpenAIBaseModel):
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     user: Optional[str] = None
+    max_context_tokens: Optional[int] = None
 
     # doc: begin-completion-sampling-params
     use_beam_search: Optional[bool] = False
@@ -1780,6 +1782,7 @@ class RerankResponse(OpenAIBaseModel):
 
 
 class CompletionLogProbs(OpenAIBaseModel):
+    ids: list[int] = Field(default_factory=list)
     text_offset: list[int] = Field(default_factory=list)
     token_logprobs: list[Optional[float]] = Field(default_factory=list)
     tokens: list[str] = Field(default_factory=list)

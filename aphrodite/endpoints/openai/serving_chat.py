@@ -11,7 +11,7 @@ import regex as re
 from fastapi import Request
 from loguru import logger
 from openai_harmony import Message as OpenAIMessage
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from aphrodite.common.outputs import CompletionOutput, RequestOutput
 from aphrodite.common.sampling_params import BeamSearchParams, SamplingParams
@@ -243,10 +243,17 @@ class OpenAIServingChat(OpenAIServing):
                     request_prompts,
                     engine_prompts,
                 ) = self._make_request_with_harmony(request)
+        except ValidationError as ex:
+            logger.exception("Error in validating request")
+            return self.create_error_response(ex.json())
         except (ValueError, TypeError, RuntimeError,
                 jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(f"{e} {e.__cause__}")
+
+        if request.max_context_tokens:
+            if len(engine_prompts[0]['prompt_token_ids']) > request.max_context_tokens:
+                return self.create_error_response("Prompt too large", status_code=406)
 
         request_id = "chatcmpl-" \
                      f"{self._base_request_id(raw_request, request.request_id)}"
@@ -330,6 +337,7 @@ class OpenAIServingChat(OpenAIServing):
                 conversation, tokenizer, request_metadata)
         except ValueError as e:
             # TODO: Use a aphrodite-specific Validation Error
+            print(e)
             return self.create_error_response(str(e))
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
@@ -599,6 +607,12 @@ class OpenAIServingChat(OpenAIServing):
                                 total_tokens=num_prompt_tokens)
 
                         data = chunk.model_dump_json(exclude_unset=True)
+                        perfinfo = {
+                            'dur_processing': res.metrics.last_token_time - res.metrics.arrival_time,
+                            'cached_tokens': num_cached_tokens,
+                            'object': 'mancer.firstevent'
+                        }
+                        yield f"data: {json.dumps(perfinfo)}\n\n"
                         yield f"data: {data}\n\n"
 
                     # Send response to echo the input portion of the
@@ -642,7 +656,7 @@ class OpenAIServingChat(OpenAIServing):
                     if finish_reason_sent[i]:
                         continue
 
-                    if request.logprobs and request.top_logprobs is not None:
+                    if len(output.token_ids) and request.logprobs and request.top_logprobs is not None:
                         assert output.logprobs is not None, (
                             "Did not output logprobs")
                         logprobs = self._create_chat_logprobs(
@@ -650,8 +664,8 @@ class OpenAIServingChat(OpenAIServing):
                             top_logprobs=output.logprobs,
                             tokenizer=tokenizer,
                             num_output_top_logprobs=request.top_logprobs,
-                            return_as_token_id=request.
-                            return_token_ids,
+                            return_as_token_id=self.
+                            return_tokens_as_token_ids,
                         )
                     else:
                         logprobs = None

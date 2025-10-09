@@ -432,25 +432,26 @@ class OpenAIServing:
         self,
         request: AnyRequest,
     ) -> Optional[ErrorResponse]:
+        return None
 
-        error_response = None
+        # error_response = None
 
-        if self._is_model_supported(request.model):
-            return None
-        if request.model in self.models.lora_requests:
-            return None
-        if envs.APHRODITE_ALLOW_RUNTIME_LORA_UPDATING and request.model and (
-                load_result := await self.models.resolve_lora(request.model)):
-            if isinstance(load_result, LoRARequest):
-                return None
-            if isinstance(load_result, ErrorResponse) and \
-                load_result.error.code == HTTPStatus.BAD_REQUEST.value:
-                error_response = load_result
+        # if self._is_model_supported(request.model):
+        #     return None
+        # if request.model in self.models.lora_requests:
+        #     return None
+        # if envs.APHRODITE_ALLOW_RUNTIME_LORA_UPDATING and request.model and (
+        #         load_result := await self.models.resolve_lora(request.model)):
+        #     if isinstance(load_result, LoRARequest):
+        #         return None
+        #     if isinstance(load_result, ErrorResponse) and \
+        #         load_result.error.code == HTTPStatus.BAD_REQUEST.value:
+        #         error_response = load_result
 
-        return error_response or self.create_error_response(
-            message=f"The model `{request.model}` does not exist.",
-            err_type="NotFoundError",
-            status_code=HTTPStatus.NOT_FOUND)
+        # return error_response or self.create_error_response(
+        #     message=f"The model `{request.model}` does not exist.",
+        #     err_type="NotFoundError",
+        #     status_code=HTTPStatus.NOT_FOUND)
 
     def _get_active_default_mm_loras(
             self, request: AnyRequest) -> Optional[LoRARequest]:
@@ -481,22 +482,23 @@ class OpenAIServing:
         request: AnyRequest,
         supports_default_mm_loras: bool = False,
     ) -> Optional[LoRARequest]:
+        return None
 
-        if request.model in self.models.lora_requests:
-            return self.models.lora_requests[request.model]
+        # if request.model in self.models.lora_requests:
+        #     return self.models.lora_requests[request.model]
 
-        # Currently only support default modality specific loras
-        # if we have exactly one lora matched on the request.
-        if supports_default_mm_loras:
-            default_mm_lora = self._get_active_default_mm_loras(request)
-            if default_mm_lora is not None:
-                return default_mm_lora
+        # # Currently only support default modality specific loras
+        # # if we have exactly one lora matched on the request.
+        # if supports_default_mm_loras:
+        #     default_mm_lora = self._get_active_default_mm_loras(request)
+        #     if default_mm_lora is not None:
+        #         return default_mm_lora
 
-        if self._is_model_supported(request.model):
-            return None
+        # if self._is_model_supported(request.model):
+        #     return None
 
-        # if _check_model has been called earlier, this will be unreachable
-        raise ValueError(f"The model `{request.model}` does not exist.")
+        # # if _check_model has been called earlier, this will be unreachable
+        # raise ValueError(f"The model `{request.model}` does not exist.")
 
     def _get_message_types(self, request: AnyRequest) -> set[str]:
         """Retrieve the set of types from message content dicts up
