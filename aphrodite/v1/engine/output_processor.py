@@ -8,6 +8,7 @@ import torch
 from aphrodite.common.outputs import (CompletionOutput, PoolingOutput,
                                       PoolingRequestOutput, RequestOutput)
 from aphrodite.common.sampling_params import RequestOutputKind
+from aphrodite.common.sequence import RequestMetrics
 from aphrodite.transformers_utils.tokenizer import AnyTokenizer
 from aphrodite.transformers_utils.tokenizer_group import TokenizerGroup
 from aphrodite.v1.engine import (EngineCoreOutput, EngineCoreRequest,
@@ -228,6 +229,13 @@ class RequestState:
             finished=finished,
             kv_transfer_params=kv_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
+            metrics = RequestMetrics(
+                arrival_time=self.stats.arrival_time,
+                first_token_time=self.stats.first_token_ts,
+                last_token_time=self.stats.last_token_ts,
+                first_scheduled_time=self.stats.scheduled_ts,
+                time_in_queue=self.stats.queued_ts - self.stats.scheduled_ts
+            )
         )
 
     def _new_completion_output(
