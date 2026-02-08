@@ -21,11 +21,15 @@ if TYPE_CHECKING:
     import transformers.file_utils as file_utils
     import transformers.models.gpt2.tokenization_gpt2 as tokenization_gpt2
     import xgrammar as xgr
+    import xgrammar.kernels.apply_token_bitmask_inplace_torch_compile as xgr_torch_compile  # noqa: E501
 
     from aphrodite.transformers_utils.tokenizer import AnyTokenizer
     from aphrodite.v1.worker.gpu_input_batch import InputBatch
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
+    xgr_torch_compile = LazyLoader(
+        "xgr_torch_compile", globals(),
+        "xgrammar.kernels.apply_token_bitmask_inplace_torch_compile")
     oc = LazyLoader("oc", globals(), "outlines_core")
     file_utils = LazyLoader("file_utils", globals(), "transformers.file_utils")
     tokenization_gpt2 = LazyLoader(
@@ -113,7 +117,7 @@ def apply_grammar_bitmask(
         index_tensor = torch.tensor(out_indices, dtype=torch.int32, device="cpu", pin_memory=True)
         index_tensor = index_tensor.to(logits.device, non_blocking=True)
 
-    xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, indices=index_tensor)
+    xgr_torch_compile.apply_token_bitmask_inplace_torch_compile(logits, grammar_bitmask, indices=index_tensor)
 
 
 class OutlinesVocabulary:
