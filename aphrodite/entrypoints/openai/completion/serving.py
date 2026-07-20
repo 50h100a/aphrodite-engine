@@ -257,6 +257,8 @@ class OpenAIServingCompletion(GenerateBaseServing):
             )
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
+        finally:
+            await result_generator.aclose()
 
         # When user requests streaming but we don't stream, we still need to
         # return a streaming response with a single event.
@@ -464,6 +466,8 @@ class OpenAIServingCompletion(GenerateBaseServing):
             logger.exception("Error in completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
+        finally:
+            await result_generator.aclose()
         yield "data: [DONE]\n\n"
 
     def request_output_to_completion_response(

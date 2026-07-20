@@ -436,6 +436,7 @@ class OpenAIServingChat(GenerateBaseServing):
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
             yield "data: [DONE]\n\n"
+            await result_generator.aclose()
             return
 
         stream_options = request.stream_options
@@ -761,6 +762,8 @@ class OpenAIServingChat(GenerateBaseServing):
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
+        finally:
+            await result_generator.aclose()
         # Send the final done message after all response.n are finished
         yield "data: [DONE]\n\n"
 
@@ -784,6 +787,8 @@ class OpenAIServingChat(GenerateBaseServing):
                 final_res = res
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
+        finally:
+            await result_generator.aclose()
 
         if final_res is None:
             return self.create_error_response(

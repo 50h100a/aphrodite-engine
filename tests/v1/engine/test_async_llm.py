@@ -36,7 +36,7 @@ if not current_platform.is_cuda():
     pytest.skip(reason="V1 currently only supported on CUDA.", allow_module_level=True)
 
 TEXT_ENGINE_ARGS = AsyncEngineArgs(
-    model="meta-llama/Llama-3.2-1B-Instruct",
+    model="unsloth/Llama-3.2-1B-Instruct",
     enforce_eager=True,
 )
 
@@ -249,6 +249,35 @@ async def test_multi_abort(output_kind: RequestOutputKind):
                 )
 
         # Make sure all aborted requests were cleaned up
+        assert not engine.output_processor.has_unfinished_requests()
+
+
+@pytest.mark.asyncio
+async def test_explicit_aclose_aborts_request():
+    """Test that closing the generator directly, not cancelling the
+    consuming task, still aborts the request.
+    """
+    with ExitStack() as after:
+        with set_default_torch_num_threads(1):
+            engine = AsyncLLM.from_engine_args(TEXT_ENGINE_ARGS)
+        after.callback(engine.shutdown)
+
+        sampling_params = SamplingParams(
+            max_tokens=1000,
+            ignore_eos=True,
+            output_kind=RequestOutputKind.DELTA,
+            temperature=0.5,
+            seed=33,
+        )
+        agen = engine.generate(request_id="request-aclose", prompt=TEXT_PROMPT, sampling_params=sampling_params)
+
+        # Advance once so the request is actually registered with the engine
+        # before we close mid-stream.
+        await agen.__anext__()
+        assert engine.output_processor.has_unfinished_requests()
+
+        await agen.aclose()
+
         assert not engine.output_processor.has_unfinished_requests()
 
 
