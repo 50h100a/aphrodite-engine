@@ -12,7 +12,7 @@ import torch.nn as nn
 from aphrodite.logger import init_logger
 from aphrodite.triton_utils import tl, triton
 from aphrodite.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
-from aphrodite.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
+from aphrodite.v1.sample.logits_processor.builtin import MinPLogitsProcessor
 from aphrodite.v1.sample.metadata import SamplingMetadata
 from aphrodite.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from aphrodite.v1.sample.ops.penalties import apply_all_penalties
@@ -305,8 +305,7 @@ class RejectionSampler(nn.Module):
             apply_bad_words_with_drafts(logits, bad_words_token_ids, output_token_ids, metadata.num_draft_tokens)
 
         for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
-            if isinstance(processor, MinTokensLogitsProcessor):
-                logits = processor.apply_with_spec_decode(logits, metadata.num_draft_tokens)
+            logits = processor.apply_with_spec_decode(logits, metadata.num_draft_tokens)
         holder = sampling_metadata.thinking_budget_state_holder
         if holder is not None and holder.has_tracked_requests():
             logits = holder.apply_to_logits(
@@ -514,6 +513,24 @@ def apply_sampling_constraints(
     )
     # NOTE(woosuk): Update `logits` in place to avoid allocating a new tensor.
     logits.div_(temperature.unsqueeze(-1))
+
+    # Apply min_p after temperature scaling and before top-k/top-p, matching
+    # where MinPLogitsProcessor runs in the non-spec sampling path. The
+    # processor's per-request state is expanded to per-token rows here since
+    # its own apply() assumes one logits row per request.
+    min_p_processor = next(
+        (proc for proc in sampling_metadata.logitsprocs.argmax_invariant if isinstance(proc, MinPLogitsProcessor)),
+        None,
+    )
+    if min_p_processor is not None and min_p_processor.min_p_count:
+        min_p = expand_batch_to_tokens(
+            min_p_processor.min_p.squeeze(-1),
+            cu_num_draft_tokens,
+            num_tokens,
+        )
+        probs = logits.softmax(dim=-1)
+        threshold = probs.amax(dim=-1, keepdim=True).mul_(min_p.unsqueeze(-1))
+        logits.masked_fill_(probs < threshold, -float("inf"))
 
     # Get expanded top_k and top_p tensors.
     top_k = None

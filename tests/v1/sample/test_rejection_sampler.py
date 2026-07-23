@@ -76,6 +76,7 @@ def create_sampling_metadata(
     repetition_penalties: list[float] | None = None,
     bad_words_token_ids: dict[int, list[list[int]]] | None = None,
     allowed_token_ids_mask: torch.Tensor | None = None,
+    logitsprocs: LogitsProcessors | None = None,
 ) -> SamplingMetadata:
     """Create a v1 sampling metadata object with all_greedy set
     to the given value. Either all greedy or all random sampling
@@ -119,7 +120,7 @@ def create_sampling_metadata(
         spec_token_ids=[] if spec_token_ids is None else spec_token_ids,
         allowed_token_ids_mask=allowed_token_ids_mask,
         bad_words_token_ids={} if bad_words_token_ids is None else bad_words_token_ids,
-        logitsprocs=LogitsProcessors(),
+        logitsprocs=logitsprocs if logitsprocs is not None else LogitsProcessors(),
     )
 
 
@@ -690,6 +691,55 @@ def test_top_p(rejection_sampler, top_p):
     )
 
 
+@pytest.mark.parametrize("min_p", [0.1, 0.5, 0.9])
+def test_min_p(rejection_sampler, min_p):
+    """Test rejection sampling with min-p sampling"""
+    from types import SimpleNamespace
+
+    from aphrodite.v1.sample.logits_processor import MinPLogitsProcessor
+
+    vocab_size = 100
+    batch_size = 100
+    num_draft_tokens = 3
+    num_tokens = batch_size * num_draft_tokens
+
+    target_logits = torch.randn((num_tokens, vocab_size), device=DEVICE_TYPE)
+    temperature = torch.ones(batch_size, dtype=torch.float32, device=DEVICE_TYPE)
+
+    # With temperature=1, min_p thresholds on softmax of the raw logits.
+    probs = (target_logits / temperature[0]).softmax(dim=-1)
+    threshold = probs.amax(dim=-1, keepdim=True) * min_p
+    min_p_indices = []
+    for i in range(num_tokens):
+        min_p_indices.append(torch.nonzero(probs[i] >= threshold[i]).flatten().tolist())
+
+    # Build a MinPLogitsProcessor with populated per-request state, as
+    # build_logitsprocs does under spec decode.
+    fake_config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=batch_size))
+    min_p_proc = MinPLogitsProcessor(fake_config, torch.device(DEVICE_TYPE), is_pin_memory=False)
+    min_p_proc.min_p_cpu[:batch_size] = min_p
+    min_p_proc.min_p_count = batch_size
+    min_p_proc.min_p = min_p_proc.min_p_device[:batch_size]
+    min_p_proc.min_p.copy_(min_p_proc.min_p_cpu_tensor[:batch_size])
+    min_p_proc.min_p.unsqueeze_(1)
+
+    sampling_metadata = create_sampling_metadata(
+        all_greedy=False,
+        temperature=temperature,
+        logitsprocs=LogitsProcessors([min_p_proc]),
+    )
+
+    _test_masked_logits(
+        rejection_sampler,
+        batch_size=batch_size,
+        num_draft_tokens=num_draft_tokens,
+        vocab_size=vocab_size,
+        target_logits=target_logits,
+        unmasked_indices=min_p_indices,
+        sampling_metadata=sampling_metadata,
+    )
+
+
 ########################### Tests for Logit Processors ###################
 def test_frequency_penalties(rejection_sampler):
     """Test rejection sampling with frequency penalties"""
@@ -807,6 +857,58 @@ def test_allowed_token_ids(rejection_sampler):
 
     expected = torch.tensor(
         [[15, -1, -1, -1], [10, 5, 10, -1], [7, 10, 12, 5]],
+        dtype=torch.int,
+        device=logits.device,
+    )
+    assert torch.equal(output.sampled_token_ids, expected)
+
+
+def test_logit_bias(rejection_sampler):
+    """Test rejection sampling with logit_bias.
+
+    The bias must reach every speculated (draft) position, not only the
+    first/bonus token. Request 0 is biased at draft position 1, request 1 at
+    position 0, and request 2 is left unbiased.
+    """
+    from aphrodite.v1.sample.logits_processor import LogitBiasLogitsProcessor
+
+    spec_tokens = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+    output_tokens = [[1, 2, 3, 4], [4, 5, 6, 7], [7, 8, 9, 5]]
+
+    # Token 15 is the fallback the sampler falls back to when the intended
+    # token is biased below it (create_logits_tensor sets 15 to 99.0 vs 100.0).
+    logits = create_logits_tensor(output_tokens, token_idx_to_override=15)
+
+    # A -50 bias drops the target token from 100.0 to 50.0, below the 99.0
+    # fallback, flipping the greedy argmax to token 15 (i.e. a rejection).
+    logit_bias_proc = LogitBiasLogitsProcessor(None, torch.device(DEVICE_TYPE), is_pin_memory=False)
+    logit_bias_proc.biases = {
+        0: {2: -50.0},  # suppress token 2 -> reject req 0 at draft position 1
+        1: {4: -50.0},  # suppress token 4 -> reject req 1 at draft position 0
+        # request 2 is intentionally left unbiased
+    }
+
+    metadata = create_sampling_metadata(
+        all_greedy=True,
+        output_token_ids=[[], [], []],
+        spec_token_ids=spec_tokens,
+        logitsprocs=LogitsProcessors([logit_bias_proc]),
+    )
+    bonus_token_tensor = torch.tensor([output_tokens[i][-1] for i in range(len(output_tokens))], device=logits.device)
+    spec_decode_metadata = create_spec_decode_metadata(spec_tokens, logits)
+    mock_sampler_output(rejection_sampler, bonus_token_tensor)
+    output = rejection_sampler(
+        spec_decode_metadata,
+        draft_probs=None,
+        logits=logits,
+        sampling_metadata=metadata,
+    )
+
+    # Request 0: token 1 accepted, token 2 biased out -> 15, rest discarded.
+    # Request 1: token 4 biased out at the first position -> 15, rest discarded.
+    # Request 2: unbiased, all draft tokens accepted plus the bonus token.
+    expected = torch.tensor(
+        [[1, 15, -1, -1], [15, -1, -1, -1], [7, 8, 9, 5]],
         dtype=torch.int,
         device=logits.device,
     )
