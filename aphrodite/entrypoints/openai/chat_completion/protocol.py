@@ -107,6 +107,7 @@ class ChatCompletionLogProb(OpenAIBaseModel):
     token: str
     logprob: float = -9999.0
     bytes: list[int] | None = None
+    token_id: int | None = None
 
 
 class ChatCompletionLogProbsContent(ChatCompletionLogProb):

@@ -1079,6 +1079,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 ),
                 logprob=max(p[1].logprob, -9999.0),
                 bytes=list(token.encode("utf-8", errors="replace")),
+                token_id=p[0],
             )
             for i, p in enumerate(logprobs.items())
             if return_all or top_logprobs == -1 or (top_logprobs is not None and i < top_logprobs)
@@ -1114,6 +1115,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     ChatCompletionLogProbsContent(
                         token=token,
                         bytes=list(token.encode("utf-8", errors="replace")),
+                        token_id=token_id,
                     )
                 )
             else:
@@ -1130,6 +1132,7 @@ class OpenAIServingChat(GenerateBaseServing):
                         ),
                         logprob=max(step_token.logprob, -9999.0),
                         bytes=(None if step_decoded is None else list(step_decoded.encode("utf-8", errors="replace"))),
+                        token_id=token_id,
                         top_logprobs=self._get_top_logprobs(
                             step_top_logprobs,
                             num_output_top_logprobs,

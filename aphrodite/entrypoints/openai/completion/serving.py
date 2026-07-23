@@ -643,6 +643,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
         out_text_offset: list[int] = []
         out_token_logprobs: list[float | None] = []
         out_tokens: list[str] = []
+        out_token_ids: list[int] = []
         out_top_logprobs: list[dict[str, float] | None] = []
 
         last_token_len = 0
@@ -701,6 +702,8 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     }
                 )
 
+            out_token_ids.append(token_id)
+
             if len(out_text_offset) == 0:
                 out_text_offset.append(initial_text_offset)
             else:
@@ -712,4 +715,5 @@ class OpenAIServingCompletion(GenerateBaseServing):
             token_logprobs=out_token_logprobs,
             tokens=out_tokens,
             top_logprobs=out_top_logprobs,
+            token_ids=out_token_ids,
         )

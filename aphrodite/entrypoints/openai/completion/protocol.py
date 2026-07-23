@@ -636,6 +636,9 @@ class CompletionLogProbs(OpenAIBaseModel):
     token_logprobs: list[float | None] = Field(default_factory=list)
     tokens: list[str] = Field(default_factory=list)
     top_logprobs: list[dict[str, float] | None] = Field(default_factory=list)
+    # Aphrodite extension (not in the OpenAI spec): integer token id per
+    # position, parallel to ``tokens``, so callers need not re-tokenize.
+    token_ids: list[int] = Field(default_factory=list)
 
 
 class CompletionResponseChoice(OpenAIBaseModel):
