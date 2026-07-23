@@ -712,3 +712,10 @@ class CompletionStreamResponse(OpenAIBaseModel):
     # without the per-chunk serialization overhead.
     system_fingerprint: str | None = None
     metrics: PerRequestTimingMetrics | None = None
+
+
+class CompactCompletionStreamResponse(OpenAIBaseModel):
+    """Compact streaming event for ``stream_options.compact_stream``."""
+
+    choices: list[CompletionResponseStreamChoice] = Field(default_factory=list)
+    usage: UsageInfo | None = Field(default=None)

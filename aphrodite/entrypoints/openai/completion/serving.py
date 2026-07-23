@@ -21,6 +21,7 @@ from aphrodite.entrypoints.generate.base.serving import (
     format_token_id_placeholder,
 )
 from aphrodite.entrypoints.openai.completion.protocol import (
+    CompactCompletionStreamResponse,
     CompletionLogProbs,
     CompletionRequest,
     CompletionResponse,
@@ -295,6 +296,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
 
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(stream_options, self.enable_force_include_usage)
+        compact_stream = bool(stream_options and stream_options.compact_stream)
 
         last_res: RequestOutput | None = None
         try:
@@ -306,6 +308,19 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 if first_iteration:
                     num_cached_tokens = res.num_cached_tokens
                     first_iteration = False
+
+                    # compact stream: emit a single leading event carrying
+                    # prompt + cached counts only, before any content. Cached
+                    # tokens are always reported here, overriding the
+                    # enable_prompt_tokens_details gate. For a multi-prompt
+                    # (batched) request this reflects the first prompt.
+                    if compact_stream:
+                        lead_prompt_tokens = len(prompt_token_ids) if prompt_token_ids is not None else 0
+                        lead_usage = UsageInfo(prompt_tokens=lead_prompt_tokens)
+                        if num_cached_tokens is not None:
+                            lead_usage.prompt_tokens_details = PromptTokenUsageInfo(cached_tokens=num_cached_tokens)
+                        lead_event = CompactCompletionStreamResponse(usage=lead_usage)
+                        yield f"data: {lead_event.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
 
                 prompt_text = res.prompt
                 if prompt_text is None:
@@ -388,22 +403,32 @@ class OpenAIServingCompletion(GenerateBaseServing):
 
                     self._raise_if_error(finish_reason, request_id)
 
+                    choice_data = CompletionResponseStreamChoice(
+                        index=i,
+                        text=delta_text,
+                        logprobs=logprobs,
+                        finish_reason=finish_reason,
+                        stop_reason=stop_reason,
+                        prompt_token_ids=prompt_token_ids_to_return,
+                        token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
+                    )
+
+                    # compact stream: emit only the choice structure plus a
+                    # running completion_tokens count.
+                    if compact_stream:
+                        compact_event = CompactCompletionStreamResponse(
+                            choices=[choice_data],
+                            usage=UsageInfo(completion_tokens=previous_num_tokens[i]),
+                        )
+                        yield f"data: {compact_event.model_dump_json(exclude_unset=True)}\n\n"
+                        continue
+
                     chunk = CompletionStreamResponse(
                         id=request_id,
                         object="text_completion",
                         created=created_time,
                         model=model_name,
-                        choices=[
-                            CompletionResponseStreamChoice(
-                                index=i,
-                                text=delta_text,
-                                logprobs=logprobs,
-                                finish_reason=finish_reason,
-                                stop_reason=stop_reason,
-                                prompt_token_ids=prompt_token_ids_to_return,
-                                token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
-                            )
-                        ],
+                        choices=[choice_data],
                     )
                     # Stamp on terminal chunk only when no trailing usage chunk
                     # will follow (that one is the true final message).
@@ -432,7 +457,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
             if self.enable_prompt_tokens_details and num_cached_tokens is not None:
                 final_usage_info.prompt_tokens_details = PromptTokenUsageInfo(cached_tokens=num_cached_tokens)
 
-            if include_usage:
+            if include_usage and not compact_stream:
                 # In streaming, metrics ride on this final usage chunk, which is
                 # only emitted when usage reporting is enabled.
                 stream_per_request_metrics: PerRequestTimingMetrics | None = None

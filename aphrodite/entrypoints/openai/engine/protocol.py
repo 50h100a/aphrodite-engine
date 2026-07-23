@@ -240,6 +240,9 @@ def validate_structured_outputs_structural_tag(
 class StreamOptions(OpenAIBaseModel):
     include_usage: bool | None = False
     continuous_usage_stats: bool | None = False
+    compact_stream: bool | None = False
+    """Limits stream to ``choices`` and ``usage``, fields only filled as
+    needed."""
 
 
 class FunctionDefinition(OpenAIBaseModel):

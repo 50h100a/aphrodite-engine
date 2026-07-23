@@ -192,6 +192,13 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     metrics: PerRequestTimingMetrics | None = None
 
 
+class CompactChatCompletionStreamResponse(OpenAIBaseModel):
+    """Compact streaming event for ``stream_options.compact_stream``."""
+
+    choices: list[ChatCompletionResponseStreamChoice] = Field(default_factory=list)
+    usage: UsageInfo | None = Field(default=None)
+
+
 class ChatCompletionToolsParam(OpenAIBaseModel):
     type: Literal["function"] = "function"
     function: FunctionDefinition
