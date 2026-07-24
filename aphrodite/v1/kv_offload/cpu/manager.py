@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections import OrderedDict
 from collections.abc import Collection, Iterable
 from typing import Literal
@@ -10,6 +11,7 @@ from aphrodite.distributed.kv_events import MEDIUM_CPU
 from aphrodite.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
+from aphrodite.logger import init_logger
 from aphrodite.v1.kv_offload.base import (
     LoadStoreSpec,
     LookupResult,
@@ -19,6 +21,7 @@ from aphrodite.v1.kv_offload.base import (
     PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
+    get_offload_group_idx,
 )
 from aphrodite.v1.kv_offload.cpu.common import (
     CPULoadStoreSpec,
@@ -28,10 +31,15 @@ from aphrodite.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from aphrodite.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from aphrodite.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
 
+logger = init_logger(__name__)
+
 _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
     "arc": ARCCachePolicy,
 }
+
+# Minimum seconds between periodic usage-summary log lines.
+_USAGE_LOG_MIN_INTERVAL_S = 10.0
 
 
 class CPUOffloadingManager(OffloadingManager):
@@ -51,6 +59,7 @@ class CPUOffloadingManager(OffloadingManager):
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
+        gpu_residency_aware: bool = False,
     ):
         self.medium: str = MEDIUM_CPU
         self._num_blocks: int = num_blocks
@@ -61,6 +70,19 @@ class CPUOffloadingManager(OffloadingManager):
         if policy_cls is None:
             raise ValueError(f"Unknown cache policy: {cache_policy!r}. Supported: {list(_CACHE_POLICIES)}")
         self._policy: CachePolicy = policy_cls(cache_capacity=num_blocks)
+
+        # Victim-cache eviction; honored only by policies that support it.
+        self._gpu_residency_aware: bool = gpu_residency_aware and self._policy.supports_gpu_residency
+        # Read by the scheduler to gate residency-signal computation.
+        self.gpu_residency_aware: bool = self._gpu_residency_aware
+        if gpu_residency_aware and not self._policy.supports_gpu_residency:
+            logger.warning(
+                "gpu_residency_aware requested but policy %r does not support it; using default eviction.",
+                cache_policy,
+            )
+        self._policy.set_gpu_residency_aware(self._gpu_residency_aware)
+
+        self._last_usage_log_time: float = 0.0
         # Track the number of blocks in the cache that are evictable. i.e. ref_cnt 0.
         self._num_evictable_cache_blocks: int = 0
         # Track blocks with an in-flight store (ref_cnt -1, not yet completed).
@@ -251,6 +273,9 @@ class CPUOffloadingManager(OffloadingManager):
                     self._num_evictable_cache_blocks += 1
                     self._policy.mark_evictable(key)
                     stored_keys.append(key)
+            # A just-stored block is GPU-resident, hence a duplicate.
+            if stored_keys and self._gpu_residency_aware:
+                self._policy.mark_gpu_resident(stored_keys)
         else:
             for key in keys:
                 block = self._policy.get(key)
@@ -282,6 +307,16 @@ class CPUOffloadingManager(OffloadingManager):
         self._free_list.clear()
         self._num_allocated_blocks = 0
 
+    def note_gpu_resident(self, keys: Collection[OffloadKey]) -> None:
+        """Mark keys GPU-resident. No-op unless residency-aware."""
+        if self._gpu_residency_aware and keys:
+            self._policy.mark_gpu_resident(keys)
+
+    def note_gpu_evicted(self, keys: Collection[OffloadKey]) -> None:
+        """Mark keys no longer GPU-resident. No-op unless residency-aware."""
+        if self._gpu_residency_aware and keys:
+            self._policy.mark_gpu_evicted(keys)
+
     @override
     def take_events(self) -> Iterable[OffloadingEvent]:
         if self.events is not None:
@@ -311,4 +346,45 @@ class CPUOffloadingManager(OffloadingManager):
                 self.stores_skipped_in_current_batch,
             )
             self.stores_skipped_in_current_batch = 0
+
+        self._maybe_log_usage_summary(num_used, usage)
         return stats
+
+    def _maybe_log_usage_summary(self, num_used: int, usage: float) -> None:
+        now = time.monotonic()
+        if now - self._last_usage_log_time < _USAGE_LOG_MIN_INTERVAL_S:
+            return
+        self._last_usage_log_time = now
+
+        per_group: dict[int, int] = {}
+        for key in self._policy.iter_keys():
+            gid = get_offload_group_idx(key)
+            per_group[gid] = per_group.get(gid, 0) + 1
+        per_group_str = " ".join(f"g{gid}={cnt}" for gid, cnt in sorted(per_group.items()))
+
+        duplicate_blocks, exclusive_blocks = self._policy.segment_counts()
+        residency_str = ""
+        if self._gpu_residency_aware:
+            residency_str = f" | victim-cache: duplicate_blocks={duplicate_blocks} exclusive_blocks={exclusive_blocks}"
+
+        # Occupancy (allocated minus free) is pool fullness, unlike the
+        # transfer-pinned CPU_CACHE_USAGE_PERC gauge.
+        occupied = self._num_allocated_blocks - len(self._free_list)
+        occupancy = occupied / self._num_blocks if self._num_blocks > 0 else 0.0
+
+        logger.info(
+            "KV offload CPU: occupancy=%.1f%% (%d/%d blocks hold data) "
+            "pinned=%.1f%% (used=%d) allocated=%d free=%d evictable=%d "
+            "write_pending=%d | per-group cached blocks: %s%s",
+            occupancy * 100.0,
+            occupied,
+            self._num_blocks,
+            usage * 100.0,
+            num_used,
+            self._num_allocated_blocks,
+            len(self._free_list),
+            self._num_evictable_cache_blocks,
+            self._num_write_pending_blocks,
+            per_group_str or "(none)",
+            residency_str,
+        )

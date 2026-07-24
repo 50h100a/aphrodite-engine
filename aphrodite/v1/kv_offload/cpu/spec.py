@@ -4,6 +4,7 @@ from typing import Any
 
 from typing_extensions import override
 
+from aphrodite.logger import init_logger
 from aphrodite.platforms import current_platform
 from aphrodite.utils.math_utils import round_up
 from aphrodite.v1.kv_offload.base import (
@@ -20,6 +21,8 @@ from aphrodite.v1.kv_offload.config import OffloadingConfig
 from aphrodite.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from aphrodite.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from aphrodite.v1.kv_offload.cpu.manager import CPUOffloadingManager
+
+logger = init_logger(__name__)
 
 
 class CPUOffloadingSpec(OffloadingSpec):
@@ -111,6 +114,41 @@ class CPUOffloadingSpec(OffloadingSpec):
 
         self.eviction_policy: str = self.extra_config.get("eviction_policy", "lru")
 
+        self._log_capacity_summary(int(cpu_bytes_to_use))
+
+    def _log_capacity_summary(self, cpu_bytes_to_use: int) -> None:
+        """Startup summary of CPU offload pool size and nominal token capacity.
+
+        Nominal density is a floor: hybrid models store full sliding-window
+        history, so measured density is higher.
+        """
+        # Row granularity uses the smallest block size (global group).
+        tokens_per_block = min(self.tokens_per_block) if self.tokens_per_block else 0
+        tokens_per_chunk = tokens_per_block * self.blocks_per_chunk
+        row_bytes = self.kv_bytes_per_chunk
+        if self.num_blocks <= 0 or tokens_per_chunk <= 0 or row_bytes <= 0:
+            logger.warning(
+                "KV offload capacity summary unavailable: num_blocks=%d tokens_per_chunk=%d row_bytes=%d",
+                self.num_blocks,
+                tokens_per_chunk,
+                row_bytes,
+            )
+            return
+        mib = 1024**2
+        token_capacity = self.num_blocks * tokens_per_chunk
+        logger.info(
+            "KV offload CPU pool sizing: budget=%.1f GiB num_blocks=%d "
+            "row_bytes=%d (%.2f MiB/row) tokens_per_chunk=%d => nominal "
+            "%.3f MiB/token, token_capacity~=%d tokens (floor).",
+            cpu_bytes_to_use / 1024**3,
+            self.num_blocks,
+            row_bytes,
+            row_bytes / mib,
+            tokens_per_chunk,
+            (row_bytes / tokens_per_chunk) / mib,
+            token_capacity,
+        )
+
     @override
     def get_manager(self) -> OffloadingManager:
         if not self._manager:
@@ -122,12 +160,16 @@ class CPUOffloadingSpec(OffloadingSpec):
             # Maximum entries in the internal tracker's LRU table.
             max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
 
+            # Victim-cache eviction (opt-in).
+            gpu_residency_aware = bool(self.extra_config.get("gpu_residency_aware", False))
+
             self._manager = CPUOffloadingManager(
                 num_blocks=self.num_blocks,
                 cache_policy=self.eviction_policy,  # type: ignore[arg-type]
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,
+                gpu_residency_aware=gpu_residency_aware,
             )
         return self._manager
 

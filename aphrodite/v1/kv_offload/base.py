@@ -171,6 +171,10 @@ class OffloadingKVEventsConfig:
 
 
 class OffloadingManager(ABC):
+    # Whether this manager runs victim-cache eviction; gates the scheduler's
+    # residency-signal computation.
+    gpu_residency_aware: bool = False
+
     @abstractmethod
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         """
@@ -303,6 +307,14 @@ class OffloadingManager(ABC):
         Args:
             req_context: per-request context.
         """
+        return
+
+    def note_gpu_resident(self, keys: Collection[OffloadKey]) -> None:
+        """Hint that ``keys`` are GPU-resident (victim-cache). Default no-op."""
+        return
+
+    def note_gpu_evicted(self, keys: Collection[OffloadKey]) -> None:
+        """Hint that ``keys`` are no longer GPU-resident. Default no-op."""
         return
 
     def take_events(self) -> Iterable[OffloadingEvent]:

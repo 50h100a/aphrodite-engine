@@ -140,13 +140,26 @@ class SchedulerOffloadConfig(NamedTuple):
         aphrodite_config: AphroditeConfig,
         kv_cache_config: KVCacheConfig,
     ) -> "SchedulerOffloadConfig":
-        # Determine the alignment token count from the full-attention group(s).
-        # This is the tokens_per_chunk of the full-attention group; load
-        # hits are always aligned to this boundary, so SWA blocks earlier in
-        # each segment can never serve a load hit. Relevant for hybrid
-        # architectures like DeepSeek V4 (MLA + SWA groups).
+        # EAGLE/MTP draft groups, annotated upstream in get_kv_cache_groups.
+        # If annotation was unavailable (multi-process executor) mark all groups.
+        eagle_groups = {idx for idx, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group}
+
+        use_eagle = aphrodite_config.speculative_config is not None and aphrodite_config.speculative_config.use_eagle()
+        if use_eagle and not eagle_groups:
+            logger.warning(
+                "KV offloading: EAGLE/MTP enabled but no draft group annotated; marking all %d groups volatile.",
+                len(kv_cache_config.kv_cache_groups),
+            )
+            eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))
+
+        # Alignment token count = tokens_per_chunk of the full-attention
+        # group(s); load hits align to it so earlier SWA blocks can't serve a
+        # hit (DeepSeek V4-style MLA + SWA). Eagle groups are excluded: a draft
+        # full-attention chunk differs in size and would make this ambiguous.
         full_attn_tokens_per_chunk: set[int] = set()
         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
+            if idx in eagle_groups:
+                continue
             kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
             sw = get_sliding_window_size_in_chunks(kv_spec, tokens_per_block * spec.blocks_per_chunk)
             if sw is None:
@@ -170,12 +183,6 @@ class SchedulerOffloadConfig(NamedTuple):
             if sliding_window_size_in_chunks >= per_segment:
                 return None
             return per_segment
-
-        eagle_groups = {idx for idx, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group}
-
-        use_eagle = aphrodite_config.speculative_config is not None and aphrodite_config.speculative_config.use_eagle()
-        if use_eagle and not eagle_groups:
-            eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))
 
         if eagle_groups:
             logger.info(
@@ -466,6 +473,19 @@ class OffloadingConnectorScheduler:
                     group_state.offload_keys[blocks_to_skip:],
                     req_status.req_context,
                 )
+
+        # Chunks below the GPU-hit boundary are GPU-resident; confirm them as
+        # duplicates for victim-cache eviction. Keys beyond the boundary are
+        # served from CPU and left in their current segment.
+        if self.manager.gpu_residency_aware:
+            gpu_resident_keys: list[OffloadKey] = []
+            num_gpu_tokens = req_status.num_locally_computed_tokens
+            for group_config, group_state in zip(self.config.kv_group_configs, req_status.group_states):
+                gpu_chunks = num_gpu_tokens // group_config.tokens_per_chunk
+                if gpu_chunks:
+                    gpu_resident_keys.extend(group_state.offload_keys[:gpu_chunks])
+            if gpu_resident_keys:
+                self.manager.note_gpu_resident(gpu_resident_keys)
 
     def _lookup(self, req_status: RequestOffloadState) -> int | None:
         """

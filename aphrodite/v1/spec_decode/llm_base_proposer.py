@@ -1258,6 +1258,12 @@ class SpecDecodeBaseProposer:
             if all_attn_layers[name].get_kv_cache_spec(self.aphrodite_config) is not None
         }
 
+        # Publish draft layer names for KV cache config generation (draft-bucket
+        # exclusion and eagle-group annotation). Deferred import avoids a cycle.
+        from aphrodite.v1.core.kv_cache_utils import register_draft_attn_layer_names
+
+        register_draft_attn_layer_names(self._draft_attn_layer_names)
+
         if self.supports_mm_inputs:
             # Even if the target model is multimodal, we can also use
             # text-only draft models

@@ -2583,3 +2583,102 @@ def test_resolve_block_hashes_rejects_mismatched_view():
     mismatched = BlockHashListWithBlockSize(raw, 2, 8)
     with pytest.raises(AssertionError):
         resolve_block_hashes(mismatched, 2, 4)
+
+
+# Draft-layer-aware KV cache grouping and EAGLE/MTP group annotation.
+
+
+@pytest.fixture
+def clear_draft_names():
+    """Reset the process-global draft-name registry around each test."""
+    kv_cache_utils.register_draft_attn_layer_names(set())
+    try:
+        yield
+    finally:
+        kv_cache_utils.register_draft_attn_layer_names(set())
+
+
+def _hybrid_spec_with_draft_bucket():
+    """Three same-page-size buckets: 50 target SW, 16 target full, 8 draft SW.
+
+    The size-8 draft bucket is > 1/8 of the largest, so the heuristic keeps it
+    (collapsing group size) while the identity path excludes it.
+    """
+    spec: dict[str, Any] = {}
+    for i in range(50):
+        spec[f"t.sw.{i}"] = new_sliding_window_spec(sliding_window=1024)
+    for i in range(16):
+        spec[f"t.full.{i}"] = new_kv_cache_spec()
+    draft_names = set()
+    for i in range(8):
+        name = f"d.sw.{i}"
+        spec[name] = new_sliding_window_spec(sliding_window=512)
+        draft_names.add(name)
+    return spec, draft_names
+
+
+def test_uniform_page_size_grouping_excludes_draft_bucket(clear_draft_names):
+    spec, draft_names = _hybrid_spec_with_draft_bucket()
+
+    # Heuristic fallback keeps the draft bucket; identity path excludes it.
+    groups_heuristic = kv_cache_utils._get_kv_cache_groups_uniform_page_size(dict(spec))
+    kv_cache_utils.register_draft_attn_layer_names(draft_names)
+    groups_semantic = kv_cache_utils._get_kv_cache_groups_uniform_page_size(dict(spec))
+
+    assert len(groups_semantic) < len(groups_heuristic)
+    # No target group is fragmented below the excluded draft bucket size (8).
+    target_group_sizes = [
+        len(g.layer_names) for g in groups_semantic if any(n.startswith("t.") for n in g.layer_names)
+    ]
+    assert min(target_group_sizes) > 8
+
+
+def test_uniform_page_size_grouping_unchanged_without_draft(clear_draft_names):
+    """No draft registered: the identity branch is inactive."""
+    spec: dict[str, Any] = {}
+    for i in range(25):
+        spec[f"sw.{i}"] = new_sliding_window_spec(sliding_window=1024)
+    for i in range(5):
+        spec[f"full.{i}"] = new_kv_cache_spec()
+
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(dict(spec))
+    total_layers = sum(len(g.layer_names) for g in groups)
+    assert total_layers >= 30  # all layers grouped (plus any padding)
+
+
+def _fake_eagle_config():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(speculative_config=SimpleNamespace(use_eagle=lambda: True))
+
+
+def test_annotate_eagle_groups_flags_only_draft_groups(clear_draft_names):
+    from types import SimpleNamespace
+
+    groups = [
+        SimpleNamespace(layer_names=["t.full.0", "t.full.1"], is_eagle_group=False),
+        SimpleNamespace(layer_names=["t.sw.0"], is_eagle_group=False),
+        SimpleNamespace(layer_names=["d.sw.0", "d.sw.1"], is_eagle_group=False),
+    ]
+    cfg = _fake_eagle_config()
+
+    # No registered names => returns False so callers can fall back; nothing
+    # is flagged.
+    assert kv_cache_utils._annotate_eagle_groups(cfg, groups) is False
+    assert not any(g.is_eagle_group for g in groups)
+
+    # With registered draft names, only the draft-containing group is flagged.
+    kv_cache_utils.register_draft_attn_layer_names({"d.sw.0", "d.sw.1"})
+    assert kv_cache_utils._annotate_eagle_groups(cfg, groups) is True
+    assert [g.is_eagle_group for g in groups] == [False, False, True]
+
+
+def test_annotate_eagle_groups_noop_without_spec_decode(clear_draft_names):
+    from types import SimpleNamespace
+
+    groups = [SimpleNamespace(layer_names=["d.sw.0"], is_eagle_group=False)]
+    kv_cache_utils.register_draft_attn_layer_names({"d.sw.0"})
+
+    cfg = SimpleNamespace(speculative_config=None)
+    assert kv_cache_utils._annotate_eagle_groups(cfg, groups) is False
+    assert not groups[0].is_eagle_group

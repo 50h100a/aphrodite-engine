@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
 from collections.abc import Iterable
+from itertools import chain
 
 from typing_extensions import override
 
@@ -97,6 +98,10 @@ class ARCCachePolicy(CachePolicy):
                 self.target_t1_size = max(self.target_t1_size - delta, 0)
                 # move to MRU position (end) to keep it fresh in the ghost list
                 self.b2.move_to_end(key)
+
+    @override
+    def iter_keys(self) -> Iterable[OffloadKey]:
+        return chain(self.t1.keys(), self.t2.keys())
 
     @override
     def clear(self) -> None:

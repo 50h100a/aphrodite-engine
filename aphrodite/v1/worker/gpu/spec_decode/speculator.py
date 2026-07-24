@@ -155,6 +155,12 @@ class DraftModelSpeculator(BaseSpeculator):
         )
         self.draft_attn_layer_names = all_attn_layers - target_attn_layer_names
 
+        # Publish draft layer names for KV cache config generation (draft-bucket
+        # exclusion and eagle-group annotation). Deferred import avoids a cycle.
+        from aphrodite.v1.core.kv_cache_utils import register_draft_attn_layer_names
+
+        register_draft_attn_layer_names(self.draft_attn_layer_names)
+
     def set_eplb_state(self, eplb_state: EplbState) -> None:
         """Inject EPLB state after construction."""
         self.eplb_state = eplb_state

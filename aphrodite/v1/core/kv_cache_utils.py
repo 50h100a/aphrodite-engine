@@ -1160,9 +1160,25 @@ def _get_kv_cache_groups_uniform_page_size(
     # is the minimum number of layers among all attention types. Need a better
     # strategy if we want to support more complex patterns (e.g., 20 full + 30
     # sw, where the group size should be 10).
-    min_num_layers = min([len(layers) for layers in same_type_layers.values()])
+    bucket_sizes = [len(layers) for layers in same_type_layers.values()]
+    max_num_layers = max(bucket_sizes)
+    # Exclude speculative-decoding draft buckets from group-size selection;
+    # their tiny foreign-shaped buckets would otherwise collapse the group size
+    # and fragment the target's layers. Prefer draft-layer identity; fall back
+    # to a size heuristic (bucket < 1/8 of the largest) when draft names are
+    # unavailable. The heuristic can misjudge a legitimate hybrid ratio > 8:1.
+    draft_names = get_draft_attn_layer_names()
+    if draft_names:
+        non_draft_bucket_sizes = [
+            len(layers)
+            for layers in same_type_layers.values()
+            if not (layers and all(name in draft_names for name in layers))
+        ]
+        main_pattern_sizes = non_draft_bucket_sizes or bucket_sizes
+    else:
+        main_pattern_sizes = [s for s in bucket_sizes if s * 8 >= max_num_layers] or bucket_sizes
+    min_num_layers = min(main_pattern_sizes)
     group_size = min_num_layers
-    max_num_layers = max([len(layers) for layers in same_type_layers.values()])
     if max_num_layers < min_num_layers * 1.5:
         # If the number of layers is not much larger than the minimum number of
         # layers, use the maximum number of layers as the group size to avoid
@@ -1579,6 +1595,53 @@ def _get_kv_cache_groups_uniform_groups(
     return [full_mla_group, *swa_mla_groups]
 
 
+# Draft (speculative) attention layer names, registered by the spec-decode
+# proposer at model-load time. The spec dict alone cannot distinguish draft
+# from target layers; only the proposer, which loads the draft, can. Empty
+# under multi-process executors (proposer and config generation are in
+# different processes), where the consumers below fall back.
+_DRAFT_ATTN_LAYER_NAMES: set[str] = set()
+
+
+def register_draft_attn_layer_names(names: Iterable[str]) -> None:
+    """Register the draft model's attention layer names."""
+    global _DRAFT_ATTN_LAYER_NAMES
+    _DRAFT_ATTN_LAYER_NAMES = set(names)
+    logger.info("KV cache grouping: registered %d draft attention layer(s).", len(_DRAFT_ATTN_LAYER_NAMES))
+
+
+def get_draft_attn_layer_names() -> set[str]:
+    """Registered draft attention layer names (empty if none)."""
+    return _DRAFT_ATTN_LAYER_NAMES
+
+
+def _annotate_eagle_groups(
+    aphrodite_config: AphroditeConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> bool:
+    """Flag KV cache groups containing draft (EAGLE/MTP) attention layers.
+
+    Returns True if it ran (draft names available), so callers can fall back
+    to an architecture-specific heuristic otherwise. Draft layers sharing KV
+    with a target layer are absent from group layer_names, so target groups are
+    never mis-flagged.
+    """
+    spec_config = aphrodite_config.speculative_config
+    if spec_config is None or not spec_config.use_eagle():
+        return False
+    draft_names = get_draft_attn_layer_names()
+    if not draft_names:
+        return False
+
+    annotated: list[int] = []
+    for idx, group in enumerate(kv_cache_groups):
+        if draft_names.intersection(group.layer_names):
+            group.is_eagle_group = True
+            annotated.append(idx)
+    logger.info("KV cache grouping: annotated draft (EAGLE/MTP) group(s) %s of %d.", annotated, len(kv_cache_groups))
+    return True
+
+
 def _annotate_eagle_groups_deepseek_v4(
     aphrodite_config: AphroditeConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -1625,19 +1688,25 @@ def get_kv_cache_groups(
         # KV cache of all layers are the same, which is true for
         # most models. Allocate the same amount of memory for
         # each layer.
-        return _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+        groups = _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+        _annotate_eagle_groups(aphrodite_config, groups)
+        return groups
     elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
         # All layers need the same number of token slots (e.g., all layers are
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
-        return _get_kv_cache_groups_uniform_type(uniform_spec)
+        groups = _get_kv_cache_groups_uniform_type(uniform_spec)
+        _annotate_eagle_groups(aphrodite_config, groups)
+        return groups
     elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
         # DeepseekV4 case: All layers need the same number of token slots,
         # yet some layers are full attention while others are sliding window
         # attention in different sizes. Need to group layers into multiple
         # UniformTypeKVCacheSpecs.
         kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
-        _annotate_eagle_groups_deepseek_v4(aphrodite_config, kv_cache_spec, kv_cache_groups)
+        # Generic annotation, else the DeepSeek-V4 "last layer" heuristic.
+        if not _annotate_eagle_groups(aphrodite_config, kv_cache_groups):
+            _annotate_eagle_groups_deepseek_v4(aphrodite_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
 
     # Pull HiddenStateCacheSpec layers out before the general multi-group
@@ -1659,6 +1728,8 @@ def get_kv_cache_groups(
             new_bs = max(common_page // per_token, 1)
             aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
             groups.append(KVCacheGroupSpec([name], aligned))
+
+    _annotate_eagle_groups(aphrodite_config, groups)
 
     return groups
 
