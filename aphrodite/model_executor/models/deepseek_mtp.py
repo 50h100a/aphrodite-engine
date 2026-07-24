@@ -11,7 +11,6 @@ from aphrodite._aiter_ops import rocm_aiter_ops
 from aphrodite.compilation.decorators import support_torch_compile
 from aphrodite.config import AphroditeConfig
 from aphrodite.distributed import tensor_model_parallel_all_gather
-from aphrodite.logger import init_logger
 from aphrodite.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -34,11 +33,12 @@ from .deepseek_v2 import (
     DeepseekV2MixtureOfExperts,
     DeepseekV2MoE,
     _try_load_fp8_indexer_wk,
-    get_spec_layer_idx_from_weight_name,
 )
-from .utils import get_pp_missing_layer_names, maybe_prefix
-
-logger = init_logger(__name__)
+from .utils import (
+    get_pp_missing_layer_names,
+    get_spec_layer_idx_from_weight_name,
+    maybe_prefix,
+)
 
 
 def _restore_full_token_layout_if_needed(

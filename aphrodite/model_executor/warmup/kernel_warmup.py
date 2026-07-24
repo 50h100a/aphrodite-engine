@@ -17,6 +17,9 @@ from aphrodite.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from aphrodite.model_executor.warmup.deepseek_v4_mhc_warmup import (
     deepseek_v4_mhc_warmup,
 )
+from aphrodite.model_executor.warmup.fa4_cutedsl_warmup import (
+    fa4_cutedsl_warmup,
+)
 from aphrodite.model_executor.warmup.flashinfer_autotune_cache import (
     resolve_flashinfer_autotune_file,
     write_flashinfer_autotune_cache,
@@ -27,7 +30,7 @@ from aphrodite.model_executor.warmup.flashinfer_sparse_mla_warmup import (
 )
 from aphrodite.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from aphrodite.model_executor.warmup.sparse_mla_triton_warmup import (
-    sparse_mla_triton_warmup_if_needed,
+    sparse_mla_triton_warmup,
 )
 from aphrodite.model_executor.warmup.v1_block_table_warmup import (
     warm_v1_block_table_kernels,
@@ -63,10 +66,16 @@ def _warmup_ll_bf16_router_gemm() -> None:
         return
 
     logger.info("Warming up ll_bf16 router GEMM kernels.")
-    ll_bf16_gemm_kernel.warmup(
-        shapes=_LL_BF16_WARMUP_MODEL_SHAPES,
-        m_values=_LL_BF16_WARMUP_M_RANGE,
-    )
+    try:
+        ll_bf16_gemm_kernel.warmup(
+            shapes=_LL_BF16_WARMUP_MODEL_SHAPES,
+            m_values=_LL_BF16_WARMUP_M_RANGE,
+        )
+    except Exception:
+        # cuteDSL JIT can fail on architectures its bundled toolchain does not
+        # target (e.g. NVVM ICE on SM 11.0); the kernel is optional, so never
+        # let warmup take down the engine.
+        logger.warning("ll_bf16 router GEMM warmup failed; kernel disabled.", exc_info=True)
 
 
 def kernel_warmup(worker: "Worker"):
@@ -92,7 +101,6 @@ def kernel_warmup(worker: "Worker"):
     )
 
     # Run next so input-prep kernels JIT against pristine runner state.
-    sparse_mla_triton_warmup_if_needed(worker)
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
 
@@ -114,7 +122,10 @@ def kernel_warmup(worker: "Worker"):
     elif has_flashinfer() and current_platform.has_device_capability(90):
         flashinfer_autotune(worker.model_runner)
 
-    if current_platform.has_device_capability(90):
+    # Match the runtime eligibility in fused_moe/router/gate_linear.py: SM 9.0
+    # or 10.x only. A plain >=90 check would include SM 11.x (Thor), where
+    # cuteDSL's NVVM backend cannot compile and the JIT ICEs at startup.
+    if current_platform.is_device_capability((9, 0)) or current_platform.is_device_capability_family(100):
         _warmup_ll_bf16_router_gemm()
 
     # FlashInfer attention warmup
@@ -146,7 +157,14 @@ def kernel_warmup(worker: "Worker"):
         )
 
     if worker.aphrodite_config.kernel_config.enable_cutedsl_warmup:
+        # TODO(roberto): Remove after registered CuTeDSL warmups are migrated
+        # to the shared JIT warmup infrastructure.
+        # https://github.com/aphrodite-project/aphrodite/pull/47451
         cutedsl_warmup()
+
+    if worker.aphrodite_config.kernel_config.enable_jit_warmup:
+        fa4_cutedsl_warmup(worker)
+        sparse_mla_triton_warmup(worker)
 
 
 def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:

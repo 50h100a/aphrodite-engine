@@ -3,7 +3,7 @@
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from itertools import islice
+from itertools import chain, islice
 from typing import Any, NamedTuple
 
 from aphrodite.config import AphroditeConfig
@@ -107,6 +107,24 @@ def get_sliding_window_size_in_chunks(kv_cache_spec: KVCacheSpec, tokens_per_chu
 
     assert isinstance(kv_cache_spec, FullAttentionSpec)
     return None
+
+
+def is_store_reachable_swa_chunk(
+    absolute_chunk_index: int,
+    storable_chunk_count: int,
+    alignment_chunk_count: int | None,
+    sliding_window_chunks: int | None,
+    is_eagle_group: bool,
+) -> bool:
+    """Return whether an SWA chunk can participate in an external-cache hit."""
+    if alignment_chunk_count is None:
+        return True
+    assert sliding_window_chunks is not None
+    position_in_segment = absolute_chunk_index % alignment_chunk_count
+    segment_start = absolute_chunk_index - position_in_segment
+    actual_segment_length = min(alignment_chunk_count, storable_chunk_count - segment_start)
+    reachable_tail = sliding_window_chunks + int(is_eagle_group)
+    return position_in_segment >= actual_segment_length - reachable_tail
 
 
 def resolve_mamba_align_size(spec: "OffloadingSpec", kv_cache_config: KVCacheConfig) -> int | None:
@@ -280,16 +298,21 @@ class RequestOffloadState:
         for group_state, new_blocks in zip(self.group_states, new_block_id_groups):
             group_state.block_ids.extend(new_blocks)
 
-    def storable_chunks(self, group_config: "GroupOffloadConfig", num_offloadable_tokens: int) -> int:
-        """Number of leading offloaded blocks eligible for store.
+    def storable_chunks(
+        self,
+        group_config: "GroupOffloadConfig",
+        group_state: RequestGroupState,
+        num_offloadable_tokens: int,
+    ) -> int:
+        """Number of allocated leading offloaded chunks eligible for store.
 
-        For eagle/MTP groups the volatile trailing block of the offloadable
+        For eagle/MTP groups the volatile trailing chunk of the offloadable
         range is excluded while decoding: the draft-layer KV of the last
         accepted position may be rewritten after spec-token rejection. During
-        prefill the trailing block is stable (the draft input for a chunk's
+        prefill the trailing chunk is stable (the draft input for a chunk's
         last position is the next prompt token), so it is stored immediately.
         The exclusion must be applied consistently everywhere
-        ``next_stored_chunk_idx`` is derived: otherwise the trailing block of
+        ``next_stored_chunk_idx`` is derived: otherwise the trailing chunk of
         each step is skipped on collection but jumped over by
         ``next_stored_chunk_idx``, so it is never re-considered and a
         permanent hole breaks prefix-reuse lookup.
@@ -298,7 +321,8 @@ class RequestOffloadState:
         is_decoding = num_offloadable_tokens > self.req.num_prompt_tokens
         if group_config.is_eagle_group and is_decoding:
             num_blocks = max(0, num_blocks - 1)
-        return num_blocks
+        num_allocated_chunks = len(group_state.block_ids) // self.config.blocks_per_chunk
+        return min(num_blocks, num_allocated_chunks)
 
     def advance_stored_idx(self, num_offloadable_tokens: int) -> None:
         # max(): at the prefill->decode transition of a block-aligned prompt,
@@ -307,7 +331,7 @@ class RequestOffloadState:
         for group_config, group_state in zip(self.config.kv_group_configs, self.group_states):
             group_state.next_stored_chunk_idx = max(
                 group_state.next_stored_chunk_idx,
-                self.storable_chunks(group_config, num_offloadable_tokens),
+                self.storable_chunks(group_config, group_state, num_offloadable_tokens),
             )
 
     def update_num_hit_chunks(self, num_cached_tokens: int) -> None:
@@ -405,14 +429,42 @@ class OffloadingConnectorScheduler:
             if not pending:
                 del self._block_id_to_pending_jobs[bid]
 
-    def _maximal_prefix_lookup(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> int | None:
+    def _calc_num_offloadable_tokens(self, req_status: RequestOffloadState, num_computed_tokens: int) -> int:
+        num = min(num_computed_tokens, req_status.req.num_tokens)
+        max_offload_tokens = req_status.max_offload_tokens
+        if max_offload_tokens is not None:
+            num = min(num, max_offload_tokens)
+        if self.config.offload_prompt_only:
+            num = min(num, req_status.req.num_prompt_tokens)
+        return num
+
+    def _maybe_cleanup_finished_req(self, req_id: str, req_status: RequestOffloadState) -> None:
+        """Clean up req_status if finished and no in-flight jobs."""
+        if req_status.req.is_finished() and not req_status.transfer_jobs:
+            del self._req_status[req_id]
+
+    def _maximal_prefix_lookup(
+        self,
+        keys: Sequence[OffloadKey],
+        req_context: ReqContext,
+        req: Request | None = None,
+        group_config: GroupOffloadConfig | None = None,
+        start_chunk_idx: int = 0,
+    ) -> int | None:
         """Return the number of consecutive offloaded blocks from the start,
         or None if the backend deferred a lookup."""
         hit_count = 0
         defer_lookup = False
-        for key in keys:
+        for idx, key in enumerate(keys):
             match self.manager.lookup(key, req_context):
                 case LookupResult.HIT:
+                    if req is not None and group_config is not None:
+                        self._events_tracker.record_lookup(
+                            req,
+                            group_config,
+                            start_chunk_idx + idx,
+                            key,
+                        )
                     hit_count += 1
                 case LookupResult.HIT_PENDING:
                     defer_lookup = True
@@ -430,6 +482,9 @@ class OffloadingConnectorScheduler:
         keys: Sequence[OffloadKey],
         sliding_window_size: int,
         req_context: ReqContext,
+        req: Request | None = None,
+        group_config: GroupOffloadConfig | None = None,
+        start_chunk_idx: int = 0,
     ) -> int | None:
         """Return the end index (in `keys`) of the last run of
         `sliding_window_size` consecutive hits, scanning from the end.
@@ -437,8 +492,16 @@ class OffloadingConnectorScheduler:
         defer_lookup = False
         consecutive_hits = 0
         for idx in range(len(keys) - 1, -1, -1):
-            match self.manager.lookup(keys[idx], req_context):
+            key = keys[idx]
+            match self.manager.lookup(key, req_context):
                 case LookupResult.HIT:
+                    if req is not None and group_config is not None:
+                        self._events_tracker.record_lookup(
+                            req,
+                            group_config,
+                            start_chunk_idx + idx,
+                            key,
+                        )
                     consecutive_hits += 1
                 case LookupResult.HIT_PENDING:
                     # Block is in cache, just not readable yet — counts
@@ -554,7 +617,13 @@ class OffloadingConnectorScheduler:
                 # have backend-confirmed hits
                 num_hit_chunks: int | None
                 if sliding_window_size_in_chunks is None:
-                    num_hit_chunks = self._maximal_prefix_lookup(offload_keys, req_status.req_context)
+                    num_hit_chunks = self._maximal_prefix_lookup(
+                        offload_keys,
+                        req_status.req_context,
+                        req_status.req,
+                        group_config,
+                        start_block_idx,
+                    )
                 else:
                     required_window = sliding_window_size_in_chunks
                     if is_eagle_unverified:
@@ -563,6 +632,9 @@ class OffloadingConnectorScheduler:
                         offload_keys,
                         required_window,
                         req_status.req_context,
+                        req_status.req,
+                        group_config,
+                        start_block_idx,
                     )
                 if num_hit_chunks == 0:
                     return 0
@@ -839,32 +911,35 @@ class OffloadingConnectorScheduler:
     ) -> dict[int, TransferJob]:
         blocks_per_chunk = self.config.blocks_per_chunk
         store_jobs: dict[int, TransferJob] = {}
-        for req_id in scheduler_output.num_scheduled_tokens:
+        for req_id in chain(
+            scheduler_output.num_scheduled_tokens,
+            scheduler_output.finished_req_ids or (),
+        ):
             req_status = self._req_status.get(req_id)
             if req_status is None:
                 continue
             req = req_status.req
 
-            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
-            # with async scheduling, some tokens may be missing
-            num_offloadable_tokens = min(num_tokens_after_batch, req.num_tokens)
-            max_offload_tokens = req_status.max_offload_tokens
-            if max_offload_tokens is not None:
-                num_offloadable_tokens = min(num_offloadable_tokens, max_offload_tokens)
+            if req.is_finished():
+                num_tokens_after_batch = req.num_tokens
+            else:
+                num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
 
-            # Skip decode-phase blocks: clamp to the prompt length so only
-            # prefill (prompt) blocks become eligible for store. next_stored_idx
-            # never advances past this boundary, so decode blocks are never
-            # queued in this or any later step.
-            if self.config.offload_prompt_only:
-                num_offloadable_tokens = min(num_offloadable_tokens, req.num_prompt_tokens)
+            num_offloadable_tokens = self._calc_num_offloadable_tokens(
+                req_status,
+                num_tokens_after_batch,
+            )
 
             # Filter out blocks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
             for group_config, group_state in zip(self.config.kv_group_configs, req_status.group_states):
-                num_blocks = req_status.storable_chunks(group_config, num_offloadable_tokens)
+                num_blocks = req_status.storable_chunks(
+                    group_config,
+                    group_state,
+                    num_offloadable_tokens,
+                )
 
                 start_block_idx = group_state.next_stored_chunk_idx
                 if num_blocks <= start_block_idx:
@@ -881,37 +956,40 @@ class OffloadingConnectorScheduler:
                 ]
                 assert len(offload_keys) == len(offload_block_ids)
 
-                alignment_chunk_count = group_config.alignment_chunk_count
-                tail = group_config.sliding_window_size_in_chunks
-
                 for key_idx, (offload_key, block_id) in enumerate(zip(offload_keys, offload_block_ids)):
                     if block_id == 0:
                         continue
                     # Skip SWA blocks that can never serve a load hit:
                     # within each full-attention alignment segment, only the
-                    # trailing `tail` blocks are reachable by
-                    # _sliding_window_lookup. For DeepSeek V4 with 100K
-                    # tokens this reduces SWA stores by ~78%.
-                    if alignment_chunk_count is not None:
-                        assert tail is not None
-                        abs_block_idx = start_block_idx + key_idx
-                        pos_in_segment = abs_block_idx % alignment_chunk_count
-                        if pos_in_segment < alignment_chunk_count - tail:
-                            continue
+                    # trailing blocks queried by _sliding_window_lookup are
+                    # reachable. EAGLE/MTP requires one additional block that
+                    # lookup later drops as its volatile draft tail.
+                    abs_block_idx = start_block_idx + key_idx
+                    if not is_store_reachable_swa_chunk(
+                        abs_block_idx,
+                        num_blocks,
+                        group_config.alignment_chunk_count,
+                        group_config.sliding_window_size_in_chunks,
+                        group_config.is_eagle_group,
+                    ):
+                        continue
                     new_offload_keys.append(offload_key)
 
             if not new_offload_keys:
                 req_status.advance_stored_idx(num_offloadable_tokens)
+                self._maybe_cleanup_finished_req(req_id, req_status)
                 continue
 
             store_output = self.manager.prepare_store(new_offload_keys, req_status.req_context)
             if store_output is None:
                 self._connector_stats.increase_counter(_ConnectorMetricName.ALLOCATION_FAILURE)
                 logger.warning("Request %s: cannot store blocks", req_id)
+                self._maybe_cleanup_finished_req(req_id, req_status)
                 continue
 
             if not store_output.keys_to_store:
                 req_status.advance_stored_idx(num_offloadable_tokens)
+                self._maybe_cleanup_finished_req(req_id, req_status)
                 continue
 
             self._touch(req_status)
@@ -925,7 +1003,11 @@ class OffloadingConnectorScheduler:
             non_sliding_window_block_ids: list[int] = []
             for group_config, group_state in zip(self.config.kv_group_configs, req_status.group_states):
                 is_sliding_window = group_config.sliding_window_size_in_chunks is not None
-                num_blocks = req_status.storable_chunks(group_config, num_offloadable_tokens)
+                num_blocks = req_status.storable_chunks(
+                    group_config,
+                    group_state,
+                    num_offloadable_tokens,
+                )
                 start_block_idx = group_state.next_stored_chunk_idx
                 block_ids = group_state.block_ids
                 num_group_blocks = 0
@@ -991,6 +1073,13 @@ class OffloadingConnectorScheduler:
                 num_offloadable_tokens,
                 job_id,
             )
+
+            if req.is_finished():
+                # Register non-sliding-window blocks for flush detection.
+                for bid in non_sliding_window_block_ids:
+                    self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
+                    if bid in self._current_batch_allocated_block_ids:
+                        self._current_batch_jobs_to_flush.add(job_id)
 
         return store_jobs
 
@@ -1143,8 +1232,6 @@ class OffloadingConnectorScheduler:
             Optional KVTransferParams to be included in the request outputs
             returned by the engine.
         """
-        # TODO(orozery): possibly kickoff offload for last block
-        # which may have been deferred due to async scheduling
         req_status = self._req_status.get(request.request_id)
 
         if req_status is None:
@@ -1157,20 +1244,20 @@ class OffloadingConnectorScheduler:
 
         self.manager.on_request_finished(req_status.req_context)
         self._maybe_observe_lookup_async_delay(req_status)
-        if not req_status.transfer_jobs:
-            # No in-flight jobs: no later complete_store()/complete_load() calls
-            # need this request's state.
-            del self._req_status[request.request_id]
-            return False, None
 
-        # In-flight jobs remain after the request stopped. Their completion may
-        # still call manager.complete_store()/complete_load(), so keep req_status.
-        # Pending stores outlive the request's block ownership; register them so
-        # future reuse of those blocks triggers a flush.
+        # Update offload keys with final block hash so _build_store_jobs can
+        # create store jobs for the last block(s) on the next schedule step.
+        req_status.update_offload_keys()
+
+        # Keep req_status alive: _build_store_jobs will process finished_req_ids
+        # on the next step and handle cleanup after creating store jobs.
+        # Register non_sliding_window_block_ids so future block reuse triggers
+        # a flush via _block_id_to_pending_jobs.
         for job_id in req_status.transfer_jobs:
             job_status = self._jobs[job_id]
             for bid in job_status.non_sliding_window_block_ids or ():
                 self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
+
         return False, None
 
     def take_events(self) -> Iterable[KVCacheEvent]:

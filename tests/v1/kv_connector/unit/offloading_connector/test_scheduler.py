@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 import torch
 
+from aphrodite.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    OffloadingConnectorMetadata,
+)
 from aphrodite.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
     _ConnectorMetricName,
@@ -13,6 +16,7 @@ from aphrodite.distributed.kv_transfer.kv_connector.v1.offloading.metrics import
 from aphrodite.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
     RequestOffloadState,
+    is_store_reachable_swa_chunk,
 )
 from aphrodite.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -60,6 +64,72 @@ def test_scheduler_reports_allocation_failure(request_runner):
     assert reduced[_ConnectorMetricName.ALLOCATION_FAILURE] == 1
 
 
+@pytest.mark.parametrize("async_scheduling", [True, False])
+@pytest.mark.parametrize("prompt_offset", [-1, -2])
+def test_last_block_offloaded_at_request_finish(request_runner, async_scheduling: bool, prompt_offset: int):
+    """EOS fills the last block at request finish - verify req_status is kept alive.
+
+    prompt = block_size + prompt_offset tokens -> not a full block at schedule time,
+    so _build_store_jobs creates no store job. After EOS, request_finished
+    keeps req_status alive so _build_store_jobs can process it on the next step.
+
+    prompt_offset=-1: EOS fills the block -> store job created on next step.
+    prompt_offset=-2: block remains partial -> no store job, cleanup in
+    _build_store_jobs deletes req_status.
+    """
+    block_size = 4
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=10,
+        async_scheduling=async_scheduling,
+    )
+    # prompt = block_size + prompt_offset tokens
+    runner.new_request(token_ids=[0] * (block_size + prompt_offset))
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (generate_store_output(list(keys)))
+
+    # Run with one step (EOS)
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+    )
+
+    cs = runner.connector_scheduler
+    # Verify req_status is kept alive for _build_store_jobs to process
+    # regardless of whether there are storable blocks
+    assert "0" in cs._req_status, (
+        "req_status was deleted but should be kept alive for _build_store_jobs to process finished_req_ids."
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_abort_queued_request_does_not_build_store_job(request_runner, async_scheduling: bool):
+    """Aborting a never-scheduled request must not store unallocated KV."""
+    block_size = 4
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=8,
+        async_scheduling=async_scheduling,
+    )
+
+    runner.new_request(token_ids=[0] * (block_size * 4))
+    runner.scheduler.schedule()
+
+    runner.new_request(token_ids=[1] * (block_size * 4))
+    queued_req_id = str(runner.req_id)
+    assert any(request.request_id == queued_req_id for request in runner.scheduler.waiting)
+
+    runner.scheduler.finish_requests(queued_req_id, RequestStatus.FINISHED_ABORTED)
+    req_status = runner.connector_scheduler._req_status[queued_req_id]
+    assert all(group_state.offload_keys for group_state in req_status.group_states)
+    assert all(not group_state.block_ids for group_state in req_status.group_states)
+
+    scheduler_output = runner.scheduler.schedule()
+
+    metadata = scheduler_output.kv_connector_metadata
+    assert isinstance(metadata, OffloadingConnectorMetadata)
+    assert all(job.req_id != queued_req_id for job in metadata.store_jobs.values())
+    assert queued_req_id not in runner.connector_scheduler._req_status
+
+
 def test_scheduler_reports_lookup_sync_delay(request_runner):
     runner = request_runner(
         block_size=4,
@@ -74,6 +144,55 @@ def test_scheduler_reports_lookup_sync_delay(request_runner):
     reduced = _reduce_kv_connector_stats(runner)
     assert reduced[f"{_ConnectorMetricName.LOOKUP_SYNC_DELAY}_count"] == 1
     assert reduced[f"{_ConnectorMetricName.LOOKUP_SYNC_DELAY}_sum"] > 0
+
+
+@pytest.mark.parametrize(
+    (
+        "absolute_chunk_index",
+        "storable_chunk_count",
+        "alignment_chunk_count",
+        "sliding_window_chunks",
+        "is_eagle_group",
+        "expected",
+    ),
+    [
+        # Full 64-chunk segment: ordinary SWA keeps 62-63; EAGLE also keeps 61.
+        (61, 64, 64, 2, False, False),
+        (62, 64, 64, 2, False, True),
+        (60, 64, 64, 2, True, False),
+        (61, 64, 64, 2, True, True),
+        # Partial 48-of-64 segment: the reachable tail ends at chunk 47.
+        (45, 48, 64, 2, False, False),
+        (46, 48, 64, 2, False, True),
+        (44, 48, 64, 2, True, False),
+        (45, 48, 64, 2, True, True),
+        # A later partial segment uses its own actual end (chunks 64-79).
+        (76, 80, 64, 3, False, False),
+        (77, 80, 64, 3, False, True),
+        # No alignment means no store-pruning optimization.
+        (0, 1, None, None, False, True),
+        # A tail at least as large as the segment keeps every chunk.
+        (0, 2, 64, 2, False, True),
+    ],
+)
+def test_is_store_reachable_swa_chunk(
+    absolute_chunk_index: int,
+    storable_chunk_count: int,
+    alignment_chunk_count: int | None,
+    sliding_window_chunks: int | None,
+    is_eagle_group: bool,
+    expected: bool,
+):
+    assert (
+        is_store_reachable_swa_chunk(
+            absolute_chunk_index,
+            storable_chunk_count,
+            alignment_chunk_count,
+            sliding_window_chunks,
+            is_eagle_group,
+        )
+        is expected
+    )
 
 
 def test_scheduler_reports_lookup_async_delay_on_resolve(request_runner):
@@ -178,13 +297,13 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     runner.scheduler.reset_prefix_cache()
     runner.new_request(token_ids=[0] * tokens_per_chunk)
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (generate_store_output([]))
-    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context, *_: 1
     runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0, 1, 2))
 
     # single block lookup with a hit in a middle block
     runner.new_request(token_ids=[0] * tokens_per_chunk * 2 + [1] * tokens_per_chunk)
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (generate_store_output([]))
-    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context, *_: 1
     runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(3, 4, 5))
 
 
@@ -238,7 +357,7 @@ def test_request_preemption(request_runner, async_scheduling: bool):
 
     # request should now return from preemption
     # re-load [0, ..., 8] from the CPU and store [9, 10, 11]
-    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 3
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context, *_: 3
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (generate_store_output(keys))
     runner.run(
         decoded_tokens=[0] * block_size,
@@ -348,7 +467,7 @@ def test_concurrent_lookups_of_the_same_prefix(request_runner, async_scheduling:
     # start a request to load the first block, but don't complete
     runner.scheduler.reset_prefix_cache()
     runner.new_request(token_ids=[0] * tokens_per_chunk)
-    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context, *_: 1
     runner.run(
         decoded_tokens=[],
         complete_transfers=False,
@@ -360,7 +479,7 @@ def test_concurrent_lookups_of_the_same_prefix(request_runner, async_scheduling:
 
     # start a new request to load the same first block
     runner.new_request(token_ids=[0] * tokens_per_chunk)
-    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context, *_: 1
     runner.run(
         decoded_tokens=[],
         complete_transfers=False,
@@ -408,7 +527,7 @@ def test_abort_loading_requests(request_runner, async_scheduling: bool):
     # start a request to load the first block, but don't complete
     runner.scheduler.reset_prefix_cache()
     runner.new_request(token_ids=[0] * tokens_per_chunk)
-    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context, *_: 1
     runner.run(
         decoded_tokens=[],
         complete_transfers=False,
@@ -514,11 +633,19 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
         # Group 1 (sliding window, window=2): only the last 2 blocks
         #   are within the window → loads blocks 1,2
         expected_loaded=((0, 0), (0, 1), (0, 2), (1, 1), (1, 2)),
+        # The deferred store from the previous request's last block
+        # completes during this step, and its blocks are flushed because
+        # they were reallocated to the new request.
+        # Only block 1 (sliding window group) is stored - block 0's
+        # deferred store is flushed because it was reallocated.
+        expected_stored=((0, 1),),
+        expected_flushed=((0, 1),),
     )
 
-    # one touch in get_num_new_matched_tokens x 2 groups
+    # 4 touch calls: 2 from get_num_new_matched_tokens (2 groups)
+    # + 2 from _get_reqs_to_store (2 groups)
     touch_calls = runner.manager.touch.call_args_list
-    assert len(touch_calls) == 2
+    assert len(touch_calls) == 4
     # full attention group touched all 3 blocks
     assert len(touch_calls[0].args[0]) == 3
     # sliding window group touched just the last 2 blocks
@@ -692,61 +819,113 @@ def _make_scheduler_with_lookup(
 
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler.manager = manager
+    scheduler._events_tracker = MagicMock()
     return scheduler
 
 
 _EMPTY_REQ_CTX = ReqContext(req_id="")
+_LOOKUP_REQ = MagicMock()
+_LOOKUP_REQ.request_id = "req"
+_LOOKUP_GROUP_CONFIG = MagicMock()
+
+
+def _maximal_lookup(
+    sched: OffloadingConnectorScheduler,
+    keys,
+    start_chunk_idx: int = 0,
+):
+    return sched._maximal_prefix_lookup(
+        keys,
+        _EMPTY_REQ_CTX,
+        _LOOKUP_REQ,
+        _LOOKUP_GROUP_CONFIG,
+        start_chunk_idx,
+    )
 
 
 class TestMaximalPrefixLookup:
     def test_all_hit(self):
         sched = _make_scheduler_with_lookup({1: LookupResult.HIT, 2: LookupResult.HIT})
-        assert sched._maximal_prefix_lookup(to_keys([1, 2]), _EMPTY_REQ_CTX) == 2
+        assert _maximal_lookup(sched, to_keys([1, 2])) == 2
+
+    def test_records_absolute_chunk_indices(self):
+        keys = to_keys([1, 2])
+        sched = _make_scheduler_with_lookup({1: LookupResult.HIT, 2: LookupResult.HIT})
+
+        assert _maximal_lookup(sched, keys, start_chunk_idx=3) == 2
+        assert sched._events_tracker.record_lookup.call_args_list == [
+            call(
+                _LOOKUP_REQ,
+                _LOOKUP_GROUP_CONFIG,
+                3,
+                keys[0],
+            ),
+            call(
+                _LOOKUP_REQ,
+                _LOOKUP_GROUP_CONFIG,
+                4,
+                keys[1],
+            ),
+        ]
 
     def test_all_miss(self):
         sched = _make_scheduler_with_lookup({})
-        assert sched._maximal_prefix_lookup(to_keys([1, 2]), _EMPTY_REQ_CTX) == 0
+        assert _maximal_lookup(sched, to_keys([1, 2])) == 0
+        sched._events_tracker.record_lookup.assert_not_called()
 
     def test_partial_prefix(self):
         sched = _make_scheduler_with_lookup({1: LookupResult.HIT, 2: LookupResult.HIT})
-        assert sched._maximal_prefix_lookup(to_keys([1, 2, 3]), _EMPTY_REQ_CTX) == 2
+        assert _maximal_lookup(sched, to_keys([1, 2, 3])) == 2
 
     def test_miss_then_hit(self):
         sched = _make_scheduler_with_lookup({2: LookupResult.HIT})
-        assert sched._maximal_prefix_lookup(to_keys([1, 2]), _EMPTY_REQ_CTX) == 0
+        assert _maximal_lookup(sched, to_keys([1, 2])) == 0
 
     def test_single_hit(self):
         sched = _make_scheduler_with_lookup({1: LookupResult.HIT})
-        assert sched._maximal_prefix_lookup(to_keys([1]), _EMPTY_REQ_CTX) == 1
+        assert _maximal_lookup(sched, to_keys([1])) == 1
 
     def test_empty(self):
         sched = _make_scheduler_with_lookup({})
-        assert sched._maximal_prefix_lookup([], _EMPTY_REQ_CTX) == 0
+        assert _maximal_lookup(sched, []) == 0
+
+    @pytest.mark.parametrize(
+        "pending_result",
+        [LookupResult.RETRY, LookupResult.HIT_PENDING],
+    )
+    def test_pending_result_is_not_recorded(
+        self,
+        pending_result: LookupResult,
+    ):
+        sched = _make_scheduler_with_lookup({1: pending_result})
+
+        assert _maximal_lookup(sched, to_keys([1])) is None
+        sched._events_tracker.record_lookup.assert_not_called()
 
     def test_retry_defers(self):
         sched = _make_scheduler_with_lookup({1: LookupResult.RETRY, 2: LookupResult.HIT})
-        assert sched._maximal_prefix_lookup(to_keys([1, 2]), _EMPTY_REQ_CTX) is None
+        assert _maximal_lookup(sched, to_keys([1, 2])) is None
         assert sched.manager.lookup.call_count == 2
 
     def test_retry_after_hit_defers(self):
         sched = _make_scheduler_with_lookup({1: LookupResult.HIT, 2: LookupResult.RETRY})
-        assert sched._maximal_prefix_lookup(to_keys([1, 2]), _EMPTY_REQ_CTX) is None
+        assert _maximal_lookup(sched, to_keys([1, 2])) is None
 
     def test_hit_pending_defers(self):
         sched = _make_scheduler_with_lookup({1: LookupResult.HIT_PENDING, 2: LookupResult.HIT})
-        assert sched._maximal_prefix_lookup(to_keys([1, 2]), _EMPTY_REQ_CTX) is None
+        assert _maximal_lookup(sched, to_keys([1, 2])) is None
         assert sched.manager.lookup.call_count == 2
 
     def test_hit_pending_does_not_stop_scan(self):
         """HIT_PENDING defers but does not break — scan continues until miss."""
         sched = _make_scheduler_with_lookup({1: LookupResult.HIT_PENDING, 2: LookupResult.MISS, 3: LookupResult.HIT})
-        assert sched._maximal_prefix_lookup(to_keys([1, 2, 3]), _EMPTY_REQ_CTX) is None
+        assert _maximal_lookup(sched, to_keys([1, 2, 3])) is None
         assert sched.manager.lookup.call_count == 2
 
     def test_retry_stops_at_miss(self):
         """RETRY is treated as hit for iteration, but miss stops the scan."""
         sched = _make_scheduler_with_lookup({1: LookupResult.RETRY, 2: LookupResult.MISS, 3: LookupResult.HIT})
-        assert sched._maximal_prefix_lookup(to_keys([1, 2, 3]), _EMPTY_REQ_CTX) is None
+        assert _maximal_lookup(sched, to_keys([1, 2, 3])) is None
         # lookup should have been called for blocks 1 and 2 (stops at miss)
         assert sched.manager.lookup.call_count == 2
 
@@ -872,7 +1051,7 @@ def test_request_level_policy_stores_all_blocks(request_runner, async_scheduling
 
     # New request with 2 offloaded blocks; first matches what's in CPU.
     runner.new_request(token_ids=[0] * tokens_per_chunk * 2)
-    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context, *_: 1
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (generate_store_output(keys))
 
     # Load the first offloaded block from CPU.
@@ -901,7 +1080,7 @@ def test_loads_do_not_populate_fence_index(request_runner):
         async_scheduling=False,
     )
     runner.new_request(token_ids=[0] * 12)
-    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context, *_: 1
     runner.run(decoded_tokens=[], complete_transfers=False)
     assert runner.connector_scheduler._block_id_to_pending_jobs == {}
 
@@ -943,7 +1122,7 @@ def test_fence_at_update_state_after_alloc(request_runner):
 
     runner.scheduler.reset_prefix_cache()
     runner.new_request(token_ids=[0] * 4)
-    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context, *_: 1
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (generate_store_output([]))
     runner.run(
         decoded_tokens=[],
@@ -988,7 +1167,7 @@ def test_fence_at_build_store_jobs(request_runner):
 
     runner.scheduler.reset_prefix_cache()
     runner.new_request(token_ids=[1] * 4)
-    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 0
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context, *_: 0
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (generate_store_output([]))
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
@@ -1200,7 +1379,7 @@ def test_reset_cache(request_runner, async_scheduling: bool):
     # Leave the load in-flight so that reset_cache must flush it.
     runner.scheduler.reset_prefix_cache()
     runner.new_request(token_ids=[0] * tokens_per_chunk)
-    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 1
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context, *_: 1
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (generate_store_output([]))
     runner.run(decoded_tokens=[], complete_transfers=False)
 
@@ -1372,7 +1551,7 @@ def test_async_preempt_readmit_before_transfer_output_is_deferred(request_runner
     # preemption batch's ModelRunnerOutput is consumed by update_from_output().
     free_block_queue.num_free_blocks = num_free_blocks_empty
     assert runner.scheduler.reset_prefix_cache()
-    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: len(key)
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context, *_: len(key)
 
     readmit_output = runner.scheduler.schedule()
 
@@ -1482,7 +1661,7 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool):
     runner.scheduler.reset_prefix_cache()
     runner.new_request(token_ids=[0] * num_tokens + [1])
     runner.manager.lookup.return_value = LookupResult.HIT
-    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 2
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context, *_: 2
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
         # Group 0: full prefix lookup hits 2 offloaded blocks
@@ -1786,11 +1965,17 @@ class TestEagle:
         captured_keys: list = []
         orig_sw_lookup = type(sched)._sliding_window_lookup
 
-        def capturing_sw_lookup(self_arg, keys, window, req_context):
+        def capturing_sw_lookup(self_arg, keys, window, req_context, *args):
             captured_keys.append(list(keys))
-            return orig_sw_lookup(self_arg, keys, window, req_context)
+            return orig_sw_lookup(self_arg, keys, window, req_context, *args)
 
-        sched._sliding_window_lookup = lambda keys, window, req_ctx: (capturing_sw_lookup(sched, keys, window, req_ctx))
+        sched._sliding_window_lookup = lambda keys, window, req_ctx, *args: capturing_sw_lookup(
+            sched,
+            keys,
+            window,
+            req_ctx,
+            *args,
+        )
 
         req_status = self._make_req_status(sched, num_tokens=13, offload_keys_per_group=[[1, 2, 3, 4]])
         result = sched._lookup(req_status)

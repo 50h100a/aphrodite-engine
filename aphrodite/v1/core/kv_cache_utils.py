@@ -601,8 +601,8 @@ def resolve_kv_cache_block_sizes(
 
     - ``scheduler_block_size`` is the token-alignment invariant used by the
       scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:
-      ``cache_config.block_size * dcp * pcp``. Multiple groups: LCM of every
-      group's block size — context parallelism is not supported here.
+      ``cache_config.block_size * dcp``. Multiple groups: LCM of every
+      group's block size; DCP is not supported here.
     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
       is computed. Single group: equals scheduler block size. Multiple groups:
       ``cache_config.prefix_match_unit`` override if set, else the GCD of group
@@ -613,17 +613,16 @@ def resolve_kv_cache_block_sizes(
     """
     cache_config = aphrodite_config.cache_config
     dcp = aphrodite_config.parallel_config.decode_context_parallel_size
-    pcp = aphrodite_config.parallel_config.prefill_context_parallel_size
     groups = kv_cache_config.kv_cache_groups
 
-    if len(groups) <= 1:  # Single group: block_size * dcp * pcp
-        bs = cache_config.block_size * dcp * pcp
+    if len(groups) <= 1:
+        bs = cache_config.block_size * dcp
         return bs, bs
 
-    if dcp != 1 or pcp != 1:
+    if dcp != 1:
         raise ValueError(
             "Hybrid KV cache groups with multiple block sizes do not "
-            "support context parallelism (dcp_world_size/pcp_world_size > 1)."
+            "support decode context parallelism (dcp_world_size > 1)."
         )
 
     group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
@@ -893,14 +892,23 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
 def get_max_concurrency_for_kv_cache_config(aphrodite_config: AphroditeConfig, kv_cache_config: KVCacheConfig) -> float:
     """
     Get the maximum concurrency for the given KV cache configuration.
+
+    A request at max_model_len consumes whole blocks from each group's block
+    table -- cdiv(per-request bytes, page bytes) of the group's spec -- and all
+    groups draw those block ids from one shared pool, so the per-request total
+    is the sum over groups. The memory/page ratio is identical whether a group
+    carries an aggregated UniformTypeKVCacheSpecs (worker config) or a
+    representative per-layer spec (scheduler config), so both capacity call
+    sites agree.
     """
-    num_layer_per_group = max(len(group.layer_names) for group in kv_cache_config.kv_cache_groups)
-    max_memory_usage_per_request = num_layer_per_group * max_memory_usage_bytes(
-        aphrodite_config, (group.kv_cache_spec for group in kv_cache_config.kv_cache_groups)
+    num_blocks_per_request = sum(
+        cdiv(
+            group.kv_cache_spec.max_memory_usage_bytes(aphrodite_config),
+            group.kv_cache_spec.page_size_bytes,
+        )
+        for group in kv_cache_config.kv_cache_groups
     )
-    memory_per_block = kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes * num_layer_per_group
-    num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
-    max_concurrency = kv_cache_config.num_blocks / num_block_per_request
+    max_concurrency = kv_cache_config.num_blocks / num_blocks_per_request
     return max_concurrency
 
 
@@ -1052,7 +1060,13 @@ def unify_kv_cache_spec_page_size(
             new_kv_cache_spec[layer_name] = new_spec
         else:
             layer_page_size = layer_spec.page_size_bytes
-            if max_page_size % layer_page_size == 0:
+            if isinstance(layer_spec, AttentionSpec) and layer_spec.page_size_padded is not None:
+                # Already-padded specs (e.g. KV-quant skip layers aligned to
+                # the shared page by the platform) are read through a strided
+                # view, so grow the padding; scaling block_size instead would
+                # leave the stale smaller padding below the new unpadded size.
+                new_spec = replace(layer_spec, page_size_padded=max_page_size)
+            elif max_page_size % layer_page_size == 0:
                 ratio = max_page_size // layer_page_size
                 new_block_size = layer_spec.block_size * ratio
                 new_spec = replace(layer_spec, block_size=new_block_size)
