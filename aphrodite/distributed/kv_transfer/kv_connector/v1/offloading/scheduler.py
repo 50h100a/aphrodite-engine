@@ -28,7 +28,13 @@ from aphrodite.distributed.kv_transfer.kv_connector.v1.offloading.metrics import
 )
 from aphrodite.logger import init_logger
 from aphrodite.utils.math_utils import cdiv, round_down
+from aphrodite.v1.core.block_pool import BlockPool
 from aphrodite.v1.core.kv_cache_manager import KVCacheBlocks
+from aphrodite.v1.core.kv_cache_utils import (
+    BlockHashWithGroupId,
+    get_block_hash,
+    get_group_id,
+)
 from aphrodite.v1.core.sched.output import SchedulerOutput
 from aphrodite.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -382,6 +388,19 @@ class OffloadingConnectorScheduler:
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        # Only needed for victim-cache eviction: it lets the manager drop the
+        # "duplicate" (GPU-resident) flag on a block the instant the GPU
+        # actually evicts it, instead of relying solely on the touch-driven
+        # note_gpu_resident heuristic.
+        if self.manager.gpu_residency_aware:
+            gpu_block_pool.set_gpu_eviction_listener(self._on_gpu_blocks_evicted)
+
+    def _on_gpu_blocks_evicted(self, block_hashes: list[BlockHashWithGroupId]) -> None:
+        self.manager.note_gpu_evicted(
+            [make_offload_key(get_block_hash(bh), get_group_id(bh)) for bh in block_hashes]
+        )
 
     def _maybe_observe_lookup_async_delay(self, req_status: RequestOffloadState) -> None:
         start_time = req_status.deferred_lookup_start_time

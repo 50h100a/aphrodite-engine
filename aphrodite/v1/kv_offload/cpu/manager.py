@@ -373,15 +373,14 @@ class CPUOffloadingManager(OffloadingManager):
         occupancy = occupied / self._num_blocks if self._num_blocks > 0 else 0.0
 
         logger.info(
-            "KV offload CPU: occupancy=%.1f%% (%d/%d blocks hold data) "
-            "pinned=%.1f%% (used=%d) allocated=%d free=%d evictable=%d "
+            "KV offload CPU: %d/%d blocks (%.1f%%) "
+            "pinned=%.1f%% (used=%d) free=%d evictable=%d "
             "write_pending=%d | per-group cached blocks: %s%s",
-            occupancy * 100.0,
             occupied,
             self._num_blocks,
+            occupancy * 100.0,
             usage * 100.0,
             num_used,
-            self._num_allocated_blocks,
             len(self._free_list),
             self._num_evictable_cache_blocks,
             self._num_write_pending_blocks,

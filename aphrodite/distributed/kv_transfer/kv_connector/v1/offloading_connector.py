@@ -38,6 +38,7 @@ from aphrodite.distributed.kv_transfer.kv_connector.v1.offloading.worker import 
 )
 from aphrodite.forward_context import ForwardContext
 from aphrodite.v1.attention.backend import AttentionBackend, AttentionMetadata
+from aphrodite.v1.core.block_pool import BlockPool
 from aphrodite.v1.core.kv_cache_manager import KVCacheBlocks
 from aphrodite.v1.core.sched.output import SchedulerOutput
 from aphrodite.v1.kv_cache_interface import KVCacheConfig
@@ -125,6 +126,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_worker is not None:
             return self.connector_worker.build_connector_worker_meta()
         return None
+
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
 
     def on_new_request(self, request: "Request") -> None:
         assert self.connector_scheduler is not None

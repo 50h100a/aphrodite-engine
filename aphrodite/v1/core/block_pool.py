@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 from aphrodite.distributed.kv_events import (
@@ -190,6 +190,18 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+
+        # Optional listener notified with the raw `BlockHashWithGroupId`s of
+        # every block evicted from the GPU prefix cache, independent of
+        # `enable_kv_cache_events` (that flag only gates the external
+        # publisher). Consumers such as KV-offload connectors bind this via
+        # `set_gpu_eviction_listener` to keep their own residency tracking in
+        # sync with actual GPU evictions.
+        self._gpu_eviction_listener: Callable[[list[BlockHashWithGroupId]], None] | None = None
+
+    def set_gpu_eviction_listener(self, listener: Callable[[list[BlockHashWithGroupId]], None] | None) -> None:
+        """Register a callback fired with evicted block hashes on every GPU cache eviction."""
+        self._gpu_eviction_listener = listener
 
     def get_cached_block(self, block_hash: BlockHash, kv_cache_group_ids: list[int]) -> list[KVCacheBlock] | None:
         """Get the cached block by the block hash for each group in
@@ -510,6 +522,8 @@ class BlockPool:
         self,
         block_hashes: list[BlockHashWithGroupId],
     ) -> None:
+        if self._gpu_eviction_listener is not None:
+            self._gpu_eviction_listener(block_hashes)
         if not self.enable_kv_cache_events:
             return
         for block_hash in block_hashes:
