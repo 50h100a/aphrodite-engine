@@ -21,7 +21,7 @@ from aphrodite.distributed.kv_transfer.kv_connector.v1.offloading.common import 
     OffloadingWorkerMetadata,
 )
 from aphrodite.distributed.kv_transfer.kv_connector.v1.offloading.config import (
-    build_offloading_config,
+    OffloadingConfig,
 )
 from aphrodite.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
@@ -122,8 +122,8 @@ class MockOffloadingWorker(OffloadingWorker):
 
 
 class MockOffloadingSpec(OffloadingSpec):
-    def __init__(self, aphrodite_config: AphroditeConfig, kv_cache_config: KVCacheConfig):
-        super().__init__(build_offloading_config(aphrodite_config, kv_cache_config))
+    def __init__(self, config: OffloadingConfig):
+        super().__init__(config)
 
         self.manager = MagicMock(spec=OffloadingManager)
         self.manager.prepare_load = lambda keys, req_context: MockLoadStoreSpec(keys)
@@ -198,6 +198,9 @@ class RequestRunner:
             "spec_module_path": "tests.v1.kv_connector.unit.offloading_connector.utils",  # noqa: E501
             # Preserve legacy behavior for tests; new opt-in tests override.
             "offload_prompt_only": False,
+            # Preserve legacy store-everything SWA behavior for tests;
+            # prompt-tail gating tests override.
+            "swa_store_prompt_tail_only": False,
             # Exercise the self-describing KV events path by default;
             # opt-out tests override this to cover the legacy placeholders.
             "self_describing_kv_events": True,
@@ -250,7 +253,7 @@ class RequestRunner:
         aphrodite_config.cache_config.num_gpu_blocks = num_gpu_blocks
         self.num_kv_groups = len(kv_cache_config.kv_cache_groups)
 
-        scheduler_block_size, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, aphrodite_config)
+        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(kv_cache_config, aphrodite_config)
 
         scheduler_cls = AsyncScheduler if async_scheduling else Scheduler
         self.scheduler = scheduler_cls(
@@ -259,7 +262,7 @@ class RequestRunner:
             log_stats=True,
             structured_output_manager=StructuredOutputManager(aphrodite_config),
             block_size=scheduler_block_size,
-            tokens_per_hash=tokens_per_hash,
+            hash_block_size=hash_block_size,
         )
 
         self.worker_connector = OffloadingConnector(aphrodite_config, KVConnectorRole.WORKER, kv_cache_config)

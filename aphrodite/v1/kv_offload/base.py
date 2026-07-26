@@ -171,10 +171,6 @@ class OffloadingKVEventsConfig:
 
 
 class OffloadingManager(ABC):
-    # Whether this manager runs victim-cache eviction; gates the scheduler's
-    # residency-signal computation.
-    gpu_residency_aware: bool = False
-
     @abstractmethod
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         """
@@ -307,14 +303,6 @@ class OffloadingManager(ABC):
         Args:
             req_context: per-request context.
         """
-        return
-
-    def note_gpu_resident(self, keys: Collection[OffloadKey]) -> None:
-        """Hint that ``keys`` are GPU-resident (victim-cache). Default no-op."""
-        return
-
-    def note_gpu_evicted(self, keys: Collection[OffloadKey]) -> None:
-        """Hint that ``keys`` are no longer GPU-resident. Default no-op."""
         return
 
     def take_events(self) -> Iterable[OffloadingEvent]:
@@ -511,6 +499,19 @@ class OffloadingSpec(ABC):
         # turns' generated tokens are dropped before the next turn (e.g.
         # reasoning models that strip thinking).
         self.offload_prompt_only: bool = bool(self.extra_config.get("offload_prompt_only", True))
+
+        # When True, sliding-window attention groups only store the trailing
+        # `sliding_window` worth of prompt chunks — the only chunks the
+        # suffix-based load path can use to serve the dominant re-send /
+        # multi-turn hit. Applies only when no full-attention alignment
+        # optimization is in effect (e.g. Gemma-style hybrids where all
+        # groups share one block size). Mid-prompt prefix-divergence hits are
+        # lost; use swa_store_alignment_chunks to trade capacity for them.
+        self.swa_store_prompt_tail_only: bool = bool(self.extra_config.get("swa_store_prompt_tail_only", True))
+        # When > sliding window size (in chunks), also store the trailing
+        # window of every N-chunk segment, preserving SWA load hits at
+        # N-chunk granularity after mid-prompt divergence. 0 disables.
+        self.swa_store_alignment_chunks: int = int(self.extra_config.get("swa_store_alignment_chunks", 0))
 
         self.tokens_per_block = tuple(group.tokens_per_block for group in config.groups)
         self.tokens_per_hash = config.cache.tokens_per_hash

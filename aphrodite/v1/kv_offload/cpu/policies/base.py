@@ -41,10 +41,6 @@ class CachePolicy(ABC):
     and eviction, so they cannot be separated cleanly.
     """
 
-    # Whether this policy honors GPU-residency hints for victim-cache eviction.
-    # Policies leaving this False treat the residency hooks below as no-ops.
-    supports_gpu_residency: bool = False
-
     @abstractmethod
     def __init__(self, cache_capacity: int) -> None: ...
 
@@ -102,19 +98,3 @@ class CachePolicy(ABC):
     def iter_keys(self) -> Iterable[OffloadKey]:
         """All keys currently held (any ref_cnt). Default: none."""
         return ()
-
-    def set_gpu_residency_aware(self, enabled: bool) -> None:
-        """Enable/disable victim-cache eviction. No-op unless supported."""
-        return
-
-    def mark_gpu_resident(self, keys: Iterable[OffloadKey]) -> None:
-        """Mark ``keys`` GPU-resident (evict-first segment). No-op unless supported."""
-        return
-
-    def mark_gpu_evicted(self, keys: Iterable[OffloadKey]) -> None:
-        """Mark ``keys`` no longer GPU-resident (evict-last segment). No-op unless supported."""
-        return
-
-    def segment_counts(self) -> tuple[int, int]:
-        """(duplicate_blocks, exclusive_blocks) among evictable blocks."""
-        return (0, 0)

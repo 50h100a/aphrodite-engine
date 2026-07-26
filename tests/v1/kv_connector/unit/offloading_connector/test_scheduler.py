@@ -1436,17 +1436,21 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool):
         num_gpu_blocks=num_gpu_blocks,
         async_scheduling=async_scheduling,
         kv_cache_groups=kv_cache_groups,
+        # Real (load-path-constraining) alignment takes precedence over the
+        # prompt-tail gate: enabling the knob must not change this test.
+        extra_config_overrides={"swa_store_prompt_tail_only": True},
     )
 
-    # Verify config: alignment_block_count computed correctly
+    # Verify config: alignment_chunk_count computed correctly
     kv_group_configs = runner.connector_scheduler.config.kv_group_configs
     assert len(kv_group_configs) == 2
     # Group 0: full attention -> no alignment skip
-    assert kv_group_configs[0].alignment_block_count is None
+    assert kv_group_configs[0].alignment_chunk_count is None
     assert kv_group_configs[0].sliding_window_size_in_chunks is None
     assert kv_group_configs[0].tokens_per_chunk == full_attn_block_size
-    # Group 1: SWA -> alignment_block_count = 16/4 = 4, tail = 2
-    assert kv_group_configs[1].alignment_block_count == 4
+    # Group 1: SWA -> alignment_chunk_count = 16/4 = 4, tail = 2
+    assert kv_group_configs[1].alignment_chunk_count == 4
+    assert kv_group_configs[1].alignment_is_synthetic is False
     assert kv_group_configs[1].sliding_window_size_in_chunks == 2
     assert kv_group_configs[1].tokens_per_chunk == swa_block_size
 
@@ -1495,6 +1499,209 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool):
             (0, 1),
             (1, 6),
             (1, 7),
+        ),
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_swa_prompt_tail_only_store(request_runner, async_scheduling: bool):
+    """With swa_store_prompt_tail_only, only the trailing sliding-window
+    worth of prompt chunks is stored for SWA groups.
+
+    Simulates a Gemma-style hybrid where full-attention and SWA groups share
+    one block size, so no real full-attention alignment applies and every SWA
+    prompt chunk used to be stored — even though _sliding_window_lookup can
+    only ever use the last `sliding_window_size_in_chunks` chunks before a
+    matched prefix end.
+
+    Setup:
+      - Group 0: full attention, block_size=4
+      - Group 1: SWA, block_size=4, sliding_window=8 -> tail = 2 chunks
+      - Prompt: 20 tokens = 5 chunks -> prompt tail = chunks [3, 4]
+    """
+    block_size = 4
+    sliding_window = 8
+    num_gpu_blocks = 100
+
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=sliding_window,
+            ),
+        ),
+    ]
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+        extra_config_overrides={"swa_store_prompt_tail_only": True},
+    )
+
+    # Equal block sizes -> no real alignment; prompt-tail gate is active.
+    kv_group_configs = runner.connector_scheduler.config.kv_group_configs
+    assert kv_group_configs[0].is_true_swa is False
+    assert kv_group_configs[1].is_true_swa is True
+    assert kv_group_configs[1].alignment_chunk_count is None
+    assert kv_group_configs[1].sliding_window_size_in_chunks == 2
+    assert runner.connector_scheduler.config.swa_prompt_tail_only is True
+
+    num_tokens = block_size * 5
+    runner.new_request(token_ids=[0] * num_tokens)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (generate_store_output(keys))
+    runner.run(decoded_tokens=[0])
+
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (generate_store_output(keys))
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        # Group 0 (full attn): all 5 prompt chunks stored.
+        # Group 1 (SWA): only the prompt tail [3, 4] stored.
+        expected_stored=(
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (1, 3),
+            (1, 4),
+        ),
+    )
+
+    # A re-sent prompt hits: full-attn prefix plus the stored SWA tail.
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * num_tokens + [1])
+    runner.manager.lookup.return_value = LookupResult.HIT
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 5
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_loaded=(
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (1, 3),
+            (1, 4),
+        ),
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_swa_synthetic_alignment_store(request_runner, async_scheduling: bool):
+    """swa_store_alignment_chunks adds segment tails on top of the prompt
+    tail, preserving SWA load hits at segment granularity after mid-prompt
+    divergence.
+
+    Setup:
+      - Equal block sizes (no real alignment), sliding_window=8 -> tail = 2
+      - swa_store_alignment_chunks=4 -> synthetic segments of 4 chunks
+      - Prompt: 20 tokens = 5 chunks
+        * segment gate keeps chunks 2, 3 (trailing 2 of segment [0..3])
+        * prompt-tail gate keeps chunks 3, 4
+        -> SWA group stores chunks 2, 3, 4
+    """
+    block_size = 4
+    sliding_window = 8
+    num_gpu_blocks = 100
+
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=sliding_window,
+            ),
+        ),
+    ]
+
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+        extra_config_overrides={
+            "swa_store_prompt_tail_only": True,
+            "swa_store_alignment_chunks": 4,
+        },
+    )
+
+    kv_group_configs = runner.connector_scheduler.config.kv_group_configs
+    assert kv_group_configs[1].alignment_chunk_count == 4
+    assert kv_group_configs[1].alignment_is_synthetic is True
+
+    num_tokens = block_size * 5
+    runner.new_request(token_ids=[0] * num_tokens)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (generate_store_output(keys))
+    runner.run(decoded_tokens=[0])
+
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (generate_store_output(keys))
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=(
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (1, 2),
+            (1, 3),
+            (1, 4),
+        ),
+    )
+
+    # A request diverging after chunk 4 still hits at the synthetic segment
+    # boundary: full-attn prefix of 4 chunks plus SWA segment tail [2, 3].
+    # Without the synthetic segment tails these SWA chunks would not have
+    # been stored, and the load below would fail address resolution.
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * (block_size * 4) + [7] * (block_size * 2))
+    runner.manager.lookup.return_value = LookupResult.HIT
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (generate_store_output(keys))
+    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 4
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_loaded=(
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+        ),
+        # The diverged tail (chunks 4, 5 of the 6-chunk prompt) is stored:
+        # both pass the prompt-tail gate (prompt tail = chunks [4, 5]).
+        expected_stored=(
+            (0, 4),
+            (0, 5),
+            (1, 4),
+            (1, 5),
         ),
     )
 
@@ -2531,3 +2738,61 @@ def test_request_finished_mixed_full_attn_and_sliding_window(
     # Verify fence is empty after full lifecycle (cleanup happened).
     assert runner.connector_scheduler._block_id_to_pending_jobs == {}
     assert len(runner.connector_scheduler._jobs) == 0
+
+
+def test_writeback_reset_cache_releases_reserved_blocks(request_runner):
+    """reset_cache must release GPU blocks reserved by in-flight write-back jobs
+    and zero the in-flight counter, so a mid-flight reset cannot leak pinned
+    blocks or wedge the pin cap shut."""
+    from aphrodite.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        TransferJobStatus,
+    )
+    from aphrodite.v1.core.kv_cache_utils import (
+        BlockHash,
+        make_block_hash_with_group_id,
+    )
+
+    runner = request_runner(
+        block_size=16,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+        extra_config_overrides={"writeback_offload": True},
+    )
+    cs = runner.connector_scheduler
+    pool = cs._gpu_block_pool
+    assert pool is not None
+
+    # Cache 3 blocks then free them so they are idle eviction candidates.
+    blocks = pool.get_new_blocks(3)
+    for b in blocks:
+        bh = make_block_hash_with_group_id(BlockHash(str(b.block_id).encode()), 0)
+        b.set_block_hash(bh)
+        pool.cached_block_hash_to_block.insert(bh, b)
+    pool.free_blocks(blocks)
+
+    # Reserve them for write-back and register a fake in-flight write-back job.
+    victims = pool.reserve_writeback_victims(3)
+    block_ids = [bid for bid, _ in victims]
+    assert len(block_ids) == 3
+    for bid in block_ids:
+        assert pool.blocks[bid].ref_cnt == 1  # pinned out of the free pool
+
+    cs._jobs[cs._job_counter] = TransferJobStatus(
+        req_id=cs._writeback_ctx.req_id,
+        pending_count=1,
+        keys=set(),
+        is_store=True,
+        is_writeback=True,
+        writeback_block_ids=block_ids,
+    )
+    cs._job_counter += 1
+    cs._writeback_inflight_blocks = 3
+
+    cs.reset_cache()
+
+    # Reserved blocks unpinned and returned to the pool; counter cleared.
+    assert cs._writeback_inflight_blocks == 0
+    for bid in block_ids:
+        assert pool.blocks[bid].ref_cnt == 0
+        assert bid not in pool._writeback_reserved
+    assert not cs._jobs

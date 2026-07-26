@@ -30,11 +30,7 @@ from aphrodite.logger import init_logger
 from aphrodite.utils.math_utils import cdiv, round_down
 from aphrodite.v1.core.block_pool import BlockPool
 from aphrodite.v1.core.kv_cache_manager import KVCacheBlocks
-from aphrodite.v1.core.kv_cache_utils import (
-    BlockHashWithGroupId,
-    get_block_hash,
-    get_group_id,
-)
+from aphrodite.v1.core.kv_cache_utils import get_block_hash, get_group_id
 from aphrodite.v1.core.sched.output import SchedulerOutput
 from aphrodite.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -78,6 +74,12 @@ class TransferJobStatus:
     # Store src block IDs that may be freed before the request finishes.
     # Registered in _block_id_to_pending_jobs at store creation time.
     sliding_window_block_ids: list[int] | None = None
+    # True for request-decoupled offload-on-eviction (write-back) store jobs.
+    # These are not tracked in _req_status; on completion they release their
+    # reserved GPU blocks back to the pool instead.
+    is_writeback: bool = False
+    # For write-back jobs: the reserved GPU block IDs to release on completion.
+    writeback_block_ids: list[int] | None = None
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -96,10 +98,20 @@ class GroupOffloadConfig(NamedTuple):
     # than the MLA full-attention group).
     # None for full-attention groups or when the optimization doesn't apply.
     alignment_chunk_count: int | None = None
+    # True when alignment_chunk_count comes from the opt-in
+    # swa_store_alignment_chunks knob rather than a real full-attention
+    # alignment constraint. Synthetic alignment widens what is stored
+    # (segment tails) but does not constrain the load path, so the
+    # prompt-tail store gate still applies on top of it.
+    alignment_is_synthetic: bool = False
     # True for EAGLE/MTP draft-model attention groups. The trailing block
     # of these groups is volatile and lacks a stable hash, so it must
     # be excluded from store and load scheduling.
     is_eagle_group: bool = False
+    # True for genuine sliding-window attention groups (excludes Mamba,
+    # whose window of 1 makes every stored chunk a useful hit endpoint,
+    # and eagle draft groups). Gates SWA store-skipping optimizations.
+    is_true_swa: bool = False
 
 
 def get_sliding_window_size_in_chunks(kv_cache_spec: KVCacheSpec, tokens_per_chunk: int) -> int | None:
@@ -138,6 +150,10 @@ class SchedulerOffloadConfig(NamedTuple):
     blocks_per_chunk: int
     num_workers: int
     offload_prompt_only: bool
+    # Store only the trailing sliding-window worth of prompt chunks for
+    # true-SWA groups without a real alignment constraint (see
+    # OffloadingSpec.swa_store_prompt_tail_only).
+    swa_prompt_tail_only: bool = True
 
     @classmethod
     def from_spec(
@@ -180,15 +196,22 @@ class SchedulerOffloadConfig(NamedTuple):
         def _alignment_chunk_count(
             tokens_per_chunk: int,
             sliding_window_size_in_chunks: int | None,
-        ) -> int | None:
-            if alignment_tokens is None or sliding_window_size_in_chunks is None:
-                return None
-            if alignment_tokens <= tokens_per_chunk:
-                return None
-            per_segment = alignment_tokens // tokens_per_chunk
-            if sliding_window_size_in_chunks >= per_segment:
-                return None
-            return per_segment
+            is_true_swa: bool,
+        ) -> tuple[int | None, bool]:
+            """Return (alignment_chunk_count, is_synthetic)."""
+            if sliding_window_size_in_chunks is None:
+                return None, False
+            if alignment_tokens is not None and alignment_tokens > tokens_per_chunk:
+                per_segment = alignment_tokens // tokens_per_chunk
+                if sliding_window_size_in_chunks < per_segment:
+                    return per_segment, False
+            # No real full-attention alignment (e.g. all groups share one
+            # block size, as in Gemma-style hybrids). Fall back to the
+            # opt-in synthetic segment size so mid-prompt SWA hits survive
+            # at that granularity.
+            if is_true_swa and spec.swa_store_alignment_chunks > sliding_window_size_in_chunks:
+                return spec.swa_store_alignment_chunks, True
+            return None, False
 
         if eagle_groups:
             logger.info(
@@ -198,28 +221,34 @@ class SchedulerOffloadConfig(NamedTuple):
                 sorted(eagle_groups),
             )
 
+        def _build_group_config(idx: int, tokens_per_block: int) -> GroupOffloadConfig:
+            tokens_per_chunk = tokens_per_block * spec.blocks_per_chunk
+            kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+            sw = get_sliding_window_size_in_chunks(kv_spec, tokens_per_chunk)
+            is_true_swa = isinstance(kv_spec, SlidingWindowSpec) and idx not in eagle_groups
+            alignment_chunk_count, alignment_is_synthetic = _alignment_chunk_count(tokens_per_chunk, sw, is_true_swa)
+            return GroupOffloadConfig(
+                group_idx=idx,
+                tokens_per_block=tokens_per_block,
+                tokens_per_chunk=tokens_per_chunk,
+                hashes_per_chunk=tokens_per_chunk // spec.tokens_per_hash,
+                sliding_window_size_in_chunks=sw,
+                alignment_chunk_count=alignment_chunk_count,
+                alignment_is_synthetic=alignment_is_synthetic,
+                kv_event_group_spec=get_offloading_event_group_spec(kv_cache_config.kv_cache_groups[idx]),
+                is_eagle_group=idx in eagle_groups,
+                is_true_swa=is_true_swa,
+            )
+
         return cls(
             num_workers=aphrodite_config.parallel_config.world_size,
             kv_group_configs=tuple(
-                GroupOffloadConfig(
-                    group_idx=idx,
-                    tokens_per_block=tokens_per_block,
-                    tokens_per_chunk=tokens_per_block * spec.blocks_per_chunk,
-                    hashes_per_chunk=((tokens_per_block * spec.blocks_per_chunk) // spec.tokens_per_hash),
-                    sliding_window_size_in_chunks=(
-                        sw := get_sliding_window_size_in_chunks(
-                            kv_cache_config.kv_cache_groups[idx].kv_cache_spec,
-                            tokens_per_block * spec.blocks_per_chunk,
-                        )
-                    ),
-                    alignment_chunk_count=_alignment_chunk_count(tokens_per_block * spec.blocks_per_chunk, sw),
-                    kv_event_group_spec=get_offloading_event_group_spec(kv_cache_config.kv_cache_groups[idx]),
-                    is_eagle_group=idx in eagle_groups,
-                )
+                _build_group_config(idx, tokens_per_block)
                 for idx, tokens_per_block in enumerate(spec.tokens_per_block)
             ),
             blocks_per_chunk=spec.blocks_per_chunk,
             offload_prompt_only=spec.offload_prompt_only,
+            swa_prompt_tail_only=spec.swa_store_prompt_tail_only,
         )
 
 
@@ -389,18 +418,94 @@ class OffloadingConnectorScheduler:
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
 
-    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
-        # Only needed for victim-cache eviction: it lets the manager drop the
-        # "duplicate" (GPU-resident) flag on a block the instant the GPU
-        # actually evicts it, instead of relying solely on the touch-driven
-        # note_gpu_resident heuristic.
-        if self.manager.gpu_residency_aware:
-            gpu_block_pool.set_gpu_eviction_listener(self._on_gpu_blocks_evicted)
-
-    def _on_gpu_blocks_evicted(self, block_hashes: list[BlockHashWithGroupId]) -> None:
-        self.manager.note_gpu_evicted(
-            [make_offload_key(get_block_hash(bh), get_group_id(bh)) for bh in block_hashes]
+        # Offload-on-eviction (write-back victim buffer). When enabled, the CPU
+        # tier is populated by spilling the GPU prefix cache's LRU tail under
+        # pressure instead of mirroring prompt blocks at compute time, so CPU
+        # capacity is additive to GPU rather than a subset of it.
+        self._writeback_offload: bool = bool(spec.extra_config.get("writeback_offload", False))
+        if self._writeback_offload and self.config.blocks_per_chunk != 1:
+            raise ValueError(
+                "writeback_offload requires blocks_per_chunk == 1 (one GPU block per "
+                f"offload chunk); got {self.config.blocks_per_chunk}. Unset 'block_size'/"
+                "'blocks_per_chunk' in kv_connector_extra_config."
+            )
+        # Max GPU blocks written back per engine step (bounds copy bandwidth and
+        # how many blocks are pinned out of the free pool at once).
+        self._writeback_max_per_step: int = int(spec.extra_config.get("writeback_max_per_step", 1024))
+        # The spiller must stay ahead of the allocator: it runs after allocation
+        # each step, so the free-block headroom below the watermark must exceed
+        # what a single step can allocate plus the in-flight (pinned) spill
+        # batch. Headroom is sized adaptively as
+        #   max_per_step + factor * (peak blocks allocated in one step)
+        # which self-tunes to the batch budget and the model's group structure
+        # (via the observed per-step allocation) rather than a fixed fraction of
+        # total capacity. An explicit block count overrides the adaptive value.
+        self._writeback_headroom_factor: float = float(
+            spec.extra_config.get("writeback_headroom_factor", 2.0)
         )
+        self._writeback_headroom_blocks_override: int | None = (
+            int(spec.extra_config["writeback_headroom_blocks"])
+            if "writeback_headroom_blocks" in spec.extra_config
+            else None
+        )
+        # Safeguards against adaptive headroom misbehaving under bursts:
+        #  - floor the watermark so a burst can never vent more than a bounded
+        #    fraction of the GPU cache (keeps a minimum working set resident);
+        #  - decay the observed peak so a transient burst's inflated headroom
+        #    fades instead of pinning the watermark low forever;
+        #  - cap total in-flight (pinned, copy-pending) blocks so the spiller
+        #    can never starve a live request's allocation.
+        self._writeback_min_watermark_frac: float = float(
+            spec.extra_config.get("writeback_min_watermark_frac", 0.5)
+        )
+        self._writeback_peak_decay: float = float(spec.extra_config.get("writeback_peak_decay", 0.98))
+        self._writeback_max_inflight_blocks: int = int(
+            spec.extra_config.get("writeback_max_inflight_blocks", 2 * self._writeback_max_per_step)
+        )
+        self._gpu_block_pool: BlockPool | None = None
+        self._writeback_num_gpu_blocks: int = 0
+        # Decaying peak of blocks allocated in a single engine step (drives adaptive headroom).
+        self._writeback_peak_step_alloc: int = 0
+        # Blocks currently reserved with a copy in flight (bounds pin pressure).
+        self._writeback_inflight_blocks: int = 0
+        # Diagnostics.
+        self._writeback_stored_total: int = 0
+        self._writeback_last_log: float = 0.0
+        # Shared context for request-decoupled write-back stores.
+        self._writeback_ctx: ReqContext = ReqContext(req_id="__writeback__", kv_transfer_params=None)
+
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        # Retained for the offload-on-eviction store path, which reserves
+        # eviction-bound cached blocks from the pool for write-back.
+        self._gpu_block_pool = gpu_block_pool
+        self._writeback_num_gpu_blocks = gpu_block_pool.num_gpu_blocks
+        if self._writeback_offload:
+            logger.info(
+                "writeback_offload enabled: num_gpu_blocks=%d headroom=%s max_per_step=%d",
+                gpu_block_pool.num_gpu_blocks,
+                self._writeback_headroom_blocks_override
+                if self._writeback_headroom_blocks_override is not None
+                else f"adaptive(factor={self._writeback_headroom_factor})",
+                self._writeback_max_per_step,
+            )
+
+    def _writeback_watermark(self) -> int:
+        """Cached-block count above which the LRU tail is spilled to CPU.
+
+        Leaves enough free headroom that the (post-allocation) spiller stays
+        ahead of the allocator: one step's allocation plus the in-flight spill
+        batch. Adaptive unless an explicit block count is configured.
+        """
+        if self._writeback_headroom_blocks_override is not None:
+            headroom = self._writeback_headroom_blocks_override
+        else:
+            headroom = self._writeback_max_per_step + int(
+                self._writeback_headroom_factor * self._writeback_peak_step_alloc
+            )
+        watermark = self._writeback_num_gpu_blocks - headroom
+        # Floor: never spill the GPU cache below this working-set minimum.
+        floor = int(self._writeback_num_gpu_blocks * self._writeback_min_watermark_frac)
+        return max(floor, watermark, 0)
 
     def _maybe_observe_lookup_async_delay(self, req_status: RequestOffloadState) -> None:
         start_time = req_status.deferred_lookup_start_time
@@ -492,19 +597,6 @@ class OffloadingConnectorScheduler:
                     group_state.offload_keys[blocks_to_skip:],
                     req_status.req_context,
                 )
-
-        # Chunks below the GPU-hit boundary are GPU-resident; confirm them as
-        # duplicates for victim-cache eviction. Keys beyond the boundary are
-        # served from CPU and left in their current segment.
-        if self.manager.gpu_residency_aware:
-            gpu_resident_keys: list[OffloadKey] = []
-            num_gpu_tokens = req_status.num_locally_computed_tokens
-            for group_config, group_state in zip(self.config.kv_group_configs, req_status.group_states):
-                gpu_chunks = num_gpu_tokens // group_config.tokens_per_chunk
-                if gpu_chunks:
-                    gpu_resident_keys.extend(group_state.offload_keys[:gpu_chunks])
-            if gpu_resident_keys:
-                self.manager.note_gpu_resident(gpu_resident_keys)
 
     def _lookup(self, req_status: RequestOffloadState) -> int | None:
         """
@@ -852,6 +944,111 @@ class OffloadingConnectorScheduler:
                         if group_state.block_ids[j] in self._current_batch_allocated_block_ids:
                             group_state.block_ids[j] = 0
 
+    def _build_writeback_store_jobs(self) -> dict[int, TransferJob]:
+        """Offload-on-eviction: spill the GPU prefix cache's LRU tail to CPU.
+
+        Only runs under cache pressure (cached blocks above the high
+        watermark). Reserves the eviction-soonest cached blocks (pinning their
+        KV data), copies them GPU->CPU, and on completion evicts them from the
+        GPU cache so their content lives only on the CPU tier. This keeps the
+        GPU holding the recent working set while the CPU accumulates the
+        overflow, making capacity additive.
+        """
+        pool = self._gpu_block_pool
+        if pool is None:
+            return {}
+
+        num_cached = pool.num_cached_blocks()
+        watermark = self._writeback_watermark()
+        over = num_cached - watermark
+        now = time.monotonic()
+        if now - self._writeback_last_log >= 2.0:
+            self._writeback_last_log = now
+            logger.info(
+                "writeback: num_cached=%d watermark=%d (peak_step_alloc=%d) over=%d stored_total=%d",
+                num_cached,
+                watermark,
+                self._writeback_peak_step_alloc,
+                over,
+                self._writeback_stored_total,
+            )
+        if over <= 0:
+            return {}
+        # Cap total pinned, copy-pending blocks so the spiller can never starve
+        # a live request's allocation, regardless of copy latency.
+        inflight_budget = self._writeback_max_inflight_blocks - self._writeback_inflight_blocks
+        if inflight_budget <= 0:
+            return {}
+        num_to_reserve = min(over, self._writeback_max_per_step, inflight_budget)
+        victims = pool.reserve_writeback_victims(num_to_reserve)
+        if not victims:
+            return {}
+
+        num_groups = len(self.config.kv_group_configs)
+        # (block_id, offload_key) per group, in group order.
+        per_group: list[list[tuple[int, OffloadKey]]] = [[] for _ in range(num_groups)]
+        for block_id, bhg in victims:
+            gid = get_group_id(bhg)
+            key = make_offload_key(get_block_hash(bhg), gid)
+            per_group[gid].append((block_id, key))
+
+        # Flatten in ascending group order (the order the worker expects).
+        ordered: list[tuple[int, OffloadKey, int]] = [
+            (block_id, key, gid) for gid in range(num_groups) for (block_id, key) in per_group[gid]
+        ]
+
+        store_output = self.manager.prepare_store([key for _, key, _ in ordered], self._writeback_ctx)
+        if store_output is None:
+            # CPU tier could not make room: return the victims unchanged; they
+            # stay GPU-cached eviction candidates and are retried next step.
+            for block_id, _ in victims:
+                pool.release_writeback_victim(block_id, stored=False)
+            return {}
+
+        keys_to_store = set(store_output.keys_to_store)
+
+        src_block_ids: list[int] = []
+        group_sizes = [0] * num_groups
+        job_block_ids: list[int] = []
+        for block_id, key, gid in ordered:
+            if key not in keys_to_store:
+                # Already resident on the CPU tier (dedup): the content is safe,
+                # so evict it from the GPU cache and free the block now.
+                pool.release_writeback_victim(block_id, stored=True)
+                continue
+            src_block_ids.append(block_id)
+            group_sizes[gid] += 1
+            job_block_ids.append(block_id)
+
+        if not job_block_ids:
+            return {}
+
+        self._writeback_stored_total += len(job_block_ids)
+        self._writeback_inflight_blocks += len(job_block_ids)
+        logger.info(
+            "writeback: reserved=%d storing=%d (already_on_cpu=%d) num_cached=%d inflight=%d",
+            len(victims),
+            len(job_block_ids),
+            len(victims) - len(job_block_ids),
+            num_cached,
+            self._writeback_inflight_blocks,
+        )
+
+        # blocks_per_chunk == 1 for the write-back path, so the worker's
+        # partial-chunk skip (block_idx % blocks_per_chunk) is always 0.
+        src_spec = GPULoadStoreSpec(src_block_ids, group_sizes=group_sizes, block_indices=[0] * num_groups)
+
+        job_id = self._generate_job_id()
+        self._jobs[job_id] = TransferJobStatus(
+            req_id=self._writeback_ctx.req_id,
+            pending_count=self.config.num_workers,
+            keys=set(store_output.keys_to_store),
+            is_store=True,
+            is_writeback=True,
+            writeback_block_ids=job_block_ids,
+        )
+        return {job_id: TransferJob(req_id=self._writeback_ctx.req_id, src_spec=src_spec, dst_spec=store_output.store_spec)}
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
@@ -903,6 +1100,26 @@ class OffloadingConnectorScheduler:
                 alignment_chunk_count = group_config.alignment_chunk_count
                 tail = group_config.sliding_window_size_in_chunks
 
+                # Skip SWA prompt blocks outside the trailing window:
+                # _sliding_window_lookup only ever uses the last `tail`
+                # chunks before a matched prefix end, so for the dominant
+                # re-send/multi-turn hit pattern only the prompt tail can
+                # serve a load. Applies to true-SWA groups without a real
+                # (load-path-constraining) alignment; decode-region chunks
+                # (abs_block_idx >= prompt_chunks) always pass this gate.
+                prompt_tail_start: int | None = None
+                if (
+                    group_config.is_true_swa
+                    and self.config.swa_prompt_tail_only
+                    and (alignment_chunk_count is None or group_config.alignment_is_synthetic)
+                ):
+                    assert tail is not None
+                    effective_prompt = req.num_prompt_tokens
+                    if max_offload_tokens is not None:
+                        effective_prompt = min(effective_prompt, max_offload_tokens)
+                    prompt_chunks = effective_prompt // group_config.tokens_per_chunk
+                    prompt_tail_start = max(0, prompt_chunks - tail)
+
                 for key_idx, (offload_key, block_id) in enumerate(zip(offload_keys, offload_block_ids)):
                     if block_id == 0:
                         continue
@@ -910,12 +1127,19 @@ class OffloadingConnectorScheduler:
                     # within each full-attention alignment segment, only the
                     # trailing `tail` blocks are reachable by
                     # _sliding_window_lookup. For DeepSeek V4 with 100K
-                    # tokens this reduces SWA stores by ~78%.
-                    if alignment_chunk_count is not None:
-                        assert tail is not None
+                    # tokens this reduces SWA stores by ~78%. A chunk is
+                    # stored if it passes any active gate (segment tail or
+                    # prompt tail).
+                    if alignment_chunk_count is not None or prompt_tail_start is not None:
                         abs_block_idx = start_block_idx + key_idx
-                        pos_in_segment = abs_block_idx % alignment_chunk_count
-                        if pos_in_segment < alignment_chunk_count - tail:
+                        stored = False
+                        if alignment_chunk_count is not None:
+                            assert tail is not None
+                            pos_in_segment = abs_block_idx % alignment_chunk_count
+                            stored = pos_in_segment >= alignment_chunk_count - tail
+                        if not stored and prompt_tail_start is not None:
+                            stored = abs_block_idx >= prompt_tail_start
+                        if not stored:
                             continue
                     new_offload_keys.append(offload_key)
 
@@ -1041,9 +1265,20 @@ class OffloadingConnectorScheduler:
                 for jid in self._block_id_to_pending_jobs[bid]
             )
 
+        if self._writeback_offload:
+            # Decaying peak of per-step allocation drives the adaptive headroom:
+            # a burst raises it immediately; it fades over ~seconds so headroom
+            # (and GPU retention) recovers instead of staying inflated forever.
+            self._writeback_peak_step_alloc = max(
+                len(self._current_batch_allocated_block_ids),
+                int(self._writeback_peak_step_alloc * self._writeback_peak_decay),
+            )
+            store_jobs = self._build_writeback_store_jobs()
+        else:
+            store_jobs = self._build_store_jobs(scheduler_output)
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
-            store_jobs=self._build_store_jobs(scheduler_output),
+            store_jobs=store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
         )
         self._current_batch_load_jobs = {}
@@ -1111,6 +1346,19 @@ class OffloadingConnectorScheduler:
             if job_status.pending_count > 0:
                 continue
             assert job_status.pending_count == 0
+
+            if job_status.is_writeback:
+                # Request-decoupled write-back store: mark the CPU blocks
+                # readable, then evict the source blocks from the GPU cache and
+                # return them to the pool (content now lives on the CPU tier).
+                self.manager.complete_store(job_status.keys, self._writeback_ctx)
+                assert self._gpu_block_pool is not None
+                block_ids = job_status.writeback_block_ids or ()
+                for block_id in block_ids:
+                    self._gpu_block_pool.release_writeback_victim(block_id, stored=True)
+                self._writeback_inflight_blocks -= len(block_ids)
+                del self._jobs[job_id]
+                continue
 
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
@@ -1228,6 +1476,17 @@ class OffloadingConnectorScheduler:
             for group_state in status.group_states:
                 group_state.next_stored_chunk_idx = 0
             status.transfer_jobs.clear()
+
+        # Release GPU blocks reserved by in-flight write-back jobs before we drop
+        # their records: their CPU copies are discarded by manager.reset_cache
+        # above, so unpin the source blocks (stored=False keeps them GPU-cached)
+        # and clear the in-flight counter so the pin cap doesn't wedge shut.
+        if self._gpu_block_pool is not None:
+            for job_status in self._jobs.values():
+                if job_status.is_writeback:
+                    for block_id in job_status.writeback_block_ids or ():
+                        self._gpu_block_pool.release_writeback_victim(block_id, stored=False)
+        self._writeback_inflight_blocks = 0
 
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter

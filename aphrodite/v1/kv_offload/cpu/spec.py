@@ -160,8 +160,11 @@ class CPUOffloadingSpec(OffloadingSpec):
             # Maximum entries in the internal tracker's LRU table.
             max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
 
-            # Victim-cache eviction (opt-in).
-            gpu_residency_aware = bool(self.extra_config.get("gpu_residency_aware", False))
+            if "gpu_residency_aware" in self.extra_config:
+                logger.warning(
+                    "kv_connector_extra_config: 'gpu_residency_aware' is deprecated and "
+                    "ignored; the CPU tier now holds only GPU-evicted (offloaded) blocks."
+                )
 
             self._manager = CPUOffloadingManager(
                 num_blocks=self.num_blocks,
@@ -169,7 +172,6 @@ class CPUOffloadingSpec(OffloadingSpec):
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,
-                gpu_residency_aware=gpu_residency_aware,
             )
         return self._manager
 

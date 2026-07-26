@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 from aphrodite.distributed.kv_events import (
@@ -55,6 +55,11 @@ class BlockHashToBlockMap:
 
     def __init__(self):
         self._cache: dict[BlockHashWithGroupId, KVCacheBlock | dict[int, KVCacheBlock]] = {}
+
+    def size(self) -> int:
+        """Number of distinct cached block hashes (~ number of cached blocks;
+        blocks are not de-duplicated, so each cached block contributes >= 1)."""
+        return len(self._cache)
 
     def get_one_block(self, key: BlockHashWithGroupId) -> KVCacheBlock | None:
         """
@@ -191,17 +196,10 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
-        # Optional listener notified with the raw `BlockHashWithGroupId`s of
-        # every block evicted from the GPU prefix cache, independent of
-        # `enable_kv_cache_events` (that flag only gates the external
-        # publisher). Consumers such as KV-offload connectors bind this via
-        # `set_gpu_eviction_listener` to keep their own residency tracking in
-        # sync with actual GPU evictions.
-        self._gpu_eviction_listener: Callable[[list[BlockHashWithGroupId]], None] | None = None
-
-    def set_gpu_eviction_listener(self, listener: Callable[[list[BlockHashWithGroupId]], None] | None) -> None:
-        """Register a callback fired with evicted block hashes on every GPU cache eviction."""
-        self._gpu_eviction_listener = listener
+        # Physical blocks currently reserved for write-back offloading: their
+        # KV data is frozen (pinned out of the free queue) while a GPU->CPU
+        # copy is in flight. Maps block_id -> the hash held at reserve time.
+        self._writeback_reserved: dict[int, BlockHashWithGroupId] = {}
 
     def get_cached_block(self, block_hash: BlockHash, kv_cache_group_ids: list[int]) -> list[KVCacheBlock] | None:
         """Get the cached block by the block hash for each group in
@@ -522,8 +520,6 @@ class BlockPool:
         self,
         block_hashes: list[BlockHashWithGroupId],
     ) -> None:
-        if self._gpu_eviction_listener is not None:
-            self._gpu_eviction_listener(block_hashes)
         if not self.enable_kv_cache_events:
             return
         for block_hash in block_hashes:
@@ -659,6 +655,83 @@ class BlockPool:
         # Blocks without hash always get evicted first - prepend them last to the tail
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
+
+    def num_cached_blocks(self) -> int:
+        """Approximate number of physical blocks currently holding a prefix-cache
+        entry (counts distinct cached hashes; blocks are not de-duplicated).
+
+        Used as a GPU cache-pressure signal by the offload-on-eviction store
+        path: when this approaches ``num_gpu_blocks`` the cache is full and new
+        entries evict old ones, so the LRU tail should be written back.
+        """
+        return self.cached_block_hash_to_block.size()
+
+    def reserve_writeback_victims(self, max_num: int) -> list[tuple[int, BlockHashWithGroupId]]:
+        """Reserve up to ``max_num`` cached, unreferenced blocks nearest to
+        eviction for write-back offloading to a lower KV tier.
+
+        Walks the free queue from the head (eviction-soonest first) and, for
+        each cached (hashed), non-null block not already reserved, removes it
+        from the free queue and pins it (``ref_cnt += 1``) so allocation cannot
+        overwrite its KV data while a GPU->CPU copy is in flight. The block
+        stays in the prefix cache and can still serve a cache hit (which revives
+        it); ``release_writeback_victim`` resolves that at completion.
+
+        Returns ``(block_id, block_hash)`` for each reserved block, in
+        eviction-priority order. Requires ``enable_caching``.
+        """
+        if max_num <= 0 or not self.enable_caching:
+            return []
+
+        victims: list[tuple[int, BlockHashWithGroupId]] = []
+        tail = self.free_block_queue.fake_free_list_tail
+        block = self.free_block_queue.fake_free_list_head.next_free_block
+        while block is not None and block is not tail and len(victims) < max_num:
+            # Capture the successor before we potentially unlink `block`.
+            next_block = block.next_free_block
+            block_hash = block.block_hash
+            if not block.is_null and block_hash is not None and block.block_id not in self._writeback_reserved:
+                self.free_block_queue.remove(block)
+                block.ref_cnt += 1
+                self._writeback_reserved[block.block_id] = block_hash
+                victims.append((block.block_id, block_hash))
+            block = next_block
+        return victims
+
+    def release_writeback_victim(self, block_id: int, stored: bool) -> None:
+        """Release a block reserved by ``reserve_writeback_victims``.
+
+        ``stored=True`` means the KV data now lives on the lower tier. If the
+        block was not revived by a cache hit while in flight, it is evicted from
+        the prefix cache and its physical block returned to the free pool as
+        reuse-first (its content is safely offloaded). If it was revived, or the
+        store failed (``stored=False``), the reservation pin is simply dropped
+        and the block keeps its normal lifecycle.
+        """
+        hash_at_reserve = self._writeback_reserved.pop(block_id, None)
+        if hash_at_reserve is None:
+            return
+
+        block = self.blocks[block_id]
+        block.ref_cnt -= 1  # undo the reservation pin
+
+        # Revived: a cache hit (or other allocation) still holds this block.
+        # Leave it alone; its holder will free it through the normal path.
+        if block.ref_cnt > 0:
+            return
+
+        if stored and block.block_hash is hash_at_reserve:
+            # Content is on the lower tier: drop it from the GPU prefix cache
+            # and return the now-pure-free physical block as reuse-first.
+            self._maybe_evict_cached_block(block)
+            self.free_block_queue.prepend_n([block])
+        else:
+            # Store failed/cancelled, or the block was rehashed: it is an idle
+            # cached (or hashless) block again -> return it to the free queue.
+            if block.block_hash is not None:
+                self.free_block_queue.append(block)
+            else:
+                self.free_block_queue.prepend_n([block])
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
