@@ -37,6 +37,7 @@ from aphrodite.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse,
     ChatMessage,
+    CompactChatCompletionStreamResponse,
 )
 from aphrodite.entrypoints.openai.engine.protocol import (
     DeltaMessage,
@@ -439,10 +440,12 @@ class OpenAIServingChat(GenerateBaseServing):
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
             yield "data: [DONE]\n\n"
+            await result_generator.aclose()
             return
 
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(stream_options, self.enable_force_include_usage)
+        compact_stream = bool(stream_options and stream_options.compact_stream)
 
         last_res: RequestOutput | None = None
         try:
@@ -459,79 +462,107 @@ class OpenAIServingChat(GenerateBaseServing):
                 if first_iteration:
                     num_cached_tokens = res.num_cached_tokens
                     num_cache_creation_tokens = res.num_cache_creation_tokens
-                    # Send first response for each request.n (index) with
-                    # the role
-                    role = self.get_chat_request_role(request)
 
-                    # ``res.prompt`` is the rendered chat-templated prompt
-                    prompt_text = res.prompt if request.return_prompt_text else None
-
-                    # NOTE num_choices defaults to 1 so this usually executes
-                    # once per request
-                    for i in range(num_choices):
-                        choice_data = ChatCompletionResponseStreamChoice(
-                            index=i,
-                            delta=DeltaMessage(
-                                role=role,
-                                content="",
-                            ),
-                            logprobs=None,
-                            finish_reason=None,
+                    # compact stream: a single leading event carrying the role
+                    # (once, per choice) and the prompt + cached counts (once).
+                    if compact_stream:
+                        role = self.get_chat_request_role(request)
+                        lead_usage = UsageInfo(prompt_tokens=num_prompt_tokens)
+                        prompt_tokens_details = _make_prompt_tokens_details(
+                            True,
+                            num_cached_tokens,
+                            mm_token_counts,
                         )
-
-                        # return prompt_token_ids at the first chunk ever
-                        chunk = ChatCompletionStreamResponse(
-                            id=request_id,
-                            object=chunk_object_type,
-                            created=created_time,
-                            choices=[choice_data],
-                            model=model_name,
-                            prompt_token_ids=(res.prompt_token_ids if request.return_token_ids else None),
-                            prompt_text=prompt_text,
+                        if prompt_tokens_details is not None:
+                            lead_usage.prompt_tokens_details = prompt_tokens_details
+                        lead_choices = [
+                            ChatCompletionResponseStreamChoice(
+                                index=idx,
+                                delta=DeltaMessage(role=role),
+                                logprobs=None,
+                                finish_reason=None,
+                            )
+                            for idx in range(num_choices)
+                        ]
+                        lead_event = CompactChatCompletionStreamResponse(
+                            choices=lead_choices,
+                            usage=lead_usage,
                         )
+                        yield f"data: {lead_event.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
+                    else:
+                        # Send first response for each request.n (index) with
+                        # the role
+                        role = self.get_chat_request_role(request)
 
-                        # if continuous usage stats are requested, add it
-                        if include_continuous_usage:
-                            chunk.usage = UsageInfo(
-                                prompt_tokens=num_prompt_tokens,
-                                completion_tokens=0,
-                                total_tokens=num_prompt_tokens,
+                        # ``res.prompt`` is the rendered chat-templated prompt
+                        prompt_text = res.prompt if request.return_prompt_text else None
+
+                        # NOTE num_choices defaults to 1 so this usually executes
+                        # once per request
+                        for i in range(num_choices):
+                            choice_data = ChatCompletionResponseStreamChoice(
+                                index=i,
+                                delta=DeltaMessage(
+                                    role=role,
+                                    content="",
+                                ),
+                                logprobs=None,
+                                finish_reason=None,
                             )
 
-                        data = chunk.model_dump_json(exclude_unset=True)
-                        yield f"data: {data}\n\n"
+                            # return prompt_token_ids at the first chunk ever
+                            chunk = ChatCompletionStreamResponse(
+                                id=request_id,
+                                object=chunk_object_type,
+                                created=created_time,
+                                choices=[choice_data],
+                                model=model_name,
+                                prompt_token_ids=(res.prompt_token_ids if request.return_token_ids else None),
+                                prompt_text=prompt_text,
+                            )
 
-                    # Send response to echo the input portion of the
-                    # last message
-                    if request.echo:
-                        last_msg_content: str | list[dict[str, str]] = ""
-                        if conversation and "content" in conversation[-1] and conversation[-1].get("role") == role:
-                            last_msg_content = conversation[-1]["content"] or ""
+                            # if continuous usage stats are requested, add it
+                            if include_continuous_usage:
+                                chunk.usage = UsageInfo(
+                                    prompt_tokens=num_prompt_tokens,
+                                    completion_tokens=0,
+                                    total_tokens=num_prompt_tokens,
+                                )
 
-                        if last_msg_content:
-                            for i in range(num_choices):
-                                choice_data = ChatCompletionResponseStreamChoice(
-                                    index=i,
-                                    delta=DeltaMessage(content=last_msg_content),
-                                    logprobs=None,
-                                    finish_reason=None,
-                                )
-                                chunk = ChatCompletionStreamResponse(
-                                    id=request_id,
-                                    object=chunk_object_type,
-                                    created=created_time,
-                                    choices=[choice_data],
-                                    model=model_name,
-                                )
-                                if include_continuous_usage:
-                                    chunk.usage = UsageInfo(
-                                        prompt_tokens=num_prompt_tokens,
-                                        completion_tokens=0,
-                                        total_tokens=num_prompt_tokens,
+                            data = chunk.model_dump_json(exclude_unset=True)
+                            yield f"data: {data}\n\n"
+
+                        # Send response to echo the input portion of the
+                        # last message
+                        if request.echo:
+                            last_msg_content: str | list[dict[str, str]] = ""
+                            if conversation and "content" in conversation[-1] and conversation[-1].get("role") == role:
+                                last_msg_content = conversation[-1]["content"] or ""
+
+                            if last_msg_content:
+                                for i in range(num_choices):
+                                    choice_data = ChatCompletionResponseStreamChoice(
+                                        index=i,
+                                        delta=DeltaMessage(content=last_msg_content),
+                                        logprobs=None,
+                                        finish_reason=None,
                                     )
+                                    chunk = ChatCompletionStreamResponse(
+                                        id=request_id,
+                                        object=chunk_object_type,
+                                        created=created_time,
+                                        choices=[choice_data],
+                                        model=model_name,
+                                    )
+                                    if include_continuous_usage:
+                                        chunk.usage = UsageInfo(
+                                            prompt_tokens=num_prompt_tokens,
+                                            completion_tokens=0,
+                                            total_tokens=num_prompt_tokens,
+                                        )
 
-                                data = chunk.model_dump_json(exclude_unset=True)
-                                yield f"data: {data}\n\n"
+                                    data = chunk.model_dump_json(exclude_unset=True)
+                                    yield f"data: {data}\n\n"
                     first_iteration = False
 
                 for output in res.outputs:
@@ -668,6 +699,18 @@ class OpenAIServingChat(GenerateBaseServing):
                         finish_reason_sent[i] = True
 
                     choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
+
+                    # compact stream: emit only the full choice structure plus a
+                    # running completion_tokens count.
+                    if compact_stream:
+                        compact_event = CompactChatCompletionStreamResponse(
+                            choices=[choice_data],
+                            usage=UsageInfo(completion_tokens=previous_num_tokens[i]),
+                        )
+                        data = compact_event.model_dump_json(exclude_unset=True)
+                        yield f"data: {data}\n\n"
+                        continue
+
                     chunk = ChatCompletionStreamResponse(
                         id=request_id,
                         object=chunk_object_type,
@@ -699,8 +742,9 @@ class OpenAIServingChat(GenerateBaseServing):
                     yield f"data: {data}\n\n"
 
             # once the final token is handled, if stream_options.include_usage
-            # is sent, send the usage
-            if include_usage:
+            # is sent, send the usage. Compact mode carries its counts inline
+            # and deliberately emits no trailing usage chunk.
+            if include_usage and not compact_stream:
                 completion_tokens = sum(previous_num_tokens)
                 final_usage = UsageInfo(
                     prompt_tokens=num_prompt_tokens,
@@ -766,6 +810,8 @@ class OpenAIServingChat(GenerateBaseServing):
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
+        finally:
+            await result_generator.aclose()
         # Send the final done message after all response.n are finished
         yield "data: [DONE]\n\n"
 
@@ -789,6 +835,8 @@ class OpenAIServingChat(GenerateBaseServing):
                 final_res = res
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
+        finally:
+            await result_generator.aclose()
 
         if final_res is None:
             return self.create_error_response(
@@ -1037,6 +1085,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 ),
                 logprob=max(p[1].logprob, -9999.0),
                 bytes=list(token.encode("utf-8", errors="replace")),
+                token_id=p[0],
             )
             for i, p in enumerate(logprobs.items())
             if return_all or top_logprobs == -1 or (top_logprobs is not None and i < top_logprobs)
@@ -1072,6 +1121,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     ChatCompletionLogProbsContent(
                         token=token,
                         bytes=list(token.encode("utf-8", errors="replace")),
+                        token_id=token_id,
                     )
                 )
             else:
@@ -1088,6 +1138,7 @@ class OpenAIServingChat(GenerateBaseServing):
                         ),
                         logprob=max(step_token.logprob, -9999.0),
                         bytes=(None if step_decoded is None else list(step_decoded.encode("utf-8", errors="replace"))),
+                        token_id=token_id,
                         top_logprobs=self._get_top_logprobs(
                             step_top_logprobs,
                             num_output_top_logprobs,

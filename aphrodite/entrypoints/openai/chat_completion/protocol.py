@@ -105,6 +105,7 @@ class ChatCompletionLogProb(OpenAIBaseModel):
     token: str
     logprob: float = -9999.0
     bytes: list[int] | None = None
+    token_id: int | None = None
 
 
 class ChatCompletionLogProbsContent(ChatCompletionLogProb):
@@ -188,6 +189,13 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     # ``return_prompt_text=True`` on the request); only sent on the first chunk.
     prompt_text: str | None = None
     metrics: PerRequestTimingMetrics | None = None
+
+
+class CompactChatCompletionStreamResponse(OpenAIBaseModel):
+    """Compact streaming event for ``stream_options.compact_stream``."""
+
+    choices: list[ChatCompletionResponseStreamChoice] = Field(default_factory=list)
+    usage: UsageInfo | None = Field(default=None)
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):

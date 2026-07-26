@@ -666,12 +666,6 @@ class SamplingParams(
                 parameter="temperature",
                 value=self.temperature,
             )
-        if self.temperature > 2.0:
-            raise APHRODITEValidationError(
-                f"temperature must be in [0, 2], got {self.temperature}.",
-                parameter="temperature",
-                value=self.temperature,
-            )
         if not 0.0 < self.top_p <= 1.0:
             raise APHRODITEValidationError(
                 f"top_p must be in (0, 1], got {self.top_p}.",
@@ -1001,10 +995,7 @@ class SamplingParams(
     ) -> None:
         if speculative_config is None:
             return
-
-        # Some sampling parameters are not yet compatible with spec decoding.
-        if self.logit_bias:
-            raise ValueError("The logit_bias sampling parameter is not yet supported with speculative decoding.")
+        return
 
     def _validate_diffusion(self, model_config: ModelConfig) -> None:
         if not model_config.is_diffusion:

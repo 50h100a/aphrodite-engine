@@ -622,6 +622,9 @@ class CompletionLogProbs(OpenAIBaseModel):
     token_logprobs: list[float | None] = Field(default_factory=list)
     tokens: list[str] = Field(default_factory=list)
     top_logprobs: list[dict[str, float] | None] = Field(default_factory=list)
+    # Aphrodite extension (not in the OpenAI spec): integer token id per
+    # position, parallel to ``tokens``, so callers need not re-tokenize.
+    token_ids: list[int] = Field(default_factory=list)
 
 
 class CompletionResponseChoice(OpenAIBaseModel):
@@ -698,3 +701,10 @@ class CompletionStreamResponse(OpenAIBaseModel):
     # without the per-chunk serialization overhead.
     system_fingerprint: str | None = None
     metrics: PerRequestTimingMetrics | None = None
+
+
+class CompactCompletionStreamResponse(OpenAIBaseModel):
+    """Compact streaming event for ``stream_options.compact_stream``."""
+
+    choices: list[CompletionResponseStreamChoice] = Field(default_factory=list)
+    usage: UsageInfo | None = Field(default=None)

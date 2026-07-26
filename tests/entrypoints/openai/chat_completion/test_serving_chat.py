@@ -644,6 +644,35 @@ async def _single_request_output(
     yield request_output
 
 
+class _TrackingResultGenerator:
+    """Stand-in for ``result_generator`` that records whether ``aclose()``
+    was called, so tests can assert the consumer always releases it instead
+    of leaking the underlying engine request.
+    """
+
+    def __init__(self, items, *, raise_after: int | None = None, raise_exc: BaseException | None = None):
+        self._items = list(items)
+        self._index = 0
+        self._raise_after = raise_after
+        self._raise_exc = raise_exc
+        self.aclose_called = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._raise_after is not None and self._index == self._raise_after:
+            raise self._raise_exc
+        if self._index >= len(self._items):
+            raise StopAsyncIteration
+        item = self._items[self._index]
+        self._index += 1
+        return item
+
+    async def aclose(self):
+        self.aclose_called = True
+
+
 async def _collect_metrics_stream_chunks(
     serving: OpenAIServingChat,
     request: ChatCompletionRequest,
@@ -751,6 +780,71 @@ async def test_chat_streaming_metrics_ride_on_usage_chunk():
     usage_chunks = [chunk for chunk in chunks if chunk.get("usage")]
     assert usage_chunks
     assert usage_chunks[-1]["metrics"]["time_to_first_token_ms"] == pytest.approx(500.0)
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_stream_generator_closes_generator_on_parser_error():
+    """Regression test: a failure while constructing the tool/reasoning
+    parser must not leak ``result_generator``.
+    """
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    serving.parser_cls = object  # any non-None value; triggers the tokenizer check below
+
+    result_generator = _TrackingResultGenerator([_make_metrics_request_output()])
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Test prompt"}],
+        max_tokens=10,
+        stream=True,
+    )
+
+    async for _ in serving.chat_completion_stream_generator(
+        request,
+        result_generator,
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=None,  # None + non-None parser_cls raises during parser construction
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    ):
+        pass
+
+    assert result_generator.aclose_called, "result_generator was leaked after a parser-creation error"
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_full_generator_closes_generator_on_mid_stream_error():
+    """Regression test: a non-cancellation error raised while draining
+    ``result_generator`` must still close it.
+    """
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+
+    result_generator = _TrackingResultGenerator(
+        [_make_metrics_request_output()],
+        raise_after=1,
+        raise_exc=RuntimeError("simulated mid-stream engine failure"),
+    )
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Test prompt"}],
+        max_tokens=10,
+        stream=False,
+    )
+
+    with pytest.raises(RuntimeError):
+        await serving.chat_completion_full_generator(
+            request,
+            result_generator,
+            "chatcmpl-test-id",
+            "test-model",
+            conversation=[{"role": "user", "content": "Test"}],
+            tokenizer=MagicMock(),
+            request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+        )
+
+    assert result_generator.aclose_called, "result_generator was leaked after a mid-stream error"
 
 
 @dataclass
