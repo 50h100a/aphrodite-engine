@@ -471,6 +471,7 @@ class OpenAIServingChat(GenerateBaseServing):
                         prompt_tokens_details = _make_prompt_tokens_details(
                             True,
                             num_cached_tokens,
+                            num_cache_creation_tokens,
                             mm_token_counts,
                         )
                         if prompt_tokens_details is not None:
