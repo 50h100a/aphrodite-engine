@@ -10,6 +10,7 @@ gracefully reject the unenforceable ones.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from typing import Any
 
@@ -44,10 +45,8 @@ _SUBSCHEMA_MAP_KEYS = frozenset(
     }
 )
 
-# Enforcing these means comparing an element against every element before it,
-# which needs unbounded memory across elements and so is not expressible in any
-# backend's formalism. Rejected for all backends, not just the ones that notice.
-UNENFORCEABLE_JSON_SCHEMA_KEYS = frozenset(
+# These can't be enforced with regex or CFG. Maybe someday.
+_UNENFORCEABLE_JSON_SCHEMA_KEYS = frozenset(
     {
         "contains",
         "maxContains",
@@ -80,14 +79,26 @@ def iter_schema_nodes(schema: Any) -> Iterator[dict[str, Any]]:
                     yield from iter_schema_nodes(item)
 
 
-def find_schema_keys(schema: Any, keys: frozenset[str]) -> list[str]:
-    """Return the members of ``keys`` present anywhere in ``schema``, sorted."""
+def get_unenforceable_json_schema_keys(schema: Any) -> list[str]:
+    """Return the unenforceable keywords used by ``schema``, sorted.
+
+    ``schema`` may be a dict or JSON text. Unparseable text yields nothing;
+    malformed JSON is not ours to report.
+    """
+    if isinstance(schema, str):
+        try:
+            schema = json.loads(schema)
+        except ValueError:
+            return []
     found: set[str] = set()
     for node in iter_schema_nodes(schema):
-        found.update(keys.intersection(node))
+        found.update(_UNENFORCEABLE_JSON_SCHEMA_KEYS.intersection(node))
     return sorted(found)
 
 
-def get_unenforceable_json_schema_keys(schema: Any) -> list[str]:
-    """Return the unenforceable keywords used by ``schema``, sorted."""
-    return find_schema_keys(schema, UNENFORCEABLE_JSON_SCHEMA_KEYS)
+def unenforceable_keys_message(keys: list[str]) -> str:
+    """The rejection text, shared so the API and engine layers cannot drift."""
+    return (
+        f"JSON schema keyword(s) {keys} cannot be enforced by structured output. "
+        "Remove them from the schema and validate the generated output instead."
+    )

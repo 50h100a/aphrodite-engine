@@ -4,7 +4,7 @@
 import pytest
 
 from aphrodite.v1.structured_output.backend_guidance import (
-    has_guidance_unsupported_json_features,
+    is_guidance_backend_supported,
 )
 from aphrodite.v1.structured_output.backend_xgrammar import (
     has_xgrammar_unsupported_json_features,
@@ -130,18 +130,16 @@ def test_unenforceable_json_schema_keys(schema, expected):
     assert get_unenforceable_json_schema_keys(schema) == expected
 
 
-def test_guidance_unsupported_json_features():
+def test_guidance_backend_supported():
     # llguidance reports these as "Unimplemented keys" (verified against 1.7.6).
-    assert has_guidance_unsupported_json_features({"type": "array", "uniqueItems": True})
-    assert has_guidance_unsupported_json_features({"type": "object", "propertyNames": {"pattern": "^a"}})
-    assert has_guidance_unsupported_json_features({"not": {"type": "string"}})
+    assert not is_guidance_backend_supported({"type": "array", "uniqueItems": True})
+    assert not is_guidance_backend_supported({"type": "object", "propertyNames": {"pattern": "^a"}})
+    assert not is_guidance_backend_supported({"not": {"type": "string"}})
 
     # Supported by llguidance -- must not be diverted away from guidance.
-    assert not has_guidance_unsupported_json_features(
-        {"type": "object", "patternProperties": {"^S": {"type": "string"}}}
-    )
-    assert not has_guidance_unsupported_json_features({"type": "integer", "multipleOf": 120})
+    assert is_guidance_backend_supported({"type": "object", "patternProperties": {"^S": {"type": "string"}}})
+    assert is_guidance_backend_supported({"type": "integer", "multipleOf": 120})
 
 
-def test_guidance_unsupported_json_features_supported_schema(supported_schema):
-    assert not has_guidance_unsupported_json_features(supported_schema)
+def test_guidance_backend_supported_clean_schema(supported_schema):
+    assert is_guidance_backend_supported(supported_schema)

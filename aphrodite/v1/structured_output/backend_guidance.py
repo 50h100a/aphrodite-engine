@@ -20,7 +20,7 @@ from aphrodite.v1.structured_output.backend_types import (
     StructuredOutputOptions,
 )
 from aphrodite.v1.structured_output.request import get_structured_output_key
-from aphrodite.v1.structured_output.schema_features import find_schema_keys
+from aphrodite.v1.structured_output.schema_features import iter_schema_nodes
 
 if TYPE_CHECKING:
     import llguidance
@@ -46,7 +46,7 @@ def _walk_json_for_additional_properties(data: object):
 
 
 # Keywords llguidance 1.7.6 reports as "Unimplemented keys".
-GUIDANCE_UNSUPPORTED_JSON_KEYS = frozenset(
+_GUIDANCE_UNSUPPORTED_JSON_KEYS = frozenset(
     {
         "contains",
         "dependentRequired",
@@ -65,9 +65,9 @@ GUIDANCE_UNSUPPORTED_JSON_KEYS = frozenset(
 )
 
 
-def has_guidance_unsupported_json_features(schema: dict[str, Any]) -> bool:
-    """Check if JSON schema contains features unsupported by guidance/llguidance."""
-    return bool(find_schema_keys(schema, GUIDANCE_UNSUPPORTED_JSON_KEYS))
+def is_guidance_backend_supported(schema: dict[str, Any]) -> bool:
+    """Check whether guidance/llguidance can compile ``schema``."""
+    return not any(_GUIDANCE_UNSUPPORTED_JSON_KEYS.intersection(node) for node in iter_schema_nodes(schema))
 
 
 def process_for_additional_properties(

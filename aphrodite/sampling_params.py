@@ -1082,7 +1082,7 @@ class SamplingParams(
             )
 
         from aphrodite.v1.structured_output.backend_guidance import (
-            has_guidance_unsupported_json_features,
+            is_guidance_backend_supported,
             validate_guidance_grammar,
         )
         from aphrodite.v1.structured_output.backend_lm_format_enforcer import (
@@ -1094,24 +1094,16 @@ class SamplingParams(
         from aphrodite.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
         from aphrodite.v1.structured_output.schema_features import (
             get_unenforceable_json_schema_keys,
+            unenforceable_keys_message,
         )
 
         # Reject constraints that no backend can enforce while decoding, before
-        # dispatching. Left to the backends these either surface as an opaque
-        # compiler error (xgrammar, guidance) or are silently dropped (outlines,
-        # lm-format-enforcer), the latter returning output that violates the
-        # schema without telling the caller.
-        if self.structured_outputs.json is not None:
-            _schema = self.structured_outputs.json
-            if isinstance(_schema, str):
-                _schema = json_mod.loads(_schema)
-            unenforceable = get_unenforceable_json_schema_keys(_schema)
-            if unenforceable:
-                raise ValueError(
-                    f"JSON schema keyword(s) {unenforceable} cannot be enforced by "
-                    "structured output. Remove them from the schema and validate the "
-                    "generated output instead."
-                )
+        # dispatching. Otherwise we get an exception (xgrammar, guidance) or a
+        # silent omission (outlines, lm-format-enforcer). API entrypoints screen
+        # for this, this check is just-in-case for direct engine use.
+        unenforceable = get_unenforceable_json_schema_keys(self.structured_outputs.json)
+        if unenforceable:
+            raise ValueError(unenforceable_keys_message(unenforceable))
 
         if backend.startswith("xgrammar"):
             # xgrammar with no fallback
@@ -1168,7 +1160,7 @@ class SamplingParams(
                         schema = json_mod.loads(so_params.json)
                     else:
                         schema = so_params.json
-                    skip_guidance = has_guidance_unsupported_json_features(schema)
+                    skip_guidance = not is_guidance_backend_supported(schema)
 
                 if skip_guidance:
                     # Fall back to outlines if the tokenizer is non-tekken Mistral or

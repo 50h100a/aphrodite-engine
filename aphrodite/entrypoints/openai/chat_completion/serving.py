@@ -67,6 +67,10 @@ from aphrodite.sampling_params import BeamSearchParams, SamplingParams
 from aphrodite.tokenizers import TokenizerLike
 from aphrodite.utils.collection_utils import as_list
 from aphrodite.utils.mistral import is_mistral_tool_parser
+from aphrodite.v1.structured_output.schema_features import (
+    get_unenforceable_json_schema_keys,
+    unenforceable_keys_message,
+)
 
 logger = init_logger(__name__)
 
@@ -306,6 +310,14 @@ class OpenAIServingChat(GenerateBaseServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+
+            # If the schema is unenforceable, do not try to enforce it.
+            if isinstance(sampling_params, SamplingParams):
+                unenforceable = get_unenforceable_json_schema_keys(
+                    sampling_params.structured_outputs.json if sampling_params.structured_outputs else None
+                )
+                if unenforceable:
+                    return self.create_error_response(unenforceable_keys_message(unenforceable))
 
             self._log_inputs(
                 sub_request_id,
