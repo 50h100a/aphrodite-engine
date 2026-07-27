@@ -1092,6 +1092,26 @@ class SamplingParams(
             validate_structured_output_request_outlines,
         )
         from aphrodite.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
+        from aphrodite.v1.structured_output.schema_features import (
+            get_unenforceable_json_schema_keys,
+        )
+
+        # Reject constraints that no backend can enforce while decoding, before
+        # dispatching. Left to the backends these either surface as an opaque
+        # compiler error (xgrammar, guidance) or are silently dropped (outlines,
+        # lm-format-enforcer), the latter returning output that violates the
+        # schema without telling the caller.
+        if self.structured_outputs.json is not None:
+            _schema = self.structured_outputs.json
+            if isinstance(_schema, str):
+                _schema = json_mod.loads(_schema)
+            unenforceable = get_unenforceable_json_schema_keys(_schema)
+            if unenforceable:
+                raise ValueError(
+                    f"JSON schema keyword(s) {unenforceable} cannot be enforced by "
+                    "structured output. Remove them from the schema and validate the "
+                    "generated output instead."
+                )
 
         if backend.startswith("xgrammar"):
             # xgrammar with no fallback

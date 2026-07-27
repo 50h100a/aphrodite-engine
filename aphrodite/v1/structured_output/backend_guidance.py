@@ -20,6 +20,7 @@ from aphrodite.v1.structured_output.backend_types import (
     StructuredOutputOptions,
 )
 from aphrodite.v1.structured_output.request import get_structured_output_key
+from aphrodite.v1.structured_output.schema_features import find_schema_keys
 
 if TYPE_CHECKING:
     import llguidance
@@ -44,30 +45,29 @@ def _walk_json_for_additional_properties(data: object):
             _walk_json_for_additional_properties(item)
 
 
+# Keywords llguidance 1.7.6 reports as "Unimplemented keys".
+GUIDANCE_UNSUPPORTED_JSON_KEYS = frozenset(
+    {
+        "contains",
+        "dependentRequired",
+        "dependentSchemas",
+        "else",
+        "if",
+        "maxContains",
+        "minContains",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "uniqueItems",
+    }
+)
+
+
 def has_guidance_unsupported_json_features(schema: dict[str, Any]) -> bool:
     """Check if JSON schema contains features unsupported by guidance/llguidance."""
-
-    def check_object(obj: dict[str, Any]) -> bool:
-        if not isinstance(obj, dict):
-            return False
-
-        # patternProperties is not supported by llguidance
-        if "patternProperties" in obj:
-            return True
-
-        # Recursively check all nested objects and arrays
-        for value in obj.values():
-            if isinstance(value, dict):
-                if check_object(value):
-                    return True
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict) and check_object(item):
-                        return True
-
-        return False
-
-    return check_object(schema)
+    return bool(find_schema_keys(schema, GUIDANCE_UNSUPPORTED_JSON_KEYS))
 
 
 def process_for_additional_properties(
