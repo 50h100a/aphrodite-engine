@@ -22,7 +22,15 @@ def fa4_cutedsl_warmup(worker: Worker) -> None:
     if not aphrodite_config.model_config.use_mla:
         return
 
-    backend_cls = get_mla_prefill_backend(aphrodite_config)
+    # Selection raises when no backend supports the model's MLA dimensions,
+    # which is a supported state rather than an error: sparse-MLA models such as
+    # DeepSeek V4 expose no qk_nope/v head dims and run the top-k MQA path with
+    # no dense prefill backend at all (see MLAAttention.__init__, which handles
+    # the same ValueError). Either way FA4 is not in use, so nothing to warm up.
+    try:
+        backend_cls = get_mla_prefill_backend(aphrodite_config)
+    except ValueError:
+        return
     if backend_cls.get_name() != "FLASH_ATTN":
         return
 
