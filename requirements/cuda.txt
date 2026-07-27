@@ -35,3 +35,6 @@ tokenspeed-mla==0.1.8; platform_system == "Linux"
 
 # Humming kernels for quantization gemm
 humming-kernels[cu13]==0.1.10
+
+# make sure humming-kernels[cu13] doesn't pull in an unexpected nvcc/cccl
+cuda-toolkit[nvcc,cccl]
