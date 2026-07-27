@@ -282,16 +282,14 @@ class TestRenderPrompt:
 
         with pytest.raises(
             ValueError,
-            match="maximum context length is",
+            match="contains 150 input tokens",
         ):
             renderer.tokenize_prompts(
                 prompts,
                 TokenizeParams(max_total_tokens=100),
             )
 
-        # Should only tokenize the first max_total_tokens + 1 tokens
-        assert renderer.tokenizer._captured_encode_kwargs["truncation"] is True
-        assert renderer.tokenizer._captured_encode_kwargs["max_length"] == 101
+        assert renderer.tokenizer._captured_encode_kwargs["truncation"] is False
 
     def test_token_max_length_exceeded(self):
         renderer = _build_renderer(MockModelConfig())

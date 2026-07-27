@@ -212,7 +212,7 @@ class TokenizeParams:
             raise APHRODITEValidationError(
                 f"{self.max_output_tokens_param}={max_output_tokens} "
                 f"cannot be greater than "
-                f"{self.max_total_tokens_param}={max_total_tokens=}. "
+                f"{self.max_total_tokens_param}={max_total_tokens}. "
                 f"Please request fewer output tokens.",
                 parameter=self.max_output_tokens_param,
                 value=max_output_tokens,
@@ -284,10 +284,11 @@ class TokenizeParams:
         max_length = self.truncate_prompt_tokens
         if max_length is not None and max_length < 0:
             max_length = self.max_input_tokens
-        elif max_length is None and self.max_input_tokens is not None:
-            # This prevents tokenization from taking up more resources than necessary
-            # while still failing `self._token_len_check` as expected by users
-            max_length = self.max_input_tokens + 1
+
+        # Every tokenizer I've tested truncates AFTER doing the tokenization work
+        # so if no one's asking for it, don't do it. We can make use of the
+        # token count being accurate if we need to emit any errors later.
+        # Consult `test_encode_truncation_cost.py`.
 
         # Explicit truncation-side overrides require the full token sequence
         # so we can slice from the requested side in _token_truncation.
@@ -406,17 +407,13 @@ class TokenizeParams:
 
         if len(tokens) > max_input_tokens:
             token_count = len(tokens)
-            # The tokenizer may have truncated the prompt to
-            # max_input_tokens + 1 (see get_encode_kwargs), so the
-            # actual prompt length could be larger.
-            qualifier = "at least " if token_count == max_input_tokens + 1 else ""
             total = token_count + self.max_output_tokens
             raise APHRODITEValidationError(
                 f"This model's maximum context length is "
                 f"{self.max_total_tokens} tokens. However, you requested "
                 f"{self.max_output_tokens} output tokens and your prompt "
-                f"contains {qualifier}{token_count} input tokens, "
-                f"for a total of {qualifier}{total} tokens. "
+                f"contains {token_count} input tokens, "
+                f"for a total of {total} tokens. "
                 f"Please reduce the length of the input prompt or the "
                 f"number of requested output tokens.",
                 parameter="input_tokens",
