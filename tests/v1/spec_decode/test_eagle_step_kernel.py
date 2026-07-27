@@ -38,9 +38,7 @@ def _reference_eagle_step_slot_mapping(
     slot_mapping = block_ids * block_size + (clamped_positions % block_size)
     is_padding = seq_lens == 0
     clamped_positions = torch.where(is_padding, torch.zeros_like(clamped_positions), clamped_positions)
-    slot_mapping = torch.where(
-        exceeds_max | is_padding, torch.full_like(slot_mapping, PADDING_SLOT_ID), slot_mapping
-    )
+    slot_mapping = torch.where(exceeds_max | is_padding, torch.full_like(slot_mapping, PADDING_SLOT_ID), slot_mapping)
     new_seq_lens = torch.where(exceeds_max, torch.ones_like(seq_lens), seq_lens + 1)
     new_seq_lens = torch.where(is_padding, seq_lens, new_seq_lens)
     new_seq_lens = new_seq_lens.clamp(max=max_model_len)
