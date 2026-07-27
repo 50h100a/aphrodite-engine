@@ -151,8 +151,12 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND QUTLASS_ARCHS)
   # QuTLASS uses legacy ATen headers and cannot be built with
   # TORCH_TARGET_VERSION. QUTLASS_DISABLE_PYBIND drops its pybind module so it
   # registers only via TORCH_LIBRARY (torch.ops._qutlass_C).
+  # USE_CUDA is needed to use cuda APIs from the C-shim: common.h calls
+  # aoti_torch_get_current_cuda_stream(), which shim.h only declares under
+  # #ifdef USE_CUDA.
   target_compile_definitions(_qutlass_C PRIVATE
     QUTLASS_DISABLE_PYBIND=1
+    USE_CUDA
     TARGET_CUDA_ARCH=${QUTLASS_TARGET_CC}
     CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 
