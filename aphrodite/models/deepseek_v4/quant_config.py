@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from aphrodite.config import get_current_aphrodite_config
@@ -19,6 +20,29 @@ from aphrodite.model_executor.layers.quantization.utils.quant_utils import (
 )
 
 _DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8")
+
+_LAYER_IDX_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+
+def _is_mtp_block(prefix: str) -> bool:
+    """True if ``prefix`` belongs to the MTP draft block.
+
+    ``DeepSeekV4MultiTokenPredictor`` reuses the main decoder-layer classes and
+    hands them the prefix ``model.layers.{num_hidden_layers + i}``, so the layer
+    index is the only thing that distinguishes draft modules from target ones.
+    The ``mtp_block`` attribute is inserted into weight names only, unfortunately.
+    """
+    match = _LAYER_IDX_RE.search(prefix)
+    if match is None:
+        return False
+    try:
+        num_hidden_layers = get_current_aphrodite_config().model_config.hf_config.num_hidden_layers
+    except Exception:
+        # No current config (e.g. constructed during AphroditeConfig setup);
+        # the caller re-dispatches later once the config is active.
+        return False
+    return int(match.group(1)) >= num_hidden_layers
+
 
 if TYPE_CHECKING:
     from aphrodite.model_executor.layers.quantization.modelopt import (
@@ -120,7 +144,10 @@ class DeepseekV4FP8Config(Fp8Config):
         if not (isinstance(hf_quant_cfg, dict) and hf_quant_cfg.get("quant_method") in ("fp8", "deepseek_v4_fp8")):
             return None
         model_type = getattr(hf_config, "model_type", None)
-        if model_type == "deepseek_v4" or user_quant == "deepseek_v4_fp8":
+        is_v4_mtp_draft = model_type == "deepseek_mtp" and "DeepSeekV4MTPModel" in (
+            getattr(hf_config, "architectures", None) or []
+        )
+        if model_type == "deepseek_v4" or is_v4_mtp_draft or user_quant == "deepseek_v4_fp8":
             return "deepseek_v4_fp8"
         return None
 
@@ -133,7 +160,7 @@ class DeepseekV4FP8Config(Fp8Config):
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.expert_dtype == "fp4":
-                if self.moe_quant_algo == "NVFP4":
+                if self.moe_quant_algo == "NVFP4" and not _is_mtp_block(prefix):
                     from aphrodite.model_executor.layers.quantization.modelopt import (
                         ModelOptNvFp4FusedMoE,
                     )
@@ -150,4 +177,5 @@ class DeepseekV4FP8Config(Fp8Config):
     def is_mxfp4_quant(self, prefix, layer):
         if not isinstance(layer, RoutedExperts) or self.expert_dtype != "fp4":
             return False
-        return self.moe_quant_algo != "NVFP4"
+        # Kept in lockstep with the MTP-block carve-out in get_quant_method.
+        return self.moe_quant_algo != "NVFP4" or _is_mtp_block(prefix)
