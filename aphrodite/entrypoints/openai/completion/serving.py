@@ -4,7 +4,7 @@
 import asyncio
 import io
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator
 from collections.abc import Sequence as GenericSequence
 from typing import cast
 
@@ -278,7 +278,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
         self,
         request: CompletionRequest,
         engine_inputs: list[EngineInput],
-        result_generator: AsyncIterator[tuple[int, RequestOutput]],
+        result_generator: AsyncGenerator[tuple[int, RequestOutput]],
         request_id: str,
         created_time: int,
         model_name: str,
@@ -396,7 +396,15 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     else:
                         logprobs = None
 
-                    previous_text_lens[i] += len(output.text)
+                    # Advance the text_offset cursor by the decoded length of
+                    # the tokens we just described, NOT by len(output.text).
+                    # When stop strings are in play the detokenizer holds back
+                    # up to max(len(stop)) - 1 trailing chars and can emit empty
+                    # deltas.
+                    if logprobs is not None:
+                        previous_text_lens[i] += sum(len(t) for t in logprobs.tokens)
+                    else:
+                        previous_text_lens[i] += len(output.text)
                     previous_num_tokens[i] += len(output.token_ids)
                     finish_reason = output.finish_reason
                     stop_reason = output.stop_reason

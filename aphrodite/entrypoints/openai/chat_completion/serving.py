@@ -403,7 +403,7 @@ class OpenAIServingChat(GenerateBaseServing):
     async def chat_completion_stream_generator(
         self,
         request: ChatCompletionRequest,
-        result_generator: AsyncIterator[RequestOutput],
+        result_generator: AsyncGenerator[RequestOutput],
         request_id: str,
         model_name: str,
         conversation: list[ConversationMessage],
@@ -431,6 +431,12 @@ class OpenAIServingChat(GenerateBaseServing):
             tool_choice_function_name = None
 
         previous_texts = [""] * num_choices
+        # Logprobs awaiting release, as (entry, decoded char length), paired
+        # with the number of chars of raw output text already accounted for by
+        # released entries. A token's logprobs are held until its text has
+        # actually been streamed -- see the withholding block below.
+        pending_logprobs: list[list[tuple[ChatCompletionLogProbsContent, int]]] = [[] for _ in range(num_choices)]
+        released_chars = [0] * num_choices
 
         try:
             if self.parser_cls is not None:
@@ -637,6 +643,15 @@ class OpenAIServingChat(GenerateBaseServing):
                     if hide_stream_metadata:
                         logprobs = None
 
+                    # Withhold this step's logprobs until the corresponding text
+                    # has actually been streamed. The detokenizer holds back up
+                    # to max(len(stop)) - 1 trailing chars for stop-string
+                    # matching.
+                    if logprobs is not None and logprobs.content:
+                        lengths = self._decoded_token_lengths(output.token_ids, output.logprobs, tokenizer)
+                        pending_logprobs[i].extend(zip(logprobs.content, lengths))
+                        logprobs = None
+
                     if delta_message is None:
                         # NOTE: If return_token_ids is enabled, we still need to
                         # send a chunk with token_ids even if delta_message is None
@@ -644,6 +659,26 @@ class OpenAIServingChat(GenerateBaseServing):
                         if output.finish_reason is None and (not request.return_token_ids or hide_stream_metadata):
                             continue
                         delta_message = DeltaMessage()
+
+                    # Release the logprob entries the streamed text now covers,
+                    # and flush whatever is left on the final chunk. The flush is
+                    # unconditional, including withheld tokens from incremental
+                    # detokenization, like unicode.
+                    if pending_logprobs[i]:
+                        flush = output.finish_reason is not None
+                        emitted = len(previous_texts[i])
+                        covered = released_chars[i]
+                        n = 0
+                        for _entry, length in pending_logprobs[i]:
+                            if not flush and covered + length > emitted:
+                                break
+                            covered += length
+                            n += 1
+                        if n:
+                            released = [entry for entry, _ in pending_logprobs[i][:n]]
+                            del pending_logprobs[i][:n]
+                            released_chars[i] = covered
+                            logprobs = ChatCompletionLogProbs(content=released)
 
                     # Log streaming delta if output logging is enabled
                     if self.enable_log_outputs and self.request_logger:
@@ -754,6 +789,18 @@ class OpenAIServingChat(GenerateBaseServing):
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
 
+            # The terminal chunk flushes unconditionally, so anything still
+            # queued here means an index finished without one...
+            for idx, still_pending in enumerate(pending_logprobs):
+                if still_pending:
+                    logger.warning(
+                        "Request %s choice %d ended with %d logprob entries "
+                        "never released; they are missing from the stream.",
+                        request_id,
+                        idx,
+                        len(still_pending),
+                    )
+
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage. Compact mode carries its counts inline
             # and deliberately emits no trailing usage chunk.
@@ -831,7 +878,7 @@ class OpenAIServingChat(GenerateBaseServing):
     async def chat_completion_full_generator(
         self,
         request: ChatCompletionRequest,
-        result_generator: AsyncIterator[RequestOutput],
+        result_generator: AsyncGenerator[RequestOutput],
         request_id: str,
         model_name: str,
         conversation: list[ConversationMessage],
@@ -1103,6 +1150,31 @@ class OpenAIServingChat(GenerateBaseServing):
             for i, p in enumerate(logprobs.items())
             if return_all or top_logprobs == -1 or (top_logprobs is not None and i < top_logprobs)
         ]
+
+    @staticmethod
+    def _decoded_token_lengths(
+        token_ids: GenericSequence[int],
+        top_logprobs: GenericSequence[dict[int, Logprob] | None],
+        tokenizer: TokenizerLike | None,
+    ) -> list[int]:
+        """Chars each token contributes to the detokenized output text.
+
+        Deliberately independent of ``return_tokens_as_token_ids``, which
+        renders ``token`` as an id placeholder whose length says nothing about
+        the text. Used to decide when a token's text has been streamed and its
+        logprobs may be released.
+        """
+        lengths: list[int] = []
+        for i, token_id in enumerate(token_ids):
+            step_top_logprobs = top_logprobs[i]
+            step_token = None if step_top_logprobs is None else step_top_logprobs.get(token_id)
+            if step_token is not None and step_token.decoded_token is not None:
+                lengths.append(len(step_token.decoded_token))
+            elif tokenizer is not None:
+                lengths.append(len(tokenizer.decode(token_id)))
+            else:
+                lengths.append(0)
+        return lengths
 
     def _create_chat_logprobs(
         self,
