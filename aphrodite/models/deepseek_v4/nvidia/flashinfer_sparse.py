@@ -587,7 +587,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         swa_only: bool,
     ) -> None:
         num_decode_tokens = swa_metadata.num_decode_tokens
-        if swa_metadata.num_prefills > 0:
+        if swa_metadata.num_prefill_tokens > 0:
             self._forward_prefill(
                 q=q[num_decode_tokens:],
                 compressed_k_cache=self_kv_cache,
@@ -805,6 +805,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             )
 
             q_chunk = q[query_start:query_end]
+            if q_chunk.shape[0] == 0:
+                continue  # Don't spook FlashInfer with an empty slice.
             swa_indices_chunk = swa_metadata.prefill_swa_indices[query_start:query_end]
             swa_lens_chunk = swa_metadata.prefill_swa_lens[query_start:query_end]
             if extra_kv_paged is not None and extra_sparse_indices_chunk is None:
