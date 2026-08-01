@@ -16,8 +16,8 @@ import pytest
 from transformers import AutoTokenizer
 
 from aphrodite.renderers import TokenizeParams
-from aphrodite.tokenizers.deepseek_v32 import DeepseekV32Tokenizer
 from aphrodite.tokenizers.deepseek_v4 import DeepseekV4Tokenizer
+from aphrodite.tokenizers.deepseek_v32 import DeepseekV32Tokenizer
 from aphrodite.tokenizers.kimi_audio import KimiAudioTokenizer
 from aphrodite.tokenizers.mistral import MistralTokenizer
 
@@ -44,8 +44,9 @@ _REPEATS = 3
 
 # Truncate at 1/_TRUNC_FRACTION the actual count, and then expect the tokenizer
 # to run in less than 1/_MINIMUM_SPEEDUP the time.
-_TRUNC_FRACTION = 8  
+_TRUNC_FRACTION = 8
 _MINIMUM_SPEEDUP = 2
+
 
 def _best_encode_time(tokenizer, **encode_kwargs) -> tuple[float, int]:
     """Tokenize a few times and take the fastest one"""
@@ -89,7 +90,7 @@ def test_standard_tokenizer_truncation_saves_no_work(model: str):
 
 
 @pytest.mark.parametrize("tokenizer_cls,model", NONSTANDARD_TOKENIZERS)
-def test_aphrodite_tokenizer_truncation_saves_no_work(tokenizer_cls: type, model: str):
+def test_aphrodite_tokenizer_truncation_saves_no_work(tokenizer_cls, model: str):
     try:
         tokenizer = tokenizer_cls.from_pretrained(model)
     except Exception as exc:  # offline, gated repo, missing optional dep, ...
