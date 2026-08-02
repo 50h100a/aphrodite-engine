@@ -150,6 +150,9 @@ class XgrammarGrammar(StructuredOutputGrammar):
                 )
                 return False
             self.num_processed_tokens += 1
+            if self.matcher.is_terminated():
+                # Specdec may emit EOS and then some. Stop before then.
+                break
         self._is_terminated = self.matcher.is_terminated()
         return True
 
@@ -159,11 +162,15 @@ class XgrammarGrammar(StructuredOutputGrammar):
 
         Returns the prefix list of tokens that are accepted by the FSM.
         """
+        if self._is_terminated:
+            return []
         accepted_tokens = []
         for token in tokens:
-            if self.matcher.accept_token(token):
-                accepted_tokens.append(token)
-            else:
+            if not self.matcher.accept_token(token):
+                break
+            accepted_tokens.append(token)
+            if self.matcher.is_terminated():
+                # stop probing a finished matcher
                 break
         if len(accepted_tokens) > 0:
             # Rollback the FSM to the initial state

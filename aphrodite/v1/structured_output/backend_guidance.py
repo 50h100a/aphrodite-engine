@@ -156,6 +156,8 @@ class GuidanceGrammar(StructuredOutputGrammar):
             if self.ll_matcher.is_stopped() and not self.terminated:
                 self.rollback_lag = 1
             self.terminated = True
+            # Specdec may emit EOS and then some. Stop before then.
+            tokens = tokens[: tokens.index(self.ll_tokenizer.eos_token) + 1]
 
         if self.ll_matcher.is_stopped():
             return True
