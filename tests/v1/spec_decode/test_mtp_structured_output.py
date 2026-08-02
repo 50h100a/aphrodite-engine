@@ -47,6 +47,34 @@ def _make_manager_and_request(backend: str, prompt_str: str = '{"a": "b"}'):
 
 
 @pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
+def test_accept_tokens_stops_at_grammar_termination(backend):
+    """A committed chunk can continue past the token that ends the grammar.
+
+    Under speculative decoding a step commits several tokens at once, so the
+    grammar's stop token is usually not the last one in the chunk -- EOS follows
+    it. Everything after termination must be left alone: xgrammar's matcher
+    warns once per token ("The matcher has terminated after accepting the stop
+    token, but is trying to accept new token with id ...") when it is pushed
+    past its end state, which floods the log on every structured request.
+    """
+    tokenizer, manager, request, prompt = _make_manager_and_request(backend)
+    grammar = request.structured_output_request.grammar
+    eos = tokenizer.eos_token_id
+    trailing = tokenizer.encode(" ")[0]
+
+    assert grammar.accept_tokens(request.request_id, [*prompt, eos, trailing, trailing])
+    assert grammar.is_terminated()
+
+    # Nothing is grammar-valid past the end of the grammar, so a draft arriving
+    # in the same window as the stop token must not be probed either.
+    assert grammar.validate_tokens([trailing]) == []
+
+    if backend == "xgrammar":
+        # The two trailing tokens were not consumed: the matcher stopped at EOS.
+        assert grammar.num_processed_tokens == len(prompt) + 1
+
+
+@pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
 def test_bitmask_with_padded_invalid_drafts(backend):
     """Bitmask handles -1 padded drafts and returns N+1 rows."""
     tokenizer, manager, request, prompt = _make_manager_and_request(backend, prompt_str='{"a"')
@@ -262,6 +290,17 @@ class _MarkerReasoner:
         return self.marker in list(delta_ids)
 
 
+def _setup_json_boundary_request(backend: str):
+    """Request with a plain JSON key and reasoning not yet ended."""
+    tokenizer, manager, request, prompt = _make_manager_and_request(backend)
+    marker = tokenizer.encode("\n")[0]
+    structured_req = request.structured_output_request
+    manager.reasoner_cls = _MarkerReasoner
+    structured_req.reasoner = _MarkerReasoner(marker)
+    structured_req.reasoning_ended = False
+    return tokenizer, manager, request, prompt, marker
+
+
 def _setup_boundary_request(backend: str):
     """Request with a structural-tag key and reasoning not yet ended."""
     from aphrodite.v1.structured_output.backend_types import StructuredOutputOptions
@@ -282,6 +321,41 @@ def _setup_boundary_request(backend: str):
     return tokenizer, manager, request, prompt, marker
 
 
+@pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
+def test_json_grammar_advances_past_reasoning_end_in_spec_window(backend):
+    """A spec window that ends reasoning must still commit its grammar content.
+
+    The window is [reasoning, marker, "{"]. Deferring the whole step -- correct
+    when a step is one token, since then the marker *is* the step -- drops that
+    "{" from the matcher for good. The matcher then sits at the JSON root while
+    the model has already opened the object, so the bitmask forces a second "{"
+    and the following accept_tokens fails with "Failed to advance FSM".
+    """
+    tokenizer, manager, request, _prompt, marker = _setup_json_boundary_request(backend)
+    grammar = request.structured_output_request.grammar
+
+    pre = tokenizer.encode(" ")[0]
+    open_brace = tokenizer.encode("{")[0]
+    step_tokens = [pre, marker, open_brace]
+    request.append_output_token_ids(step_tokens)
+    # Steady-state decode invariant: the rejection adjustment in
+    # update_from_output() keeps num_computed_tokens at len(all_token_ids) - 1
+    # however many tokens the step accepted, so deriving the step boundary from
+    # it would scan the final token only and miss the marker entirely.
+    request.num_computed_tokens = len(request.all_token_ids) - 1
+
+    assert manager.should_advance(request, step_tokens)
+    advance = manager.trim_reasoning_for_advance(request, list(step_tokens))
+    assert advance == [open_brace]
+    assert grammar.accept_tokens(request.request_id, advance)
+
+    # The matcher is inside the object now, so a key may start. Had the "{"
+    # been dropped it would still be at the root, where only "{" is legal.
+    quote = tokenizer.encode('"')[0]
+    assert grammar.validate_tokens([quote]) == [quote]
+    assert grammar.validate_tokens([open_brace]) == []
+
+
 def test_should_advance_records_reasoning_end_index():
     """The boundary step must record where reasoning ends."""
     tokenizer, manager, request, prompt, marker = _setup_boundary_request("xgrammar")
@@ -289,9 +363,11 @@ def test_should_advance_records_reasoning_end_index():
 
     pre = tokenizer.encode(" ")[0]
     post = tokenizer.encode("{")[0]
-    request.append_output_token_ids([pre, marker, post])
+    step_tokens = [pre, marker, post]
+    request.append_output_token_ids(step_tokens)
+    request.num_computed_tokens = len(request.all_token_ids) - 1
 
-    assert manager.should_advance(request)
+    assert manager.should_advance(request, step_tokens)
     assert structured_req.reasoning_ended
     assert structured_req.reasoning_end_token_index == len(prompt) + 1
 
@@ -308,7 +384,8 @@ def test_trim_reasoning_for_advance():
 
     step_tokens = [pre, marker, post]
     request.append_output_token_ids(step_tokens)
-    assert manager.should_advance(request)
+    request.num_computed_tokens = len(request.all_token_ids) - 1
+    assert manager.should_advance(request, step_tokens)
     assert manager.trim_reasoning_for_advance(request, step_tokens) == [post]
 
     structured_req.reasoning_end_token_index = len(request.all_token_ids) - 1

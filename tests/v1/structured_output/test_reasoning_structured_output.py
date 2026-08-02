@@ -174,19 +174,23 @@ class TestReasoningStructuredOutput:
         manager_with_reasoner,
         mock_request_with_structured_output,
     ):
-        """Test should_advance when reasoning ends in current step."""
-        # Set reasoning as not ended initially, but ends in this step
-        (mock_request_with_structured_output.structured_output_request).reasoning_ended = False
+        """Test should_advance when reasoning ends in current step.
+
+        There may be specdec-emitted content between here and there.
+        """
+        structured_req = mock_request_with_structured_output.structured_output_request
+        structured_req.reasoning_ended = False
         reasoner = MockReasoner(tokenizer=Mock())
         reasoner.is_reasoning_end_streaming.return_value = True
-        structured_req = mock_request_with_structured_output.structured_output_request
         structured_req.reasoner = reasoner
 
         result = manager_with_reasoner.should_advance(mock_request_with_structured_output)
 
-        # Should set reasoning_ended to True but return False for this step
-        assert mock_request_with_structured_output.structured_output_request.reasoning_ended is True
-        assert result is False
+        assert structured_req.reasoning_ended is True
+        assert result is True
+        # start == num_computed_tokens - num_output_placeholders == 5, and the
+        # mocked reasoner reports the end on the first token scanned.
+        assert structured_req.reasoning_end_token_index == 5
 
     def test_should_advance_reasoning_just_ended_with_spec_decode_structural_tag(
         self,

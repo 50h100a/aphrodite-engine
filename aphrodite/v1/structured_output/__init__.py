@@ -15,7 +15,6 @@ from aphrodite.v1.structured_output.backend_guidance import GuidanceBackend
 from aphrodite.v1.structured_output.backend_types import (
     StructuredOutputBackend,
     StructuredOutputGrammar,
-    StructuredOutputOptions,
 )
 from aphrodite.v1.structured_output.backend_xgrammar import XgrammarBackend
 
@@ -281,11 +280,19 @@ class StructuredOutputManager:
                             advance_grammar = False
                             post_reasoning_end_in_window = True
                     if advance_grammar and not grammar.is_terminated():
-                        accepted = grammar.accept_tokens(req_id, [token])
+                        if post_reasoning_end_in_window:
+                            # Drafts were proposed before the bitmask constrained
+                            # this window, so a mismatch is expected. Probe with
+                            # validate_tokens to get us up to speed.
+                            accepted = grammar.validate_tokens([token]) == [token]
+                            if accepted:
+                                grammar.accept_tokens(req_id, [token])
+                        else:
+                            accepted = grammar.accept_tokens(req_id, [token])
+                            if not accepted:
+                                raise AssertionError((token, req_id, scheduled_spec_decode_tokens))
                         if accepted:
                             state_advancements += 1
-                        elif not post_reasoning_end_in_window:
-                            raise AssertionError((token, req_id, scheduled_spec_decode_tokens))
                     cumulative_index += 1
                 # Diffusion LLMs don't sample a bonus token after the
                 # scheduled positions, so skip its bitmask in that case.
@@ -335,7 +342,12 @@ class StructuredOutputManager:
             return request.structured_output_request.reasoning_ended
         return True
 
-    def should_advance(self, request: "Request") -> bool:
+    def should_advance(self, request: "Request", new_token_ids: Sequence[int] | None = None) -> bool:
+        """Whether this step's tokens (`new_token_ids`) should advance the grammar.
+
+        `new_token_ids` is for finding the reasoning-end marker so the FSM does
+        not later skip emitted tokens.
+        """
         if not request.use_structured_output:
             return False
 
@@ -358,34 +370,34 @@ class StructuredOutputManager:
         if structured_req.reasoning_ended:
             return True
 
-        # Check if reasoning ends in *this* step
-        delta_from = request.num_computed_tokens - request.num_output_placeholders
+        # Check if reasoning ends in *this* step.
         all_token_ids = request.all_token_ids
-        start = delta_from if delta_from >= 0 else max(len(all_token_ids) + delta_from, 0)
+        start = self._step_start_index(request, new_token_ids)
         if reasoner.is_reasoning_end_streaming(all_token_ids, itertools.islice(all_token_ids, start, None)):
             structured_req.reasoning_ended = True
 
-            # Reasoning just ended this step. Defer FSM advance until the next
-            # pass (see reasoning_ended check above) for JSON/regex/choice/grammar:
-            # advancing on the closing boundary token can accept tokens that still
-            # belong to the reasoning stream. Structural tags are the only safe
-            # same-step exception: they model phased output (e.g. thinking tag ->
-            # answer tag), and speculative decoding must run grammar.validate_tokens
-            # on draft tokens produced immediately after that transition.
-            if (
-                self.aphrodite_config.speculative_config is not None
-                and structured_req.structured_output_key[0] == StructuredOutputOptions.STRUCTURAL_TAG
-            ):
-                # The scheduler will advance the grammar with this step's
-                # tokens right away, but the step still contains reasoning
-                # content up to and including the end marker. Record where
-                # it ends so trim_reasoning_for_advance() can drop it.
-                structured_req.reasoning_end_token_index = self._find_reasoning_end_index(
-                    reasoner, all_token_ids, start
-                )
-                return True
+            # Reasoning ended somewhere inside this step. Count be one token,
+            # could be 1+specdec tokens. Who know's what's in there, could be
+            # reasoning, end markers, formatted content, or all of the above.
+            # Keep track of the marker so trim_reasoning_for_advance() can keep
+            # the FSM up to date with the stream.
+            structured_req.reasoning_end_token_index = self._find_reasoning_end_index(reasoner, all_token_ids, start)
+            return True
 
         return False
+
+    @staticmethod
+    def _step_start_index(request: "Request", new_token_ids: Sequence[int] | None) -> int:
+        """Index in `request.all_token_ids` where this step's output begins.
+
+        With `new_token_ids` this is exact, and matches the `first_idx` that
+        trim_reasoning_for_advance() computes, so the two agree by construction.
+        """
+        all_token_ids = request.all_token_ids
+        if new_token_ids is not None:
+            return max(len(all_token_ids) - len(new_token_ids), 0)
+        delta_from = request.num_computed_tokens - request.num_output_placeholders
+        return delta_from if delta_from >= 0 else max(len(all_token_ids) + delta_from, 0)
 
     @staticmethod
     def _find_reasoning_end_index(reasoner: "ReasoningParser", all_token_ids: Sequence[int], start: int) -> int:
