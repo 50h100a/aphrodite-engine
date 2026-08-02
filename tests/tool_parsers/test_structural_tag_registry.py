@@ -353,7 +353,7 @@ def test_constrain_auto_tool_calls_still_skips_tool_choice_none(
     sample_tools: list[ChatCompletionToolsParam],
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """"none" means no call at all, so there is nothing to constrain."""
+    """ "none" means no call at all, so there is nothing to constrain."""
     monkeypatch.setattr(envs, "APHRODITE_CONSTRAIN_AUTO_TOOL_CALLS", True)
 
     tag = get_model_structural_tag(

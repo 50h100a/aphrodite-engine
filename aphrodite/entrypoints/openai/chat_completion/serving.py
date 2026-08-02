@@ -4,7 +4,7 @@
 import asyncio
 import io
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
 from typing import Any, Final, cast
@@ -1005,7 +1005,8 @@ class OpenAIServingChat(GenerateBaseServing):
             # "tool_calls" for "auto" or "required" tool calls,
             # and "stop" for named tool calls. "length" outranks both.
             is_finish_reason_tool_calls = output.finish_reason != "length" and (
-                auto_tools_called or (request.tool_choice and request.tool_choice == "required" and output.finish_reason == "stop")
+                auto_tools_called
+                or (request.tool_choice and request.tool_choice == "required" and output.finish_reason == "stop")
             )
 
             # Encode routed_experts for transport. JSON can't carry raw
