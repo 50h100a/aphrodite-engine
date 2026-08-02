@@ -728,10 +728,10 @@ class OpenAIServingChat(GenerateBaseServing):
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
-                        # finish_reason is:
-                        # "tool_calls" for "auto" or "required" tool calls,
-                        # and "stop" for named tool calls.
-                        if tools_streamed[i] and not tool_choice_function_name:
+                        # finish_reason is "tool_calls" for "auto" or "required"
+                        # tool calls, and "stop" for named tool calls.
+                        # But "length" outranks both.
+                        if tools_streamed[i] and not tool_choice_function_name and output.finish_reason != "length":
                             finish_reason_ = "tool_calls"
                         else:
                             finish_reason_ = output.finish_reason if output.finish_reason else "stop"
@@ -1003,9 +1003,9 @@ class OpenAIServingChat(GenerateBaseServing):
                 message = ChatMessage(role=role, reasoning=reasoning, content=content)
             # In OpenAI's API, when a tool is called, the finish_reason is:
             # "tool_calls" for "auto" or "required" tool calls,
-            # and "stop" for named tool calls.
-            is_finish_reason_tool_calls = auto_tools_called or (
-                request.tool_choice and request.tool_choice == "required" and output.finish_reason == "stop"
+            # and "stop" for named tool calls. "length" outranks both.
+            is_finish_reason_tool_calls = output.finish_reason != "length" and (
+                auto_tools_called or (request.tool_choice and request.tool_choice == "required" and output.finish_reason == "stop")
             )
 
             # Encode routed_experts for transport. JSON can't carry raw
