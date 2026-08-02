@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 from xgrammar import StructuralTag
 
+import aphrodite.envs as envs
 from aphrodite.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedFunction,
     ChatCompletionNamedToolChoiceParam,
@@ -327,6 +328,91 @@ def test_auto_tool_choice_skips_structural_tag_without_strict(
     )
 
     assert tag is None
+
+
+@pytest.mark.parametrize("model", sorted(XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS))
+def test_constrain_auto_tool_calls_builds_tag_without_strict(
+    model: str,
+    sample_tools: list[ChatCompletionToolsParam],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The operator override constrains "auto" that no client opted into."""
+    monkeypatch.setattr(envs, "APHRODITE_CONSTRAIN_AUTO_TOOL_CALLS", True)
+
+    tag = get_model_structural_tag(
+        model=model,
+        tools=sample_tools,
+        tool_choice="auto",
+        reasoning=False,
+    )
+
+    assert isinstance(tag, StructuralTag)
+
+
+def test_constrain_auto_tool_calls_still_skips_tool_choice_none(
+    sample_tools: list[ChatCompletionToolsParam],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """"none" means no call at all, so there is nothing to constrain."""
+    monkeypatch.setattr(envs, "APHRODITE_CONSTRAIN_AUTO_TOOL_CALLS", True)
+
+    tag = get_model_structural_tag(
+        model="deepseek_v4",
+        tools=sample_tools,
+        tool_choice="none",
+        reasoning=False,
+    )
+
+    assert tag is None
+
+
+def test_freeform_object_parameter_is_opened_for_xgrammar(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A bare ``{"type": "object"}`` compiles to a value the model can only
+    leave empty, so it is handed to xgrammar with its implied default written
+    out. An object that declares properties stays closed -- that closure is what
+    rejects an undeclared key."""
+    captured: list[list[dict]] = []
+
+    def fake_get_xgrammar_model_structural_tag(*, tools: list[dict], **kwargs):
+        captured.append(tools)
+        return None
+
+    monkeypatch.setattr(
+        "aphrodite.tool_parsers.structural_tag_registry.get_xgrammar_model_structural_tag",
+        fake_get_xgrammar_model_structural_tag,
+    )
+
+    params = {
+        "type": "object",
+        "properties": {
+            "meta": {"type": "object"},
+            "closed": {"type": "object", "properties": {"a": {"type": "string"}}},
+            "opted_out": {"type": "object", "additionalProperties": False},
+        },
+        "required": ["meta"],
+    }
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={"name": "blob", "strict": True, "parameters": params},
+        )
+    ]
+
+    get_model_structural_tag(
+        model="deepseek_v4",
+        tools=tools,
+        tool_choice="auto",
+        reasoning=False,
+    )
+
+    sent = captured[0][0]["function"]["parameters"]["properties"]
+    assert sent["meta"]["additionalProperties"] is True
+    assert "additionalProperties" not in sent["closed"]
+    assert sent["opted_out"]["additionalProperties"] is False
+    # The request's own schema is never mutated on the way through.
+    assert params["properties"]["meta"] == {"type": "object"}
 
 
 def test_get_function_parameters_relaxes_function_strict_false():

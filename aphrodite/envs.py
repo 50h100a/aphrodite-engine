@@ -220,6 +220,7 @@ if TYPE_CHECKING:
     APHRODITE_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
     APHRODITE_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
     APHRODITE_ENFORCE_STRICT_TOOL_CALLING: bool = True
+    APHRODITE_CONSTRAIN_AUTO_TOOL_CALLS: bool = False
     APHRODITE_MQ_MAX_CHUNK_BYTES_MB: int = 16
     APHRODITE_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300
     APHRODITE_WORKER_SHUTDOWN_TIMEOUT_SECONDS: int = 5
@@ -1466,6 +1467,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enforce function parameter schemas in structural-tag based tool calling.
     "APHRODITE_ENFORCE_STRICT_TOOL_CALLING": lambda: (
         os.getenv("APHRODITE_ENFORCE_STRICT_TOOL_CALLING", "True").lower() in ("true", "1")
+    ),
+    # Constrain tool_choice="auto" calls to the tool schema as well, instead of
+    # only those a client opted into with function.strict.
+    "APHRODITE_CONSTRAIN_AUTO_TOOL_CALLS": lambda: (
+        os.getenv("APHRODITE_CONSTRAIN_AUTO_TOOL_CALLS", "False").lower() in ("true", "1")
     ),
     # Control the max chunk bytes (in MB) for the rpc message queue.
     # Object larger than this threshold will be broadcast to worker

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 from collections.abc import Callable, Sequence
 from typing import Any, Literal, TypeAlias
 
@@ -25,10 +26,12 @@ from xgrammar.structural_tag import (
     TriggeredTagsFormat,
 )
 
+import aphrodite.envs as envs
 from aphrodite.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionToolsParam,
 )
+from aphrodite.v1.structured_output.schema_features import iter_schema_nodes
 
 ToolChoice: TypeAlias = (
     Literal["none", "auto", "required"] | ChatCompletionNamedToolChoiceParam | ResponsesToolChoice | None
@@ -101,7 +104,7 @@ def get_model_structural_tag(
     if not tools or tool_choice == "none":
         return None
 
-    if tool_choice == "auto" and not _any_tool_strict(tools):
+    if tool_choice == "auto" and not _any_tool_strict(tools) and not envs.APHRODITE_CONSTRAIN_AUTO_TOOL_CALLS:
         return None
 
     dumped_tools = [_dump_tool_for_xgrammar(tool) for tool in tools]
@@ -131,6 +134,21 @@ def get_model_structural_tag(
     )
 
 
+def _open_freeform_objects(schema: Any) -> Any:
+    """Bare object nodes must have `additionalProperties: true`, otherwise
+    the guidance mistakenly forces them to be an empty `{}`.
+    """
+    if not isinstance(schema, dict):
+        return schema
+    schema = copy.deepcopy(schema)
+    # Materialised first: iter_schema_nodes walks each node's items(), and
+    # inserting a key into a node mid-walk would invalidate that iterator.
+    for node in list(iter_schema_nodes(schema)):
+        if node.get("type") == "object" and "additionalProperties" not in node and not node.get("properties"):
+            node["additionalProperties"] = True
+    return schema
+
+
 def _dump_tool_for_xgrammar(
     tool: ChatCompletionToolsParam | ResponsesTool,
 ) -> dict[str, Any]:
@@ -141,14 +159,17 @@ def _dump_tool_for_xgrammar(
         if tool.description is not None:
             function["description"] = tool.description
         if tool.parameters is not None:
-            function["parameters"] = tool.parameters
+            function["parameters"] = _open_freeform_objects(tool.parameters)
         if tool.strict is not None:
             function["strict"] = tool.strict
         return {"type": "function", "function": function}
     dumped_tool = tool.model_dump(mode="json", exclude_none=True)
-    if isinstance(tool, ChatCompletionToolsParam):
-        return dumped_tool
-    return dict(dumped_tool)
+    if not isinstance(tool, ChatCompletionToolsParam):
+        dumped_tool = dict(dumped_tool)
+    dumped_function = dumped_tool.get("function")
+    if isinstance(dumped_function, dict) and dumped_function.get("parameters") is not None:
+        dumped_function["parameters"] = _open_freeform_objects(dumped_function["parameters"])
+    return dumped_tool
 
 
 def _dump_tool_choice_for_xgrammar(
