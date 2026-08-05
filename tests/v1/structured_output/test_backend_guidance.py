@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
+import json
 import time
 from concurrent.futures import Future
 
@@ -14,7 +16,11 @@ from aphrodite.sampling_params import SamplingParams, StructuredOutputsParams
 from aphrodite.tokenizers import get_tokenizer
 from aphrodite.v1.request import Request
 from aphrodite.v1.structured_output import StructuredOutputManager
-from aphrodite.v1.structured_output.backend_guidance import GuidanceBackend
+from aphrodite.v1.structured_output.backend_guidance import (
+    GuidanceBackend,
+    serialize_guidance_grammar,
+    validate_guidance_grammar,
+)
 from aphrodite.v1.structured_output.backend_types import StructuredOutputOptions
 
 TOKENIZER = "gpt2"
@@ -221,3 +227,144 @@ def test_mistral_tokenizer_compile_grammar(
     grammar = backend.compile_grammar(request_type, grammar_spec)
     assert grammar is not None
     assert not grammar.is_terminated()
+
+
+# --------------------------------------------------------------------------
+# Structural tags: the schema has to survive the trip into llguidance.
+#
+# StructTag takes a JSON schema, but serialize_guidance_grammar used to hand it
+# _process_schema()'s *compiled* grammar. StructTag treats any string starting
+# with "{" as a schema, so llguidance read the {"grammars": ...} wrapper as one.
+# It holds no schema keywords, so every tag quietly degraded to "any JSON
+# value": tool arguments went unconstrained, and schema errors inside a tag
+# were invisible to validate_grammar().
+# --------------------------------------------------------------------------
+
+# Plain-ASCII trigger so the gpt2 tokenizer can represent it. Real templates use
+# special tokens; the trigger is literal text either way and has no bearing on
+# how the argument schema is compiled.
+TAG_TRIGGER = "TOOLCALL"
+TAG_BEGIN = "TOOLCALL get_weather\n"
+TAG_END = "\nDONE"
+
+TOOL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "location": {"type": "string"},
+        "units": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+    },
+    "required": ["location"],
+    "additionalProperties": False,
+}
+CONFORMING_ARGS = '{"location": "Paris", "units": "celsius"}'
+
+
+def _tool_structural_tag(schema):
+    return json.dumps(
+        {
+            "triggers": [TAG_TRIGGER],
+            "structures": [{"begin": TAG_BEGIN, "schema": schema, "end": TAG_END}],
+        }
+    )
+
+
+@pytest.fixture(scope="module")
+def llg_tokenizer():
+    import llguidance.hf
+
+    return llguidance.hf.from_tokenizer(AutoTokenizer.from_pretrained(TOKENIZER), 50257)
+
+
+def _tag_grammar(schema, **kwargs):
+    return serialize_guidance_grammar(
+        StructuredOutputOptions.STRUCTURAL_TAG,
+        _tool_structural_tag(schema),
+        **kwargs,
+    )
+
+
+def _accepts(grammar, llg_tokenizer, payload: str) -> bool:
+    """Whether the grammar permits ``payload`` as the tag's structured body."""
+    import llguidance
+
+    matcher = llguidance.LLMatcher(llg_tokenizer, grammar, log_level=0)
+    assert matcher.consume_tokens(llg_tokenizer.tokenize_str(TAG_BEGIN)), (
+        "matcher rejected the tag's own begin string"
+    )
+    return all(matcher.consume_tokens([token]) for token in llg_tokenizer.tokenize_str(payload))
+
+
+@pytest.mark.parametrize(
+    "violation,why",
+    [
+        ('{"location": 42}', "location must be a string"),
+        ('{"units": "kelvin"}', "units outside the enum, required location missing"),
+        ("[1, 2, 3]", "not an object"),
+        ('"just a string"', "not an object"),
+    ],
+)
+def test_structural_tag_enforces_argument_schema(llg_tokenizer, violation, why):
+    """Tool arguments violating the schema must be blocked, not just the shape
+    of the tag around them. These all decoded happily when the tag degraded to
+    "any JSON value"."""
+    assert not _accepts(_tag_grammar(TOOL_SCHEMA), llg_tokenizer, violation), why
+
+
+def test_structural_tag_accepts_conforming_arguments(llg_tokenizer):
+    """The constraint must not be so tight it rejects valid arguments."""
+    assert _accepts(_tag_grammar(TOOL_SCHEMA), llg_tokenizer, CONFORMING_ARGS)
+
+
+@pytest.mark.parametrize(
+    "disable_any_whitespace,spaced_json_allowed",
+    [(False, True), (True, False)],
+)
+def test_structural_tag_honours_whitespace_option(llg_tokenizer, disable_any_whitespace, spaced_json_allowed):
+    """`disable_any_whitespace` reached llguidance through `defaults=` when the
+    schema was pre-compiled; with a raw schema it rides along as `x-guidance`.
+    Either way the option has to keep working."""
+    grammar = _tag_grammar(TOOL_SCHEMA, disable_any_whitespace=disable_any_whitespace)
+    assert _accepts(grammar, llg_tokenizer, CONFORMING_ARGS) is spaced_json_allowed
+    # Whitespace-free JSON is legal under both settings.
+    assert _accepts(grammar, llg_tokenizer, '{"location":"Paris"}')
+
+
+def test_structural_tag_keeps_explicit_x_guidance(llg_tokenizer):
+    """A schema carrying its own x-guidance keeps it; we only supply a default."""
+    schema = copy.deepcopy(TOOL_SCHEMA)
+    schema["x-guidance"] = {"whitespace_flexible": False}
+    grammar = _tag_grammar(schema, disable_any_whitespace=False)
+    assert not _accepts(grammar, llg_tokenizer, CONFORMING_ARGS)
+
+
+def test_structural_tag_does_not_mutate_caller_schema():
+    """Serializing must not write x-guidance back into the caller's dict."""
+    schema = copy.deepcopy(TOOL_SCHEMA)
+    _tag_grammar(schema)
+    assert schema == TOOL_SCHEMA
+
+
+def test_structural_tag_reports_unsatisfiable_schema(llg_tokenizer):
+    """An unsatisfiable tool schema has to surface as a validation error.
+
+    Nothing inside a tag was compiled as a schema before, so llguidance had
+    nothing to object to and the request was admitted -- then died in the
+    engine. A plain JSON request already caught this; the tag path must agree.
+    """
+    schema = {
+        "type": "object",
+        "properties": {"mode": {"type": "string", "enum": []}},
+        "required": ["mode"],
+    }
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(structural_tag=_tool_structural_tag(schema)))
+    with pytest.raises(ValueError, match="[Uu]nsatisfiable"):
+        validate_guidance_grammar(params, tokenizer=llg_tokenizer)
+
+
+def test_structural_tag_accepts_valid_schema(llg_tokenizer):
+    """Sanity: ordinary tool schemas still validate."""
+    tag = _tool_structural_tag(TOOL_SCHEMA)
+    validate_guidance_grammar(
+        SamplingParams(structured_outputs=StructuredOutputsParams(structural_tag=tag)),
+        tokenizer=llg_tokenizer,
+    )

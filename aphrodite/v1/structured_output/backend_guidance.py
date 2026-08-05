@@ -231,6 +231,26 @@ def serialize_guidance_grammar(
             },
         )
 
+    def _prepare_schema(
+        schema: str | dict[str, Any],
+    ) -> dict[str, Any] | bool:
+        """Wrap our schema correctly, with schema-level options and `x-guidance`.
+        """
+        if disable_additional_properties:
+            schema = process_for_additional_properties(schema)
+        elif isinstance(schema, str):
+            schema = json.loads(schema)
+        else:
+            schema = copy.deepcopy(schema)
+        # `true`/`false` are valid schemas and take no annotations.
+        if isinstance(schema, dict):
+            guidance_opts = schema.get("x-guidance")
+            if not isinstance(guidance_opts, dict):
+                guidance_opts = {}
+                schema["x-guidance"] = guidance_opts
+            guidance_opts.setdefault("whitespace_flexible", not disable_any_whitespace)
+        return schema
+
     if request_type == StructuredOutputOptions.JSON:
         return _process_schema(grammar_spec)
     elif request_type == StructuredOutputOptions.JSON_OBJECT:
@@ -263,7 +283,7 @@ def serialize_guidance_grammar(
                     llguidance.StructTag(
                         trigger=trig,
                         begin=s["begin"],
-                        grammar=_process_schema(s["schema"]),
+                        grammar=_prepare_schema(s["schema"]),
                         end=s["end"],
                     )
                 )
