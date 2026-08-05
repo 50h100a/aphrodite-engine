@@ -288,9 +288,7 @@ def _accepts(grammar, llg_tokenizer, payload: str) -> bool:
     import llguidance
 
     matcher = llguidance.LLMatcher(llg_tokenizer, grammar, log_level=0)
-    assert matcher.consume_tokens(llg_tokenizer.tokenize_str(TAG_BEGIN)), (
-        "matcher rejected the tag's own begin string"
-    )
+    assert matcher.consume_tokens(llg_tokenizer.tokenize_str(TAG_BEGIN)), "matcher rejected the tag's own begin string"
     return all(matcher.consume_tokens([token]) for token in llg_tokenizer.tokenize_str(payload))
 
 

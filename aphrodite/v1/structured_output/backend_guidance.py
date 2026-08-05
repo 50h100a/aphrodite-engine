@@ -234,8 +234,7 @@ def serialize_guidance_grammar(
     def _prepare_schema(
         schema: str | dict[str, Any],
     ) -> dict[str, Any] | bool:
-        """Wrap our schema correctly, with schema-level options and `x-guidance`.
-        """
+        """Wrap our schema correctly, with schema-level options and `x-guidance`."""
         if disable_additional_properties:
             schema = process_for_additional_properties(schema)
         elif isinstance(schema, str):
