@@ -428,8 +428,6 @@ def test_structural_tag_from_the_registry_is_declined_not_crashed(llg_tokenizer)
         tool_choice="required",
         reasoning=True,
     )
-    params = SamplingParams(
-        structured_outputs=StructuredOutputsParams(structural_tag=structural_tag.model_dump_json())
-    )
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(structural_tag=structural_tag.model_dump_json()))
     with pytest.raises(ValueError, match="cannot compile this structural tag"):
         validate_guidance_grammar(params, tokenizer=llg_tokenizer)

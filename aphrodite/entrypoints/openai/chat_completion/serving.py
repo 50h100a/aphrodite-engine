@@ -50,12 +50,12 @@ from aphrodite.entrypoints.openai.engine.protocol import (
     UsageInfo,
 )
 from aphrodite.entrypoints.openai.models.serving import OpenAIServingModels
-from aphrodite.entrypoints.utils import log_request_failure
 from aphrodite.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
 from aphrodite.entrypoints.serve.utils.request_logger import RequestLogger
 from aphrodite.entrypoints.serve.utils.tool_calls_utils import (
     maybe_filter_parallel_tool_calls,
 )
+from aphrodite.entrypoints.utils import log_request_failure
 from aphrodite.inputs import EngineInput, MultiModalPlaceholders
 from aphrodite.logger import init_logger
 from aphrodite.logprobs import Logprob

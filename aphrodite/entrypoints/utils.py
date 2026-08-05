@@ -280,8 +280,7 @@ def log_version_and_model(lgr: Logger, version: str, model_name: str) -> None:
 
 
 def log_request_failure(exc: Exception, context: str) -> None:
-    """Log a request-ending exception at the level its own status implies.
-    """
+    """Log a request-ending exception at the level its own status implies."""
     status = create_error_response(exc).error.code
     if status < HTTPStatus.INTERNAL_SERVER_ERROR:
         logger.warning("%s %s: %s", context, type(exc).__name__, exc)
