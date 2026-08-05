@@ -271,6 +271,12 @@ def serialize_guidance_grammar(
                 s_tag = json.loads(grammar_spec)
             else:
                 s_tag = grammar_spec
+            if "structures" not in s_tag:
+                raise ValueError(
+                    "The guidance backend cannot compile this structural tag: it "
+                    "only supports the 'triggers'/'structures' form, and this one "
+                    f"is {'the nested format form' if 'format' in s_tag else 'neither'}."
+                )
             triggers: list[str] = s_tag["triggers"]
             tags: list[llguidance.StructTag] = []
             for s in s_tag["structures"]:

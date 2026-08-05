@@ -366,3 +366,70 @@ def test_structural_tag_accepts_valid_schema(llg_tokenizer):
         SamplingParams(structured_outputs=StructuredOutputsParams(structural_tag=tag)),
         tokenizer=llg_tokenizer,
     )
+
+
+# Every test above builds the `triggers`/`structures` form, which is the only
+# one serialize_guidance_grammar can compile -- and, because they all build it,
+# the only one they ever exercised. Tool calls are built as the nested `format`
+# form instead, so the guidance backend has never been able to serve one.
+
+
+def test_structural_tag_nested_format_is_declined_not_crashed(llg_tokenizer):
+    """The unsupported tag shape has to be refused as a ValueError.
+
+    Callers separate "this backend will not take it" from "something broke" by
+    the exception type: the `auto` backend catches ValueError to try the next
+    backend, and the API layer turns it into a 400 naming the reason. Reading
+    s_tag["triggers"] on a tag that has no such key raised KeyError, which
+    matches neither -- so a request with a tool schema xgrammar happened to
+    dislike came back as a 500 with an empty message.
+    """
+    tag = json.dumps(
+        {
+            "type": "structural_tag",
+            "format": {
+                "type": "tag",
+                "begin": TAG_BEGIN,
+                "content": {"type": "json_schema", "json_schema": TOOL_SCHEMA},
+                "end": TAG_END,
+            },
+        }
+    )
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(structural_tag=tag))
+    with pytest.raises(ValueError, match="cannot compile this structural tag"):
+        validate_guidance_grammar(params, tokenizer=llg_tokenizer)
+
+
+def test_structural_tag_from_the_registry_is_declined_not_crashed(llg_tokenizer):
+    """The same, on a tag built the way a real tool call builds one.
+
+    Pinning the hand-written shape above is not enough on its own: if the
+    builder's output ever moves, this is what notices. Whether guidance grows
+    support for it or keeps refusing, the answer must stay a ValueError.
+    """
+    from aphrodite.entrypoints.openai.chat_completion.protocol import ChatCompletionToolsParam
+    from aphrodite.tool_parsers.structural_tag_registry import get_model_structural_tag
+
+    tools = [
+        ChatCompletionToolsParam.model_validate(
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Look up the weather.",
+                    "parameters": TOOL_SCHEMA,
+                },
+            }
+        )
+    ]
+    structural_tag = get_model_structural_tag(
+        model="deepseek_v4",
+        tools=tools,
+        tool_choice="required",
+        reasoning=True,
+    )
+    params = SamplingParams(
+        structured_outputs=StructuredOutputsParams(structural_tag=structural_tag.model_dump_json())
+    )
+    with pytest.raises(ValueError, match="cannot compile this structural tag"):
+        validate_guidance_grammar(params, tokenizer=llg_tokenizer)

@@ -333,4 +333,4 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
             else:
                 xgr.Grammar.from_structural_tag(so_params.structural_tag)
         except Exception as e:
-            raise ValueError("Invalid structural tag specification.") from e
+            raise ValueError(f"Invalid structural tag specification: {e}") from e

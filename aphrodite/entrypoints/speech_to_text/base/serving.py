@@ -24,6 +24,7 @@ from aphrodite.entrypoints.openai.engine.protocol import (
     UsageInfo,
 )
 from aphrodite.entrypoints.openai.models.serving import OpenAIServingModels
+from aphrodite.entrypoints.utils import log_request_failure
 from aphrodite.entrypoints.serve.engine.typing import SpeechToTextRequest
 from aphrodite.entrypoints.serve.utils.api_utils import get_max_tokens
 from aphrodite.entrypoints.serve.utils.request_logger import RequestLogger
@@ -721,7 +722,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             )
 
         except Exception as e:
-            logger.exception("Error in %s stream generator.", self.task_type)
+            log_request_failure(e, f"Error in {self.task_type} stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
         # Send the final done message after all response.n are finished

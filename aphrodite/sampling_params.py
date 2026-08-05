@@ -1159,7 +1159,7 @@ class SamplingParams(
             try:
                 validate_xgrammar_grammar(self)
                 self.structured_outputs._backend = "xgrammar"
-            except ValueError:
+            except ValueError as xgrammar_err:
                 # The request either failed validation
                 # or includes some jsonschema feature(s) that
                 # are not supported in xgrammar.
@@ -1175,18 +1175,23 @@ class SamplingParams(
                         schema = so_params.json
                     skip_guidance = not is_guidance_backend_supported(schema)
 
-                if skip_guidance:
-                    # Fall back to outlines if the tokenizer is non-tekken Mistral or
-                    # the schema contains features unsupported by guidance
-                    validate_structured_output_request_outlines(self)
-                    self.structured_outputs._backend = "outlines"
-                else:
-                    # Fall back to guidance by default.
-                    validate_guidance_grammar(
-                        self,
-                        tokenizer=_get_llg_tokenizer(tokenizer),
-                    )
-                    self.structured_outputs._backend = "guidance"
+                try:
+                    if skip_guidance:
+                        # Fall back to outlines if the tokenizer is non-tekken Mistral or
+                        # the schema contains features unsupported by guidance
+                        validate_structured_output_request_outlines(self)
+                        self.structured_outputs._backend = "outlines"
+                    else:
+                        # Fall back to guidance by default.
+                        validate_guidance_grammar(
+                            self,
+                            tokenizer=_get_llg_tokenizer(tokenizer),
+                        )
+                        self.structured_outputs._backend = "guidance"
+                except ValueError as fallback_err:
+                    # Report why the first choice declined, not the second.
+                    logger.debug("Fallback backend also declined: %s", fallback_err)
+                    raise xgrammar_err from fallback_err
             # Remember that this backend was set automatically
             self.structured_outputs._backend_was_auto = True
 
