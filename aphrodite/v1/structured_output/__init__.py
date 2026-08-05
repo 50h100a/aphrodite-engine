@@ -290,7 +290,18 @@ class StructuredOutputManager:
                         else:
                             accepted = grammar.accept_tokens(req_id, [token])
                             if not accepted:
-                                raise AssertionError((token, req_id, scheduled_spec_decode_tokens))
+                                # A draft the grammar cannot follow. Drafts are
+                                # speculative, so this is not yet a dead end.
+                                logger.warning(
+                                    "Grammar for request %s rejected draft token %d.",
+                                    req_id,
+                                    token,
+                                )
+                                # Stop constraining the rest of this window, but
+                                # do not break: every scheduled position still
+                                # owes the runner a bitmask row, and skipping
+                                # one would shift every later request's rows.
+                                apply_bitmask = False
                         if accepted:
                             state_advancements += 1
                     cumulative_index += 1

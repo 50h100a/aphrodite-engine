@@ -1093,7 +1093,10 @@ class SamplingParams(
         )
         from aphrodite.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
         from aphrodite.v1.structured_output.schema_features import (
+            get_schema_validation_error,
             get_unenforceable_json_schema_keys,
+            iter_structural_tag_schemas,
+            schema_validation_message,
             unenforceable_keys_message,
         )
 
@@ -1104,6 +1107,16 @@ class SamplingParams(
         unenforceable = get_unenforceable_json_schema_keys(self.structured_outputs.json)
         if unenforceable:
             raise ValueError(unenforceable_keys_message(unenforceable))
+
+        # Reject malformed schemas up-front and well-formatted, instead
+        # of counting on the inconsistent backends to handle it.
+        for candidate_schema in (
+            self.structured_outputs.json,
+            *iter_structural_tag_schemas(self.structured_outputs.structural_tag),
+        ):
+            invalid = get_schema_validation_error(candidate_schema)
+            if invalid is not None:
+                raise ValueError(schema_validation_message(invalid))
 
         if backend.startswith("xgrammar"):
             # xgrammar with no fallback

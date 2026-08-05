@@ -1563,12 +1563,13 @@ class Scheduler(SchedulerInterface):
                 # Trim the reasoning content so the grammar only sees grammar content.
                 advance_token_ids = self.structured_output_manager.trim_reasoning_for_advance(request, new_token_ids)
                 if advance_token_ids and not grammar.accept_tokens(req_id, advance_token_ids):
-                    logger.error(
-                        "Unexpected: grammar rejected tokens %s for request %s. Terminating request.",
+                    # Schema forbids all possible tokens, so we have to stop here.
+                    logger.warning(
+                        "Grammar rejected tokens %s for request %s; ending with finish_reason=constraint.",
                         advance_token_ids,
                         req_id,
                     )
-                    request.status = RequestStatus.FINISHED_ERROR
+                    request.status = RequestStatus.FINISHED_CONSTRAINT
                     request.resumable = False
                     stopped = True
 

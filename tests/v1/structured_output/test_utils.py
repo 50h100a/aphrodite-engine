@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+
 import pytest
 
 from aphrodite.v1.structured_output.backend_guidance import (
@@ -10,7 +12,9 @@ from aphrodite.v1.structured_output.backend_xgrammar import (
     has_xgrammar_unsupported_json_features,
 )
 from aphrodite.v1.structured_output.schema_features import (
+    get_schema_validation_error,
     get_unenforceable_json_schema_keys,
+    iter_structural_tag_schemas,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -143,3 +147,59 @@ def test_guidance_backend_supported():
 
 def test_guidance_backend_supported_clean_schema(supported_schema):
     assert is_guidance_backend_supported(supported_schema)
+
+
+@pytest.mark.parametrize(
+    "schema,valid",
+    [
+        ({"type": "object", "properties": {"a": {"type": "string"}}}, True),
+        # Unsatisfiable, but well-formed. Left to the runtime, which ends such
+        # a request with finish_reason="constraint" rather than rejecting it.
+        ({"enum": []}, True),
+        ({"type": "string", "minLength": 5, "maxLength": 3}, True),
+        ({"allOf": [{"type": "string"}, {"type": "integer"}]}, True),
+        # Malformed: these are what the check is actually for.
+        ({"anyOf": []}, False),
+        ({"type": "string", "minLength": "five"}, False),
+        ({"type": "strng"}, False),
+        ({"type": "object", "properties": {"a": {"type": 3}}}, False),
+    ],
+)
+def test_schema_validation_error(schema, valid):
+    assert (get_schema_validation_error(schema) is None) is valid
+
+
+def test_schema_validation_error_accepts_json_text():
+    assert get_schema_validation_error('{"type": "object"}') is None
+    assert get_schema_validation_error('{"anyOf": []}') is not None
+    # Not our error to report; whoever parses it for real will say so.
+    assert get_schema_validation_error("{not json") is None
+
+
+def test_schema_validation_error_names_the_offending_subschema():
+    schema = {"type": "object", "properties": {"mode": {"anyOf": []}}}
+    assert "/properties/mode/anyOf" in get_schema_validation_error(schema)
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        {"structures": [{"begin": "<f>", "schema": {"type": "object"}, "end": "</f>"}], "triggers": ["<f>"]},
+        {
+            "format": {
+                "type": "triggered_tags",
+                "tags": [{"content": {"type": "json_schema", "json_schema": {"type": "object"}}}],
+            }
+        },
+    ],
+)
+def test_iter_structural_tag_schemas(tag):
+    # Tool calls arrive as structural tags, so schema screening reaches them
+    # only through this.
+    assert list(iter_structural_tag_schemas(tag)) == [{"type": "object"}]
+    assert list(iter_structural_tag_schemas(json.dumps(tag))) == [{"type": "object"}]
+
+
+@pytest.mark.parametrize("junk", ["{not json", None, 42, {}, {"structures": "nope"}])
+def test_iter_structural_tag_schemas_tolerates_junk(junk):
+    assert list(iter_structural_tag_schemas(junk)) == []

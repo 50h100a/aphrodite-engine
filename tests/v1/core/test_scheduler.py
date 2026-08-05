@@ -2908,7 +2908,7 @@ def test_schedule_skip_tokenizer_init_structured_output_request():
     assert len(scheduler.skipped_waiting) == 1
 
 
-def test_abort_request_when_structured_output_fsm_cannot_advance():
+def test_constraint_finish_when_structured_output_fsm_cannot_advance():
     scheduler = object.__new__(Scheduler)
     sampling_params = SamplingParams(ignore_eos=True, max_tokens=4)
     sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
@@ -2981,7 +2981,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
 
     request.structured_output_request.grammar.accept_tokens.assert_called_once_with(request.request_id, [123])
     assert request.resumable is False
-    assert request.status == RequestStatus.FINISHED_ERROR
+    assert request.status == RequestStatus.FINISHED_CONSTRAINT
     assert request.request_id not in scheduler.requests
     assert not scheduler.running
     scheduler._free_request.assert_called_once_with(request)
@@ -2989,7 +2989,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     engine_core_output = engine_core_outputs[0].outputs[0]
     assert engine_core_output.request_id == request.request_id
     assert engine_core_output.new_token_ids == [123]
-    assert engine_core_output.finish_reason == FinishReason.ERROR
+    assert engine_core_output.finish_reason == FinishReason.CONSTRAINT
 
 
 @pytest.mark.parametrize("use_v2_model_runner", [False, True])
