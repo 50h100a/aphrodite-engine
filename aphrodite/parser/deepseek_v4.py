@@ -62,19 +62,80 @@ _PARTIAL_PARAM_RE = re.compile(
 )
 
 
-def _dsml_arg_converter(raw_args: str, partial: bool) -> str:
+# The whitespace xgrammar's `deepseek_xml` style allows around a parameter
+# value. Its generated rule for one parameter reads
+#
+#     "\">" [ \n\t]* <value> [ \n\t]* "</｜DSML｜parameter>"
+#
+# so a model generating under the grammar may indent its value and still be
+# inside the grammar. That padding is formatting, not data -- but the parser
+# writes the slot out verbatim, which turns e.g. a tab before an enum member
+# into part of the member and produces a tool call whose arguments violate
+# the tool's own schema.
+_DSML_VALUE_PADDING = " \t\n"
+
+
+def _dsml_declared_type(prop: object) -> str | None:
+    """The single JSON type this parameter is declared to hold, if it has one.
+
+    ``None`` whenever the schema leaves any room -- absent, composed with
+    ``anyOf``/``oneOf``/``allOf``, or a union of types. The value slot is then
+    ambiguous enough that the safe reading of both the padding and the model's
+    ``string=`` flag is the literal one.
+    """
+    if not isinstance(prop, dict):
+        return None
+    if any(key in prop for key in ("anyOf", "oneOf", "allOf")):
+        return None
+    declared = prop.get("type")
+    return declared if isinstance(declared, str) else None
+
+
+def _dsml_param_value(name: str, is_str: str, raw: str, properties: dict[str, object] | None) -> object:
+    """Read one parameter's value slot, letting the schema settle what it is.
+
+    Three cases, and the schema rather than the model's ``string=`` flag picks
+    between them, because the grammar constrains the value slot but leaves the
+    flag free -- the model may mark a number as a string, or a string as a
+    number, without ever leaving the grammar.
+
+    * A string with an ``enum``/``const``: the padding cannot be part of any
+      value the schema admits, so it comes off.
+    * Any other declared type: the slot holds a JSON literal, so the padding is
+      formatting and the text parses.
+    * A free string, or nothing declared: the padding is indistinguishable from
+      the value -- ``xml_string`` matches it either way -- so it stays, as
+      minimax_m2 keeps it for the same reason.
+    """
+    declared = _dsml_declared_type(properties.get(name) if properties else None)
+    prop = properties.get(name) if properties else None
+
+    if declared == "string":
+        pinned = isinstance(prop, dict) and ("enum" in prop or "const" in prop)
+        return raw.strip(_DSML_VALUE_PADDING) if pinned else raw
+
+    if declared is not None and declared != "string":
+        text = raw.strip(_DSML_VALUE_PADDING)
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return text
+
+    if is_str == "true":
+        return raw
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return raw
+
+
+def _dsml_arg_converter(raw_args: str, partial: bool, properties: dict[str, object] | None = None) -> str:
     params: dict[str, object] = {}
 
     last_end = 0
     for match in _PARAM_RE.finditer(raw_args):
         name, is_str, value = match.group(1), match.group(2), match.group(3)
-        if is_str == "true":
-            params[name] = value
-        else:
-            try:
-                params[name] = json.loads(value)
-            except (json.JSONDecodeError, ValueError):
-                params[name] = value
+        params[name] = _dsml_param_value(name, is_str, value, properties)
         last_end = match.end()
 
     if partial:
@@ -83,11 +144,19 @@ def _dsml_arg_converter(raw_args: str, partial: bool) -> str:
             name = partial_match.group(1)
             is_str = partial_match.group(2)
             value = partial_match.group(3)
-            if is_str == "true":
-                params[name] = value
+            declared = _dsml_declared_type((properties or {}).get(name) if properties else None)
+            if declared == "string" or (declared is None and is_str == "true"):
+                # Text either way, so a half-written value reads like a finished
+                # one. Taking the padding off a prefix stays right as the prefix
+                # grows, which keeps the streamed argument deltas a lengthening
+                # string rather than one that jumps backwards.
+                params[name] = _dsml_param_value(name, is_str, value, properties)
             else:
+                # A literal, and half of one does not parse -- `1.` is not yet a
+                # number. Leave the parameter out until it does rather than
+                # publish the fragment as a string and retract it a token later.
                 with contextlib.suppress(json.JSONDecodeError, ValueError):
-                    params[name] = json.loads(value)
+                    params[name] = json.loads(value.strip(_DSML_VALUE_PADDING) if declared else value)
 
     return json.dumps(params, ensure_ascii=False)
 
@@ -228,8 +297,9 @@ class DeepSeekV4Parser(ParserEngine):
         self._arg_converter = self._convert_args
 
     def _convert_args(self, raw_args: str, partial: bool) -> str:
-        result = _dsml_arg_converter(raw_args, partial)
         if not self._tools:
-            return result
+            return _dsml_arg_converter(raw_args, partial)
         func_name = next((s.name for s in self._tool_slots if s.args == raw_args), None)
+        properties = find_tool_properties(self._tools, func_name) if func_name else None
+        result = _dsml_arg_converter(raw_args, partial, properties)
         return _unwrap_wrapper_args(result, self._tools, func_name)

@@ -16,6 +16,7 @@ from aphrodite.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionToolsParam,
     FunctionDefinition,
 )
+from aphrodite.parser.deepseek_v4 import _dsml_arg_converter
 from aphrodite.tool_parsers import ToolParserManager
 from aphrodite.tool_parsers.deepseekv4_engine_tool_parser import (
     DeepSeekV4EngineToolParser,
@@ -389,3 +390,92 @@ def test_composed_schema_converts_object_and_array_params():
         "wait": {"type": "for", "minutes": 2880},
         "patches": [{"op": "replace", "path": "/schedule", "value": "quiet"}],
     }
+
+
+# xgrammar's `deepseek_xml` style writes each parameter into a slot that permits
+# `[ \n\t]*` on either side of the value, so a model generating under the tool
+# grammar can indent its value and never leave the grammar. Reproduced live: a
+# `severity` enum came back as " \tsev2", which is not one of its four members.
+PADDED_ENUM_TOOL = ChatCompletionToolsParam(
+    type="function",
+    function={
+        "name": "file_report",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "severity": {"type": "string", "enum": ["sev1", "sev2"]},
+                "title": {"type": "string"},
+                "count": {"type": "integer"},
+            },
+            "required": ["severity", "title", "count"],
+        },
+    },
+)
+
+
+def _padded_output() -> str:
+    return (
+        f"{TC_START}\n"
+        f'{INV_START}file_report">\n'
+        f'{PARAM_START}severity" string="true"> \tsev2{PARAM_END}\n'
+        f'{PARAM_START}title" string="true">\t indented on purpose {PARAM_END}\n'
+        f'{PARAM_START}count" string="true">\n  7\n{PARAM_END}\n'
+        f"{INV_END}\n"
+        f"{TC_END}"
+    )
+
+
+def test_grammar_padding_is_not_folded_into_the_value():
+    """Padding comes off wherever the schema says it cannot be part of a value.
+
+    A free string keeps it: `xml_string` matches the padding as readily as the
+    value, so there is no telling one from the other, and a caller asking for a
+    file's contents is entitled to its leading tab.
+    """
+    parser = make_parser(tools=[PADDED_ENUM_TOOL])
+    result = parser.extract_tool_calls(_padded_output(), make_request(tools=[PADDED_ENUM_TOOL]))
+
+    args = json.loads(result.tool_calls[0].function.arguments)
+    assert args["severity"] == "sev2"
+    assert args["title"] == "\t indented on purpose "
+    # `string="true"` on an integer is inside the grammar too -- the flag is a
+    # free choice there, so the declared type decides, not the model.
+    assert args["count"] == 7
+
+
+def test_grammar_padding_is_kept_when_the_tool_is_unknown():
+    """With no schema in hand there is nothing to justify editing the value."""
+    parser = make_parser()
+    result = parser.extract_tool_calls(_padded_output(), make_request())
+
+    args = json.loads(result.tool_calls[0].function.arguments)
+    assert args["severity"] == " \tsev2"
+
+
+def test_streamed_padded_value_matches_the_whole_response():
+    parser = make_parser(tools=[PADDED_ENUM_TOOL])
+    whole = make_parser(tools=[PADDED_ENUM_TOOL]).extract_tool_calls(
+        _padded_output(), make_request(tools=[PADDED_ENUM_TOOL])
+    )
+    deltas = stream(parser, _padded_output())
+
+    streamed = reconstruct_args(deltas)
+    assert json.loads(streamed) == json.loads(whole.tool_calls[0].function.arguments)
+
+
+def test_partial_literals_are_withheld_until_they_parse():
+    """A parameter must not be published and then rewritten.
+
+    Mid-literal, `1.` is not a number. Rendering the fragment as the string
+    "1." only to replace it with 1.5 a token later would make a streamed
+    argument delta retract what an earlier one already sent, so the fragment is
+    withheld instead -- the same thing the parser has always done for
+    `string="false"`, now also for a value the schema types as a number.
+    """
+    properties = {"factor": {"type": "number"}, "mode": {"type": "string", "enum": ["fast", "slow"]}}
+    raw = f'{PARAM_START}factor" string="false"> 1.5'
+
+    seen = [json.loads(_dsml_arg_converter(raw[:n], True, properties)) for n in range(1, len(raw) + 1)]
+
+    assert all(not isinstance(step.get("factor"), str) for step in seen), seen
+    assert seen[-1] == {"factor": 1.5}
