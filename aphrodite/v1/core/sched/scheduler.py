@@ -191,6 +191,10 @@ class Scheduler(SchedulerInterface):
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
 
+        # Requests finished by schedule() because their grammar failed to
+        # compile, awaiting their error output in update_from_output().
+        self.failed_grammar_reqs: list[Request] = []
+
         # Encoder-related.
         # Calculate encoder cache size if applicable
         supports_mm_inputs = mm_registry.supports_multimodal_inputs(aphrodite_config.model_config)
@@ -611,6 +615,11 @@ class Scheduler(SchedulerInterface):
                 if self._is_blocked_waiting_status(request.status) and not self._try_promote_blocked_waiting_request(
                     request
                 ):
+                    if request.is_finished():
+                        # Promotion failed terminally (grammar compilation
+                        # error) and finish_requests() already took the request
+                        # out of the queues, so there is nothing to pop here.
+                        continue
                     if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
@@ -1678,6 +1687,21 @@ class Scheduler(SchedulerInterface):
                     )
                 )
 
+        # Requests that schedule() failed on a grammar compilation error. They
+        # are already finished; this is where their client hears about it.
+        if self.failed_grammar_reqs:
+            for request in self.failed_grammar_reqs:
+                outputs[request.client_index].append(
+                    EngineCoreOutput(
+                        request_id=request.request_id,
+                        new_token_ids=[],
+                        finish_reason=request.get_finished_reason(),
+                        events=request.take_events(),
+                        trace_headers=request.trace_headers,
+                    )
+                )
+            self.failed_grammar_reqs.clear()
+
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
@@ -2344,6 +2368,10 @@ class Scheduler(SchedulerInterface):
         if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
             structured_output_req = request.structured_output_request
             if not (structured_output_req and structured_output_req.grammar):
+                if structured_output_req is not None and structured_output_req.grammar_error is not None:
+                    # The grammar will never arrive, so this request can only
+                    # be failed. Leaving it blocked would hang it forever.
+                    self._fail_grammar_compilation(request, structured_output_req.grammar_error)
                 return False
             request.status = RequestStatus.WAITING
             return True
@@ -2355,6 +2383,30 @@ class Scheduler(SchedulerInterface):
         raise AssertionError(
             f"Unexpected blocked waiting status in promotion: {request.status.name} for request {request.request_id}"
         )
+
+    def _fail_grammar_compilation(self, request: Request, error: BaseException) -> None:
+        """End a request whose grammar could not be compiled.
+
+        The spec was validated before the request was admitted, so reaching
+        here means the backend rejected it at compile time anyway. That is one
+        request's problem: report it as finish_reason=error (a 500 for that
+        caller) and leave the rest of the batch alone.
+        """
+        structured_output_req = request.structured_output_request
+        assert structured_output_req is not None
+        logger.error(
+            "Failed to compile the grammar for request %s; ending it with "
+            "finish_reason=error. Structured output spec: %.512s",
+            request.request_id,
+            structured_output_req.structured_output_key[1],
+            exc_info=error,
+        )
+        # The output is emitted from update_from_output(), which always runs
+        # after schedule(); finish_requests() keeps the engine alive until then.
+        # Only report a request this call actually finished, so a request that
+        # raced with an abort is not given two terminal outputs.
+        if self.finish_requests(request.request_id, RequestStatus.FINISHED_ERROR):
+            self.failed_grammar_reqs.append(request)
 
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
         """

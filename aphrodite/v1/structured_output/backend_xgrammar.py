@@ -183,6 +183,14 @@ class XgrammarGrammar(StructuredOutputGrammar):
         self._is_terminated = self.matcher.is_terminated()
 
     def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
+        # xgrammar rejects a bitmask whose rows are not exactly its own vocab
+        # width. The bitmask is shared with the other backends and sized for
+        # the widest of them, so hand xgrammar a view of the right width when
+        # they differ.
+        num_words = (self.vocab_size + 31) // 32
+        if bitmask.shape[-1] != num_words:
+            self.matcher.fill_next_token_bitmask(bitmask[idx : idx + 1, :num_words], 0)
+            return
         self.matcher.fill_next_token_bitmask(bitmask, idx)
 
     def is_terminated(self) -> bool:

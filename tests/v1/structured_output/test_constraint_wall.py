@@ -44,10 +44,11 @@ def aphrodite_config():
 @pytest.fixture
 def manager(aphrodite_config):
     manager = StructuredOutputManager(aphrodite_config)
-    manager.backend = Mock()
-    manager.backend.allocate_token_bitmask = Mock(
+    backend = Mock()
+    backend.allocate_token_bitmask = Mock(
         side_effect=lambda rows, _=None: torch.zeros(rows, VOCAB_SIZE // 32, dtype=torch.int32)
     )
+    manager.backends = {"xgrammar": backend}
     manager.tokenizer = Mock()
     return manager
 
