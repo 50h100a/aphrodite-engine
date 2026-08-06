@@ -90,6 +90,11 @@ _KEYWORD_BACKENDS: dict[str, frozenset[str]] = {
     "if": frozenset(),
     "maxContains": frozenset(),
     "minContains": frozenset(),
+    # Outlines and lm-format-enforcer used to be recorded here as enforcing
+    # `not`. Neither does: both drop it and close the object instead, which
+    # refuses a violation of a `not` over `required` without ever reading the
+    # keyword, and refuses the permitted extra keys along with it.
+    "not": frozenset(),
     "then": frozenset(),
     "uniqueItems": frozenset(),
     # Enforced by some. `auto` routes to one of these; naming a backend that is
@@ -101,7 +106,6 @@ _KEYWORD_BACKENDS: dict[str, frozenset[str]] = {
     "minimum": frozenset({"xgrammar", "guidance"}),
     "minProperties": frozenset({"xgrammar", "guidance"}),
     "multipleOf": frozenset({"guidance"}),
-    "not": frozenset({"outlines", "lm-format-enforcer"}),
     "patternProperties": frozenset({"guidance"}),
     "prefixItems": frozenset({"xgrammar", "guidance", "outlines"}),
     "propertyNames": frozenset({"xgrammar"}),

@@ -119,7 +119,11 @@ class GuidanceGrammar(StructuredOutputGrammar):
     vocab_size: int
     printed_error: bool = False
     terminated: bool = False
-    rollback_lag: int = 0
+    # Tokens reported accepted that never entered the matcher, because it had
+    # already stopped. The caller rewinds by the number of tokens it was told
+    # were accepted, so rollback has to discount these -- otherwise it rewinds
+    # past the start of the window and into text the model has already emitted.
+    unconsumed: int = 0
 
     def check_error(self):
         if not self.printed_error:
@@ -136,13 +140,16 @@ class GuidanceGrammar(StructuredOutputGrammar):
         """
 
         if self.ll_tokenizer.eos_token in tokens:
-            if self.ll_matcher.is_stopped() and not self.terminated:
-                self.rollback_lag = 1
             self.terminated = True
             # Specdec may emit EOS and then some. Stop before then.
             tokens = tokens[: tokens.index(self.ll_tokenizer.eos_token) + 1]
 
         if self.ll_matcher.is_stopped():
+            # A stopped matcher has nothing left to advance through, so these
+            # are accepted without being consumed. Count them: a draft window
+            # can land here several tokens deep, and every one of them is a
+            # token the caller will ask to be rewound.
+            self.unconsumed += len(tokens)
             return True
 
         # TODO - Add jump decoding support in the future:
@@ -176,11 +183,16 @@ class GuidanceGrammar(StructuredOutputGrammar):
         return tokens[:num_tokens]
 
     def rollback(self, num_tokens: int) -> None:
-        if num_tokens > 0:
-            self.ll_matcher.rollback(num_tokens - self.rollback_lag)
-            self.terminated = False
-            self.rollback_lag = 0
-            self.check_error()
+        if num_tokens <= 0:
+            return
+        # Rewind only what actually went in. The rest moved nothing, so
+        # rewinding for them would undo tokens from before this window.
+        consumed = max(num_tokens - self.unconsumed, 0)
+        self.unconsumed = 0
+        self.terminated = False
+        if consumed:
+            self.ll_matcher.rollback(consumed)
+        self.check_error()
 
     def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
         # this will automatically return [EOS] mask if the matcher is stopped
@@ -193,6 +205,8 @@ class GuidanceGrammar(StructuredOutputGrammar):
 
     def reset(self):
         # This method may be not needed anymore? TODO
+        self.terminated = False
+        self.unconsumed = 0
         self.ll_matcher.reset()
 
 

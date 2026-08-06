@@ -63,8 +63,11 @@ def test_backend_guidance_rollback_terminated():
     assert grammar.is_terminated()
     # Giving any other token should also be accepted
     assert grammar.accept_tokens("", dummy_wrong)
-    # Rollback is done from where state was terminated, so from '}' not EOS
-    grammar.rollback(len(prompt) - 1)
+    # The rewind is counted in tokens the caller was told were accepted, which
+    # here is everything past the first: the rest of the prompt, the EOS, and
+    # the junk after it. Only the prompt tokens ever moved the matcher, so only
+    # those are undone and it lands just after prompt[0] -- from '}' not EOS.
+    grammar.rollback((len(prompt) - 1) + 1 + len(dummy_wrong))
     assert not grammar.is_terminated()
     assert grammar.validate_tokens([tokenizer.eos_token_id]) == []
     assert grammar.validate_tokens(dummy_wrong) != dummy_wrong
@@ -77,6 +80,50 @@ def test_backend_guidance_rollback_terminated():
     assert grammar.is_terminated()
     grammar.rollback(-1)
     assert grammar.is_terminated()
+
+
+@pytest.mark.parametrize(
+    "tail_len,why",
+    [
+        (1, "EOS alone: the one case the old rollback_lag counted"),
+        (4, "EOS and then some, which is what a 5-token draft window looks like"),
+        (2, "no EOS at all: the matcher can stop on the closing brace"),
+    ],
+)
+def test_rollback_does_not_rewind_tokens_the_matcher_never_took(tail_len, why):
+    """A stopped matcher accepts without consuming, and must rewind by as much.
+
+    The caller counts the tokens it was told were accepted and asks for exactly
+    that many back. Tokens offered to an already-stopped matcher move nothing,
+    so counting them into the rewind takes the matcher back past the start of
+    the window and into text the model has already emitted -- after which the
+    bitmask constrains against a prefix that is several tokens stale, and the
+    reply comes apart. Only reachable under speculative decoding, where a whole
+    draft window can be offered past the point the grammar was satisfied.
+    """
+    structured_outputs_config = StructuredOutputsConfig(backend="guidance")
+    aphrodite_config = AphroditeConfig(structured_outputs_config=structured_outputs_config)
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+    backend = GuidanceBackend(aphrodite_config, tokenizer=tokenizer, vocab_size=50257)
+    grammar = backend.compile_grammar(StructuredOutputOptions.JSON, '{"type": "object"}')
+
+    prompt = tokenizer.encode('{"a": "b"}')
+    for token in prompt:
+        assert grammar.accept_tokens("", [token])
+    # The object is complete, so the matcher is done and every further token is
+    # accepted without moving it.
+    assert grammar.ll_matcher.is_stopped()
+
+    tail = ([tokenizer.eos_token_id] + prompt)[:tail_len]
+    # Feed the window the way the bitmask loop does: one token per call,
+    # counting each acceptance, then rewinding by the count.
+    advancements = sum(1 for token in tail if grammar.accept_tokens("", [token]))
+    assert advancements == tail_len
+    grammar.rollback(advancements)
+
+    # Still sitting on the closing brace, not somewhere back inside the object.
+    assert grammar.ll_matcher.is_stopped(), why
+    assert grammar.validate_tokens(prompt) == []
 
 
 def test_grammar_bitmask_with_specdec():

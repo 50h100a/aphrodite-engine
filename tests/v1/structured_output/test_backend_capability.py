@@ -74,7 +74,13 @@ PROBES: dict[str, tuple[dict, object, object]] = {
         {"a": "x"},
         {"a": "x", "eta": 3},
     ),
-    "not": (_open(**{"not": {"required": ["p"]}}), {"a": "z", "p": 1}, {"a": "z"}),
+    # The legal instance carries an extra property of its own, and has to. This
+    # `not` forbids one particular key, so a backend that closes the object
+    # refuses the violation without reading the keyword at all; only an
+    # instance that uses the freedom `not` leaves open can tell the two apart.
+    # `additionalProperties: True` does not settle it, because the backends
+    # that close the object are the ones that ignore it.
+    "not": (_open(**{"not": {"required": ["p"]}}), {"a": "z", "p": 1}, {"a": "z", "q": 1}),
     "unevaluatedProperties": (
         {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"], "unevaluatedProperties": False},
         {"a": "z", "x": 1},
@@ -321,7 +327,11 @@ ORDINARY = {
     "additionalProperties": False,
 }
 NEEDS_GUIDANCE = {**ORDINARY, "allOf": [{"required": ["a"]}]}
-NEEDS_OUTLINES = {
+# No keyword routes to outlines alone any more, so there is no NEEDS_OUTLINES.
+# Everything outlines enforces, xgrammar enforces too, and `auto` reaches
+# xgrammar first; outlines is left for the requests the earlier two decline for
+# reasons that have nothing to do with keywords.
+NEEDS_NOBODY = {
     "type": "object",
     "properties": {"u": {"type": "string"}},
     "required": ["u"],
@@ -375,9 +385,16 @@ def test_allof_is_routed_past_xgrammar_to_guidance(route):
     assert route(NEEDS_GUIDANCE) == "guidance"
 
 
-def test_not_is_routed_past_both_to_outlines(route):
-    """`not` is ignored by xgrammar and declined by guidance."""
-    assert route(NEEDS_OUTLINES) == "outlines"
+def test_not_is_refused_because_nothing_enforces_it(route):
+    """`not` used to be recorded as outlines' and lm-format-enforcer's.
+
+    Neither reads it. Both drop the keyword and close the object instead, which
+    happens to refuse a violation of a `not` over `required` -- and refuses the
+    keys `not` permits along with it, so the request was both unenforced and
+    walled. With the table corrected there is nowhere to send it.
+    """
+    with pytest.raises(ValueError, match="cannot be enforced by structured output"):
+        route(NEEDS_NOBODY)
 
 
 def test_a_pinned_backend_that_would_ignore_the_schema_is_refused(route):
@@ -465,19 +482,24 @@ def test_a_structures_form_tag_may_also_go_to_guidance(route):
     assert route(structural_tag=tag) == "guidance"
 
 
-def test_a_tag_is_never_routed_to_a_backend_that_cannot_compile_it(route):
-    """`not` puts the schema on outlines and lm-format-enforcer, neither of
-    which can read the tag it arrives in. Routing on the schema alone picked
-    outlines here and the request died in the engine."""
-    with pytest.raises(ValueError, match="cannot be enforced in a tool call"):
-        route(structural_tag=_tag_around(NEEDS_OUTLINES))
+@pytest.mark.parametrize(
+    "schema",
+    [
+        NEEDS_GUIDANCE,
+        {**ORDINARY, "properties": {"n": {"type": "number", "multipleOf": 0.25}}, "required": ["n"]},
+    ],
+    ids=["allOf", "multipleOf"],
+)
+def test_a_tag_is_never_routed_to_a_backend_that_cannot_compile_it(route, schema):
+    """A tool schema only guidance enforces, inside a tag only xgrammar reads.
 
-
-def test_a_tag_whose_schema_needs_guidance_survives_the_nested_form(route):
-    """`allOf` needs guidance and the nested form needs xgrammar; nothing does
-    both, so this is refused rather than decoded unconstrained."""
+    Each half has a home and they are not the same home, and a request decodes
+    with one backend, so this is refused. Routing on the schema alone looked at
+    the keywords, sent it to a backend that cannot read a structural tag at
+    all, and the request died on the engine's grammar thread as a 500.
+    """
     with pytest.raises(ValueError, match="cannot be enforced in a tool call"):
-        route(structural_tag=_tag_around(NEEDS_GUIDANCE))
+        route(structural_tag=_tag_around(schema))
 
 
 def test_a_pinned_backend_that_cannot_read_the_tag_is_refused(route):
@@ -487,7 +509,7 @@ def test_a_pinned_backend_that_cannot_read_the_tag_is_refused(route):
 
 def test_the_tag_check_leaves_ordinary_requests_alone(route):
     """No tag means no opinion: the plain JSON route must route as before."""
-    assert route(NEEDS_OUTLINES) == "outlines"
+    assert route(ORDINARY) == "xgrammar"
     assert route(NEEDS_GUIDANCE) == "guidance"
 
 
