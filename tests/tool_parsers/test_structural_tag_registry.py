@@ -329,13 +329,13 @@ def test_harmony_tag_always_admits_the_analysis_channel(
     assert "<|channel|>analysis<|message|>" in tag
 
 
-def test_harmony_tag_admits_the_commentary_preamble(
+def _harmony_tag(
     monkeypatch: pytest.MonkeyPatch,
-    sample_tools_strict: list[ChatCompletionToolsParam],
-):
-    """gpt-oss narrates on `commentary` with no recipient before it calls a
-    tool, and HarmonyParser reads that segment back as content. The xgrammar
-    template omits the form, so the grammar has to be told about it."""
+    tools: list[ChatCompletionToolsParam],
+    *,
+    tool_choice: str,
+) -> dict:
+    """Build the structural tag HarmonyParser installs, decoded back to a dict."""
     from aphrodite.parser.harmony import HarmonyParser
 
     monkeypatch.setattr(HarmonyParser, "tool_parser_cls", GptOssToolParser)
@@ -344,22 +344,45 @@ def test_harmony_tag_admits_the_commentary_preamble(
     request = ChatCompletionRequest(
         messages=[],
         model="m",
-        tools=sample_tools_strict,
-        tool_choice="required",
+        tools=tools,
+        tool_choice=tool_choice,
     )
-    parser = HarmonyParser(MagicMock(), tools=sample_tools_strict)
-
-    out = parser.adjust_request(request)
+    out = HarmonyParser(MagicMock(), tools=tools).adjust_request(request)
 
     assert out.structured_outputs is not None
     raw_tag = out.structured_outputs.structural_tag
     assert raw_tag is not None
-    tag = json.loads(raw_tag)
+    return json.loads(raw_tag)
+
+
+def test_harmony_tag_admits_the_commentary_preamble(
+    monkeypatch: pytest.MonkeyPatch,
+    sample_tools_strict: list[ChatCompletionToolsParam],
+):
+    """gpt-oss narrates on `commentary` with no recipient before it calls a
+    tool, and HarmonyParser reads that segment back as content. The xgrammar
+    template omits the form, so the grammar has to be told about it."""
+    tag = _harmony_tag(monkeypatch, sample_tools_strict, tool_choice="auto")
+
     begins = [t["begin"] for t in tag["format"]["tags"]]
     assert "<|channel|>commentary<|message|>" in begins
     # The preamble is free text, not a tool call misfiled under it.
     preamble = next(t for t in tag["format"]["tags"] if t["begin"] == "<|channel|>commentary<|message|>")
     assert preamble["content"]["type"] == "any_text"
+
+
+def test_required_tool_choice_keeps_the_preamble_out(
+    monkeypatch: pytest.MonkeyPatch,
+    sample_tools_strict: list[ChatCompletionToolsParam],
+):
+    """Under `required` the template drops the `final` channel to push the
+    model into a call. A preamble is free text by another name, so admitting
+    one there would hand back the escape the template just took away."""
+    tag = _harmony_tag(monkeypatch, sample_tools_strict, tool_choice="required")
+
+    begins = [t["begin"] for t in tag["format"]["tags"]]
+    assert "<|channel|>final<|message|>" not in begins
+    assert "<|channel|>commentary<|message|>" not in begins
 
 
 def test_structural_tag_marks_the_grammar_as_covering_reasoning(

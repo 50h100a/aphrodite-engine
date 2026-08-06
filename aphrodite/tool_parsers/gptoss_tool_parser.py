@@ -15,6 +15,12 @@ if TYPE_CHECKING:
 
 
 _COMMENTARY_PREAMBLE = "<|channel|>commentary<|message|>"
+_FINAL_CHANNEL = "<|channel|>final<|message|>"
+
+
+def _tag_begin(tag) -> str | None:
+    begin = tag.begin
+    return begin if isinstance(begin, str) else None
 
 
 def _admit_commentary_preamble(tag):
@@ -26,23 +32,27 @@ def _admit_commentary_preamble(tag):
     `commentary to=functions.*` call forms, and the tag is a closed alternation
     rather than a set of triggers -- so leaving the preamble out does not make
     it optional, it makes it unreachable.
+
+    Only added when the template already admits a free-text reply. Under
+    `tool_choice="required"` it drops the `final` channel to push the model
+    toward a call, and a preamble is free text by another name: adding it there
+    would hand back the escape the template just took away.
     """
     from xgrammar.structural_tag import AnyTextFormat, TagFormat, TagsWithSeparatorFormat
 
     fmt = tag.format
     if not isinstance(fmt, TagsWithSeparatorFormat):
         return tag
-    if any(getattr(t.begin, "begin", t.begin) == _COMMENTARY_PREAMBLE for t in fmt.tags):
+
+    begins = {_tag_begin(t) for t in fmt.tags}
+    if _COMMENTARY_PREAMBLE in begins or _FINAL_CHANNEL not in begins:
         return tag
 
-    # Borrow the terminators the template already uses for free text.
-    ends = [t.end for t in fmt.tags if isinstance(t.content, AnyTextFormat)]
-    end = ends[0] if ends else ["<|end|>", "<|return|>"]
+    # Borrow the terminators the template already uses for the free-text reply.
+    final = next(t for t in fmt.tags if _tag_begin(t) == _FINAL_CHANNEL)
 
     tag = tag.model_copy(deep=True)
-    tag.format.tags.append(
-        TagFormat(begin=_COMMENTARY_PREAMBLE, content=AnyTextFormat(), end=end)
-    )
+    tag.format.tags.append(TagFormat(begin=_COMMENTARY_PREAMBLE, content=AnyTextFormat(), end=final.end))
     return tag
 
 
