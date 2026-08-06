@@ -166,6 +166,13 @@ def validate_structured_output_request_outlines(params: SamplingParams):
 
     so_params = params.structured_outputs
 
+    if so_params.structural_tag:
+        # Said here rather than left to compile_grammar, which runs on the
+        # engine's grammar thread: raising there is a 500 for a request the
+        # frontend could have refused, or, under backend='auto', a silent
+        # acceptance that routes the request to a backend that cannot take it.
+        raise ValueError("Outlines structured outputs backend does not support structural tags")
+
     if so_params.regex:
         validate_regex_is_buildable(so_params.regex)
     elif so_params.json:

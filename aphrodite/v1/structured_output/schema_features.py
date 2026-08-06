@@ -223,6 +223,67 @@ def get_json_schema_backend_conflict(schema: Any) -> list[str]:
     return sorted(keywords)
 
 
+# Which backends can compile a structural tag, by the form the tag takes.
+#
+# The tag is how a tool call reaches the grammar, and it is not a JSON schema,
+# so schema keywords alone do not say where a tool request can go. xgrammar
+# understands both spellings; guidance only the older `structures`/`triggers`
+# one; outlines and lm-format-enforcer neither. The two that cannot do not say
+# so when asked to validate one -- they accept it in silence and then raise from
+# the engine's compile thread, which reaches the caller as a 500 -- so routing
+# has to know this before it dispatches.
+_STRUCTURES_TAG_BACKENDS = frozenset({"xgrammar", "guidance"})
+_NESTED_TAG_BACKENDS = frozenset({"xgrammar"})
+
+
+def get_structural_tag_backends(structural_tag: Any) -> frozenset[str]:
+    """Backends that can compile ``structural_tag``, or all of them if there is none."""
+    if structural_tag is None:
+        return JSON_SCHEMA_BACKENDS
+    if isinstance(structural_tag, str):
+        try:
+            structural_tag = json.loads(structural_tag)
+        except ValueError:
+            # Malformed; whoever parses it for real is the one to say so.
+            return JSON_SCHEMA_BACKENDS
+    if isinstance(structural_tag, dict) and "structures" in structural_tag:
+        return _STRUCTURES_TAG_BACKENDS
+    return _NESTED_TAG_BACKENDS
+
+
+def get_backends_for_request(structured_outputs: Any) -> frozenset[str]:
+    """Backends that can enforce everything a request asks for: schemas and tag.
+
+    Routing reads this rather than ``get_json_schema_backends_for_request``,
+    which answers only half the question for anything arriving by the tool route.
+    """
+    return get_json_schema_backends_for_request(structured_outputs) & get_structural_tag_backends(
+        getattr(structured_outputs, "structural_tag", None)
+    )
+
+
+def get_structural_tag_backend_conflict(structured_outputs: Any) -> list[str]:
+    """Return the tool-schema keywords that no structural-tag backend enforces.
+
+    Each is enforceable somewhere and the tag is compilable somewhere, but never
+    by the same backend, and a request decodes with one backend. Empty when the
+    request has a home, or when it has no structural tag to place.
+    """
+    tag = getattr(structured_outputs, "structural_tag", None)
+    if tag is None:
+        return []
+    tag_backends = get_structural_tag_backends(tag)
+    if get_json_schema_backends_for_request(structured_outputs) & tag_backends:
+        return []
+    blame = {
+        key
+        for schema in iter_request_json_schemas(structured_outputs)
+        for key in _iter_constraining_keywords(_as_schema(schema))
+        if not (_KEYWORD_BACKENDS[key] & tag_backends)
+    }
+    return sorted(blame)
+
+
 def unenforceable_keys_message(keys: list[str]) -> str:
     """The rejection text, shared so the API and engine layers cannot drift."""
     return (
@@ -238,6 +299,18 @@ def backend_conflict_message(keys: list[str]) -> str:
         f"JSON schema keyword(s) {keys} cannot be enforced together: no one structured "
         f"output backend enforces all of them ({wanted}), and a request decodes with "
         "one backend. Drop one of them and validate the generated output instead."
+    )
+
+
+def structural_tag_conflict_message(keys: list[str], tag_backends: frozenset[str]) -> str:
+    """The rejection text for a tool schema that cannot ride its own tag."""
+    wanted = ", ".join(f"{key} needs {sorted(_KEYWORD_BACKENDS[key])}" for key in keys)
+    return (
+        f"JSON schema keyword(s) {keys} cannot be enforced in a tool call: the structural "
+        "tag a tool call is wrapped in can only be compiled by "
+        f"{sorted(tag_backends)}, which do not enforce them ({wanted}), and a request "
+        "decodes with one backend. Drop them from the tool's parameters and validate "
+        "the arguments instead."
     )
 
 
@@ -352,4 +425,12 @@ def get_structured_outputs_schema_error(structured_outputs: Any) -> str | None:
     for schema in schemas:
         if conflict := get_json_schema_backend_conflict(schema):
             return backend_conflict_message(conflict)
+    # Last, because it is the same question asked across the tag rather than
+    # within one schema: keywords with a home, and a tag with a home, that are
+    # not the same home.
+    if conflict := get_structural_tag_backend_conflict(structured_outputs):
+        return structural_tag_conflict_message(
+            conflict,
+            get_structural_tag_backends(getattr(structured_outputs, "structural_tag", None)),
+        )
     return None

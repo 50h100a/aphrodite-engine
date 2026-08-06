@@ -163,6 +163,10 @@ class OnlineRenderer:
             # For GPT-OSS.
             should_include_tools = tool_dicts is not None
             conversation, engine_inputs = self._make_request_with_harmony(request, should_include_tools)
+            # This path builds its own prompt and so never enters
+            # preprocess_chat, which is where every other model gets its
+            # structural tag installed.
+            self.adjust_request_for_parsers(request, self.parser, request.chat_template_kwargs)
 
         return conversation, engine_inputs
 
@@ -306,6 +310,62 @@ class OnlineRenderer:
             skip_mm_cache=skip_mm_cache,
         )
 
+    def adjust_request_for_parsers(
+        self,
+        request: Any,
+        parser: type[Parser] | None,
+        chat_template_kwargs: dict[str, Any] | None,
+    ) -> None:
+        """Let the configured parsers rewrite the request before it is sampled.
+
+        This is where a tool parser installs its structural tag, so every render
+        path has to come through here -- a path that skips it produces a request
+        with no grammar and no schema screening at all.
+
+        Tool parsing is done only if a tool_parser has been set and if
+        tool_choice is not "none" (if tool_choice is "none" but a tool_parser
+        is set, we want to prevent parsing a tool_call hallucinated by the LLM).
+
+        Exception: Mistral grammar-capable tokenizers always call
+        adjust_request -- even for tool_choice="none" -- so that the grammar
+        factory can prevent special-token leakage.
+
+        The parsers mutate ``request`` in place; callers keep their own
+        reference to it, so nothing is returned.
+        """
+        if parser is None:
+            return
+
+        tokenizer = self.renderer.get_tokenizer()
+        tool_parser = parser.tool_parser_cls
+        tool_choice = getattr(request, "tool_choice", "none")
+        is_mistral_grammar_eligible = (
+            tool_parser is not None
+            and is_mistral_tool_parser(tool_parser)
+            and is_mistral_tokenizer(tokenizer)
+            and tokenizer.supports_grammar
+        )
+        should_adjust_request = (
+            parser.reasoning_parser_cls is not None or tool_choice != "none" or is_mistral_grammar_eligible
+        )
+        if not should_adjust_request:
+            return
+
+        if not isinstance(request, ChatCompletionRequest | ResponsesRequest):
+            msg = (
+                "Tool usage is only supported "
+                "for Chat Completions API or Responses API requests, "
+                f"but got {type(request).__name__}"
+            )
+            raise NotImplementedError(msg)
+
+        parser(
+            tokenizer,
+            request.tools,
+            model_config=self.model_config,
+            chat_template_kwargs=chat_template_kwargs,
+        ).adjust_request(request=request)
+
     async def preprocess_chat(
         self,
         request: Any,
@@ -347,41 +407,6 @@ class OnlineRenderer:
             skip_mm_cache=skip_mm_cache,
         )
 
-        # tool parsing is done only if a tool_parser has been set and if
-        # tool_choice is not "none" (if tool_choice is "none" but a tool_parser
-        # is set, we want to prevent parsing a tool_call hallucinated by the LLM
-        #
-        # Exception: Mistral grammar-capable tokenizers always call
-        # adjust_request — even for tool_choice="none" — so that the grammar
-        # factory can prevent special-token leakage.
-        if parser is not None:
-            tokenizer = renderer.get_tokenizer()
-            tool_parser = parser.tool_parser_cls
-            tool_choice = getattr(request, "tool_choice", "none")
-            is_mistral_grammar_eligible = (
-                tool_parser is not None
-                and is_mistral_tool_parser(tool_parser)
-                and is_mistral_tokenizer(tokenizer)
-                and tokenizer.supports_grammar
-            )
-            should_adjust_request = (
-                parser.reasoning_parser_cls is not None or tool_choice != "none" or is_mistral_grammar_eligible
-            )
-            if should_adjust_request:
-                if not isinstance(request, ChatCompletionRequest | ResponsesRequest):
-                    msg = (
-                        "Tool usage is only supported "
-                        "for Chat Completions API or Responses API requests, "
-                        f"but got {type(request).__name__}"
-                    )
-                    raise NotImplementedError(msg)
-                request = parser(
-                    tokenizer,
-                    request.tools,
-                    model_config=self.model_config,
-                    chat_template_kwargs=chat_params.chat_template_kwargs,
-                ).adjust_request(
-                    request=request,
-                )
+        self.adjust_request_for_parsers(request, parser, chat_params.chat_template_kwargs)
 
         return conversation, [engine_input]

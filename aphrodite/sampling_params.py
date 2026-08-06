@@ -1090,7 +1090,8 @@ class SamplingParams(
         )
         from aphrodite.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
         from aphrodite.v1.structured_output.schema_features import (
-            get_json_schema_backends_for_request,
+            get_backends_for_request,
+            get_structural_tag_backends,
             get_structured_outputs_schema_error,
         )
 
@@ -1103,9 +1104,18 @@ class SamplingParams(
         if schema_error is not None:
             raise ValueError(schema_error)
 
-        capable = get_json_schema_backends_for_request(self.structured_outputs)
+        capable = get_backends_for_request(self.structured_outputs)
         configured = backend.split(":", 1)[0]
         if configured != "auto" and configured not in capable:
+            tag_backends = get_structural_tag_backends(self.structured_outputs.structural_tag)
+            if configured not in tag_backends:
+                # Not a matter of degree: it cannot read the tag at all, and
+                # says so only by raising from the engine's compile thread.
+                raise ValueError(
+                    f"The '{configured}' structured output backend cannot compile the "
+                    "structural tag this request carries, which is how a tool call "
+                    f"reaches the grammar. Backends that can: {sorted(tag_backends)}."
+                )
             raise ValueError(
                 f"The '{configured}' structured output backend does not enforce every "
                 "keyword in this request's JSON schema, and would decode as though the "

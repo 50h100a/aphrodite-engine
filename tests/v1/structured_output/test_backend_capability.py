@@ -351,8 +351,10 @@ def route(monkeypatch):
     model_config = Mock(spec=ModelConfig)
     model_config.is_diffusion = False
 
-    def _route(schema, backend="auto"):
-        params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))
+    def _route(schema=None, backend="auto", structural_tag=None):
+        params = SamplingParams(
+            structured_outputs=StructuredOutputsParams(json=schema, structural_tag=structural_tag)
+        )
         config = Mock(spec=StructuredOutputsConfig)
         config.backend = backend
         params._validate_structured_outputs(model_config, config, Mock())
@@ -405,3 +407,105 @@ def test_requests_with_no_json_schema_are_never_refused_for_capability(route):
     params._validate_structured_outputs(model_config, config, Mock())
 
     assert params.structured_outputs._backend == "xgrammar"
+
+
+# ---------------------------------------------------------------------------
+# Structural tags: the same routing question, asked about the wrapper rather
+# than the schema inside it.
+#
+# A tool call reaches the grammar wrapped in a structural tag, and a tag is not
+# a JSON schema -- so the keyword table alone does not say where a tool request
+# can go. Only xgrammar compiles the nested `format` spelling; guidance adds the
+# older `structures`/`triggers` one; outlines and lm-format-enforcer compile
+# neither, and do not say so when asked to validate one. Routing on keywords
+# alone therefore sent tool calls to backends that accepted them in silence and
+# then raised from the engine's grammar thread, which reaches the caller as a
+# 500 rather than a rejection.
+# ---------------------------------------------------------------------------
+
+NESTED_TAG = json.dumps(
+    {
+        "type": "structural_tag",
+        "format": {
+            "type": "tags_with_separator",
+            "tags": [
+                {
+                    "begin": "<|channel|>commentary to=functions.f<|message|>",
+                    "content": {"type": "json_schema", "json_schema": ORDINARY},
+                    "end": "<|call|>",
+                }
+            ],
+            "separator": "<|start|>assistant",
+            "at_least_one": False,
+            "stop_after_first": False,
+        },
+    }
+)
+
+
+def _tag_around(schema):
+    tag = json.loads(NESTED_TAG)
+    tag["format"]["tags"][0]["content"]["json_schema"] = schema
+    return json.dumps(tag)
+
+
+def test_a_nested_structural_tag_routes_to_xgrammar(route):
+    assert route(structural_tag=NESTED_TAG) == "xgrammar"
+
+
+def test_a_structures_form_tag_may_also_go_to_guidance(route):
+    """The older spelling has two homes, so a schema xgrammar would ignore can
+    still be routed rather than refused."""
+    tag = json.dumps(
+        {
+            "triggers": ["<function="],
+            "structures": [{"begin": "<function=f>", "schema": NEEDS_GUIDANCE, "end": "</function>"}],
+        }
+    )
+    assert route(structural_tag=tag) == "guidance"
+
+
+def test_a_tag_is_never_routed_to_a_backend_that_cannot_compile_it(route):
+    """`not` puts the schema on outlines and lm-format-enforcer, neither of
+    which can read the tag it arrives in. Routing on the schema alone picked
+    outlines here and the request died in the engine."""
+    with pytest.raises(ValueError, match="cannot be enforced in a tool call"):
+        route(structural_tag=_tag_around(NEEDS_OUTLINES))
+
+
+def test_a_tag_whose_schema_needs_guidance_survives_the_nested_form(route):
+    """`allOf` needs guidance and the nested form needs xgrammar; nothing does
+    both, so this is refused rather than decoded unconstrained."""
+    with pytest.raises(ValueError, match="cannot be enforced in a tool call"):
+        route(structural_tag=_tag_around(NEEDS_GUIDANCE))
+
+
+def test_a_pinned_backend_that_cannot_read_the_tag_is_refused(route):
+    with pytest.raises(ValueError, match="cannot compile the structural tag"):
+        route(structural_tag=NESTED_TAG, backend="outlines")
+
+
+def test_the_tag_check_leaves_ordinary_requests_alone(route):
+    """No tag means no opinion: the plain JSON route must route as before."""
+    assert route(NEEDS_OUTLINES) == "outlines"
+    assert route(NEEDS_GUIDANCE) == "guidance"
+
+
+@pytest.mark.parametrize("validate", ["outlines", "lm-format-enforcer"])
+def test_tagless_backends_decline_a_tag_instead_of_accepting_it(validate):
+    """The silence is the bug: both used to return None here and raise later,
+    on the engine's grammar thread, where it is a 500."""
+    from aphrodite.sampling_params import SamplingParams, StructuredOutputsParams
+
+    if validate == "outlines":
+        from aphrodite.v1.structured_output.backend_outlines import (
+            validate_structured_output_request_outlines as fn,
+        )
+    else:
+        from aphrodite.v1.structured_output.backend_lm_format_enforcer import (
+            validate_structured_output_request_lm_format_enforcer as fn,
+        )
+
+    params = SamplingParams(structured_outputs=StructuredOutputsParams(structural_tag=NESTED_TAG))
+    with pytest.raises(ValueError, match="does not support structural tags"):
+        fn(params)

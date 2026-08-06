@@ -143,6 +143,11 @@ def validate_structured_output_request_lm_format_enforcer(params: SamplingParams
 
     so_params = params.structured_outputs
 
+    if so_params.structural_tag:
+        # See the same check in the outlines backend: without it this is a 500
+        # raised from the engine's grammar thread rather than a rejection.
+        raise ValueError("lm-format-enforcer structured outputs backend does not support structural tags")
+
     if so_params.regex:
         try:
             compile_regex_with_timeout(
