@@ -82,6 +82,16 @@ class HarmonyParser(DelegatingParser):
         self._num_processed_messages = 0
         self._current_message_tokens: list[int] = []
 
+    def _grammar_needs_reasoning(self) -> bool:
+        """Harmony always opens on the analysis channel.
+
+        Unlike parsers whose reasoning syntax only shows up once a reasoning
+        parser is configured, the analysis channel is part of the Harmony
+        format itself. Dropping the reasoning parser stops us from surfacing
+        that segment; it does not stop the model from emitting it.
+        """
+        return True
+
     @property
     def _harmony_parser(self) -> StreamableParser:
         """Lazily initializes the Harmony parser."""

@@ -25,6 +25,7 @@ from aphrodite.tool_parsers.deepseekv32_engine_tool_parser import (
     DeepSeekV32EngineToolParser,
 )
 from aphrodite.tool_parsers.glm47_moe_tool_parser import Glm47MoeModelToolParser
+from aphrodite.tool_parsers.gptoss_tool_parser import GptOssToolParser
 from aphrodite.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
 from aphrodite.tool_parsers.kimi_k2_tool_parser import KimiK2ToolParser
 from aphrodite.tool_parsers.llama_tool_parser import Llama3JsonToolParser
@@ -191,6 +192,7 @@ def test_get_model_structural_tag_supports_named_tool_choice(
         (DeepSeekV32EngineToolParser, "deepseek_v3_2"),
         (DeepSeekV4EngineToolParser, "deepseek_v4"),
         (Glm47MoeModelToolParser, "glm_4_7"),
+        (GptOssToolParser, "harmony"),
         (Hermes2ProToolParser, "hermes"),
         (KimiK2ToolParser, "kimi"),
         (Llama3JsonToolParser, "llama"),
@@ -257,10 +259,14 @@ def test_get_structural_tag_disables_reasoning(
     assert captured == [False]
 
 
-def test_unified_parser_get_structural_tag_disables_reasoning(
+@pytest.mark.parametrize("has_reasoning_parser", [True, False])
+def test_unified_parser_matches_reasoning_to_the_parser(
     monkeypatch: pytest.MonkeyPatch,
     sample_tools_strict: list[ChatCompletionToolsParam],
+    has_reasoning_parser: bool,
 ):
+    """The tag is a closed alternation, so a model that reasons needs its
+    reasoning segment listed or the grammar forbids its own first token."""
     captured: list[bool] = []
 
     def fake_get_model_structural_tag(*, reasoning: bool, **kwargs):
@@ -282,11 +288,44 @@ def test_unified_parser_get_structural_tag_disables_reasoning(
         tool_choice="auto",
     )
     parser = TestParser(MagicMock(), tools=sample_tools_strict)
-    parser.reasoning_parser = MagicMock(adjust_request=lambda request: request)
+    if has_reasoning_parser:
+        parser.reasoning_parser = MagicMock(adjust_request=lambda request: request)
 
     parser.adjust_request(request)
 
-    assert captured == [False]
+    assert captured == [has_reasoning_parser]
+
+
+@pytest.mark.parametrize("has_reasoning_parser", [True, False])
+def test_harmony_tag_always_admits_the_analysis_channel(
+    monkeypatch: pytest.MonkeyPatch,
+    sample_tools_strict: list[ChatCompletionToolsParam],
+    has_reasoning_parser: bool,
+):
+    """The analysis channel belongs to the Harmony format, not to the reasoning
+    parser. Dropping the parser stops us surfacing that segment; it does not
+    stop the model emitting it, so the grammar must admit it either way."""
+    from aphrodite.parser.harmony import HarmonyParser
+
+    monkeypatch.setattr(HarmonyParser, "tool_parser_cls", GptOssToolParser)
+    monkeypatch.setattr(HarmonyParser, "reasoning_parser_cls", None)
+
+    request = ChatCompletionRequest(
+        messages=[],
+        model="m",
+        tools=sample_tools_strict,
+        tool_choice="required",
+    )
+    parser = HarmonyParser(MagicMock(), tools=sample_tools_strict)
+    if has_reasoning_parser:
+        parser.reasoning_parser = MagicMock(adjust_request=lambda request: request)
+
+    out = parser.adjust_request(request)
+
+    assert out.structured_outputs is not None
+    tag = out.structured_outputs.structural_tag
+    assert tag is not None
+    assert "<|channel|>analysis<|message|>" in tag
 
 
 def test_xgrammar_function_parameters_are_preserved(

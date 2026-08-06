@@ -504,6 +504,16 @@ class DelegatingParser(Parser):
             request = self._tool_parser.adjust_request(request)
         return request
 
+    def _grammar_needs_reasoning(self) -> bool:
+        """Whether the structural tag must leave room for a reasoning segment.
+
+        The tag is a closed alternation, not a trigger: a form the model emits
+        but the grammar does not list is a form the model cannot emit. So a
+        model that reasons needs its reasoning segment spelled out, or the
+        grammar forbids the very first thing it tries to say.
+        """
+        return self._reasoning_parser is not None
+
     def _apply_structural_tag(
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
@@ -523,7 +533,7 @@ class DelegatingParser(Parser):
 
         structure_tag = self._tool_parser.get_structural_tag(
             request,
-            reasoning=False,
+            reasoning=self._grammar_needs_reasoning(),
         )
         if structure_tag is None:
             return request
