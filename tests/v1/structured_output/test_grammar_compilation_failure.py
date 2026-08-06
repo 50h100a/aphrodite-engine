@@ -178,7 +178,10 @@ def test_bitmask_is_wide_enough_for_every_backend(aphrodite_config, monkeypatch)
     """Backends disagree on vocab size (guidance rounds up to the tokenizer's
     length), and they all write into one shared bitmask. Sizing it from
     whichever backend happened to be built first would let the wider one write
-    past the end of a row."""
+    past the end of a row.
+
+    Note this is about the *fill* buffer only. What gets published to the
+    workers is always the model-vocab width -- see test_bitmask_width.py."""
 
     def fake_create(self, name):
         # 2 extra words, as a wider tokenizer would give.
@@ -192,13 +195,16 @@ def test_bitmask_is_wide_enough_for_every_backend(aphrodite_config, monkeypatch)
     narrow = _request("xgrammar")
     manager.grammar_init(narrow)
     bitmask = manager.grammar_bitmask({"req-xgrammar": narrow}, ["req-xgrammar"], {})
+    assert manager._grammar_bitmask.shape[1] == VOCAB_SIZE // 32
     assert bitmask.shape[1] == VOCAB_SIZE // 32
 
-    # A guidance request shows up later; the shared bitmask has to grow.
+    # A guidance request shows up later; the shared bitmask has to grow so
+    # guidance has room to fill, but the workers still get the model width.
     wide = _request("guidance")
     manager.grammar_init(wide)
     bitmask = manager.grammar_bitmask({"req-guidance": wide}, ["req-guidance"], {})
-    assert bitmask.shape[1] == VOCAB_SIZE // 32 + 2
+    assert manager._grammar_bitmask.shape[1] == VOCAB_SIZE // 32 + 2
+    assert bitmask.shape[1] == VOCAB_SIZE // 32
 
 
 def test_xgrammar_fills_a_bitmask_sized_for_a_wider_backend():

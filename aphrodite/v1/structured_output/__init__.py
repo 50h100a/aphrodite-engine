@@ -11,6 +11,7 @@ from aphrodite.logger import init_logger
 from aphrodite.reasoning import ReasoningParserManager
 from aphrodite.tokenizers import cached_tokenizer_from_config
 from aphrodite.utils.import_utils import LazyLoader
+from aphrodite.utils.math_utils import cdiv
 from aphrodite.v1.structured_output.backend_guidance import GuidanceBackend
 from aphrodite.v1.structured_output.backend_types import (
     StructuredOutputBackend,
@@ -61,6 +62,9 @@ class StructuredOutputManager:
         # Which backends the current bitmask was sized for.
         self._bitmask_backends: frozenset[str] = frozenset()
         self._full_mask = torch.tensor(-1, dtype=torch.int32)
+        # Guidance sizes from the tokenizer length, which can exceed the model vocab, so the fill
+        # buffer and the published mask are not necessarily the same width.
+        self._num_bitmask_words = cdiv(aphrodite_config.model_config.get_vocab_size(), 32)
 
         max_batch_size = self.aphrodite_config.scheduler_config.max_num_seqs
         self.fill_bitmask_parallel_threshold = 128
@@ -225,6 +229,14 @@ class StructuredOutputManager:
                 key=lambda bitmask: bitmask.shape[-1],
             )
             self._bitmask_backends = frozenset(backends)
+            # Narrowing below assumes the fill buffer covers the model vocab.
+            # A backend asking for less than that would mean the tail of the
+            # vocabulary silently went unconstrained.
+            assert self._grammar_bitmask.shape[-1] >= self._num_bitmask_words, (
+                f"structured output backends {sorted(backends)} allocated a "
+                f"{self._grammar_bitmask.shape[-1]}-word bitmask, which does not "
+                f"cover the model vocabulary ({self._num_bitmask_words} words)"
+            )
 
         # Generate a batched bitmask for all structured output requests.
         # When speculative decoding is enabled, we need to include multiple
@@ -349,6 +361,9 @@ class StructuredOutputManager:
         bitmask_tensor = self._grammar_bitmask
         if cumulative_index < bitmask_tensor.shape[0]:
             bitmask_tensor = bitmask_tensor[:cumulative_index]
+        if bitmask_tensor.shape[-1] > self._num_bitmask_words:
+            # Drop the words a backend added past the model vocab
+            bitmask_tensor = bitmask_tensor[:, : self._num_bitmask_words].contiguous()
 
         # After finishing with the xgrammar operations, we convert to
         # np.ndarray, because that is much more efficient for serialization
