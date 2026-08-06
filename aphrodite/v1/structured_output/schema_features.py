@@ -1,10 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Screen JSON schemas before they reach a structured output backend.
+"""Screen JSON schemas before they reach a structured output backend, and say
+which backends can enforce them.
 
-Rejected here: schemas that are malformed (`get_schema_validation_error`), and
-schemas using keywords no regex or CFG can enforce
-(`get_unenforceable_json_schema_keys`).
+`get_structured_outputs_schema_error` is the screen, shared by the API
+entrypoints and the engine so the two layers cannot drift, and covering both
+routes into the grammar -- `response_format` and the structural tag a tool call
+is wrapped in -- so the two routes cannot drift either. It rejects schemas that
+are malformed (`get_schema_validation_error`), schemas using keywords no
+backend enforces (`get_unenforceable_json_schema_keys`), and schemas whose
+keywords are individually enforceable but have no backend in common
+(`get_json_schema_backend_conflict`), since a request decodes with one backend.
+
+`get_json_schema_backends` answers the routing question for everything that
+survives. It exists because a backend cannot be asked: xgrammar compiles a
+schema containing `allOf`, lowers it to "any JSON value", warns only on stderr
+from C++, and then decodes constraining nothing -- indistinguishable, from the
+caller's side, from a model that happened to comply.
 
 Not checked here: whether a schema can be *satisfied*. `{"enum": []}` and a
 contradictory `allOf` are well-formed but match nothing; deciding that in
@@ -53,15 +65,87 @@ _SUBSCHEMA_MAP_KEYS = frozenset(
     }
 )
 
-# These can't be enforced with regex or CFG. Maybe someday.
-_UNENFORCEABLE_JSON_SCHEMA_KEYS = frozenset(
-    {
-        "contains",
-        "maxContains",
-        "minContains",
-        "uniqueItems",
-    }
-)
+JSON_SCHEMA_BACKENDS = frozenset({"xgrammar", "guidance", "outlines", "lm-format-enforcer"})
+
+# Which backends actually *enforce* each constraining keyword.
+#
+# Measured, not read off documentation: each backend was given a schema and an
+# instance violating only the keyword under test, and counts as enforcing it
+# only if it refuses that instance. Compiling without error is not enforcement.
+# xgrammar accepts `allOf` and then lowers the whole schema to "any JSON value",
+# warning on stderr from C++ and constraining nothing at all; llguidance is the
+# only one that reports what it did not implement ("Unimplemented keys").
+#
+# Keywords absent from this table are enforced by every backend: type,
+# properties, required, additionalProperties, enum, const, anyOf, oneOf, $ref,
+# $defs, pattern, minLength/maxLength, minItems/maxItems, maxProperties.
+# `format` is deliberately absent: it is an annotation, not an assertion.
+_KEYWORD_BACKENDS: dict[str, frozenset[str]] = {
+    # Nothing enforces these. A CFG cannot count, compare across the document,
+    # or remember what it already emitted.
+    "contains": frozenset(),
+    "dependentRequired": frozenset(),
+    "dependentSchemas": frozenset(),
+    "else": frozenset(),
+    "if": frozenset(),
+    "maxContains": frozenset(),
+    "minContains": frozenset(),
+    "then": frozenset(),
+    "uniqueItems": frozenset(),
+    # Enforced by some. `auto` routes to one of these; naming a backend that is
+    # not listed is refused rather than silently unenforced.
+    "allOf": frozenset({"guidance"}),
+    "exclusiveMaximum": frozenset({"xgrammar", "guidance"}),
+    "exclusiveMinimum": frozenset({"xgrammar", "guidance"}),
+    "maximum": frozenset({"xgrammar", "guidance"}),
+    "minimum": frozenset({"xgrammar", "guidance"}),
+    "minProperties": frozenset({"xgrammar", "guidance"}),
+    "multipleOf": frozenset({"guidance"}),
+    "not": frozenset({"outlines", "lm-format-enforcer"}),
+    "patternProperties": frozenset({"guidance"}),
+    "prefixItems": frozenset({"xgrammar", "guidance", "outlines"}),
+    "propertyNames": frozenset({"xgrammar"}),
+    "unevaluatedItems": frozenset({"xgrammar", "outlines"}),
+    "unevaluatedProperties": frozenset({"xgrammar", "outlines", "lm-format-enforcer"}),
+}
+
+# Table keywords that constrain nothing when set to their permissive value, so
+# they are not held against the schema.
+_VACUOUS_WHEN = {
+    "unevaluatedItems": True,
+    "unevaluatedProperties": True,
+    "uniqueItems": False,
+}
+
+
+def _constrains(node: dict[str, Any], key: str) -> bool:
+    """Whether ``node[key]`` actually restricts anything.
+
+    A keyword that is present but inert should not cost the caller a backend or
+    a rejection: `uniqueItems: false` says nothing, and `if` without a `then` or
+    an `else` to apply is a no-op the caller most likely did not intend as one.
+    """
+    value = node[key]
+    if key in _VACUOUS_WHEN and value is _VACUOUS_WHEN[key]:
+        return False
+    if isinstance(value, (list, dict)) and not value:
+        # `allOf: []`, `dependentRequired: {}` -- nothing to apply.
+        return False
+    if key == "if":
+        return "then" in node or "else" in node
+    if key in ("then", "else"):
+        return "if" in node
+    if key in ("minContains", "maxContains"):
+        return "contains" in node
+    return True
+
+
+def _iter_constraining_keywords(schema: Any) -> Iterator[str]:
+    """Yield each keyword in ``schema`` that is in the table and constrains."""
+    for node in iter_schema_nodes(schema):
+        for key in _KEYWORD_BACKENDS.keys() & node.keys():
+            if _constrains(node, key):
+                yield key
 
 
 def iter_schema_nodes(schema: Any) -> Iterator[dict[str, Any]]:
@@ -87,21 +171,56 @@ def iter_schema_nodes(schema: Any) -> Iterator[dict[str, Any]]:
                     yield from iter_schema_nodes(item)
 
 
-def get_unenforceable_json_schema_keys(schema: Any) -> list[str]:
-    """Return the unenforceable keywords used by ``schema``, sorted.
-
-    ``schema`` may be a dict or JSON text. Unparseable text yields nothing;
-    malformed JSON is not ours to report.
-    """
+def _as_schema(schema: Any) -> Any:
+    """Parse ``schema`` if it is JSON text. Unparseable text is left alone;
+    malformed JSON is reported by whoever parses it for real."""
     if isinstance(schema, str):
         try:
-            schema = json.loads(schema)
+            return json.loads(schema)
         except ValueError:
-            return []
-    found: set[str] = set()
-    for node in iter_schema_nodes(schema):
-        found.update(_UNENFORCEABLE_JSON_SCHEMA_KEYS.intersection(node))
-    return sorted(found)
+            return None
+    return schema
+
+
+def get_unenforceable_json_schema_keys(schema: Any) -> list[str]:
+    """Return the keywords in ``schema`` that no backend enforces, sorted.
+
+    ``schema`` may be a dict or JSON text. Unparseable text yields nothing.
+    """
+    return sorted({key for key in _iter_constraining_keywords(_as_schema(schema)) if not _KEYWORD_BACKENDS[key]})
+
+
+def get_json_schema_backends(schema: Any) -> frozenset[str]:
+    """Return the backends that enforce every constraining keyword in ``schema``.
+
+    Empty means the schema cannot be enforced by anything we have;
+    ``get_unenforceable_json_schema_keys`` says which keyword is to blame.
+    """
+    backends = JSON_SCHEMA_BACKENDS
+    for key in _iter_constraining_keywords(_as_schema(schema)):
+        backends &= _KEYWORD_BACKENDS[key]
+        if not backends:
+            break
+    return backends
+
+
+def get_json_schema_backend_conflict(schema: Any) -> list[str]:
+    """Return the keywords that pull ``schema`` towards different backends.
+
+    Every one of them is enforceable on its own, but no single backend enforces
+    all of them, and a request decodes with one backend. Empty when the schema
+    has a home (or when some keyword has no home at all, which
+    ``get_unenforceable_json_schema_keys`` reports instead).
+    """
+    keywords = {key: _KEYWORD_BACKENDS[key] for key in _iter_constraining_keywords(_as_schema(schema))}
+    if not keywords or not all(keywords.values()):
+        return []
+    remaining = JSON_SCHEMA_BACKENDS
+    for backends in keywords.values():
+        remaining &= backends
+    if remaining:
+        return []
+    return sorted(keywords)
 
 
 def unenforceable_keys_message(keys: list[str]) -> str:
@@ -109,6 +228,16 @@ def unenforceable_keys_message(keys: list[str]) -> str:
     return (
         f"JSON schema keyword(s) {keys} cannot be enforced by structured output. "
         "Remove them from the schema and validate the generated output instead."
+    )
+
+
+def backend_conflict_message(keys: list[str]) -> str:
+    """The rejection text for a schema no single backend can enforce whole."""
+    wanted = ", ".join(f"{key} needs {sorted(_KEYWORD_BACKENDS[key])}" for key in keys)
+    return (
+        f"JSON schema keyword(s) {keys} cannot be enforced together: no one structured "
+        f"output backend enforces all of them ({wanted}), and a request decodes with "
+        "one backend. Drop one of them and validate the generated output instead."
     )
 
 
@@ -121,11 +250,9 @@ def get_schema_validation_error(schema: Any) -> str | None:
     ``schema`` may be a dict or JSON text. Unparseable text yields None;
     malformed JSON is reported by whoever parses it for real.
     """
-    if isinstance(schema, str):
-        try:
-            schema = json.loads(schema)
-        except ValueError:
-            return None
+    schema = _as_schema(schema)
+    if schema is None:
+        return None
     try:
         jsonschema.validators.validator_for(schema).check_schema(schema)
     except jsonschema.exceptions.SchemaError as err:
@@ -182,3 +309,47 @@ def _iter_nested_json_schemas(node: Any) -> Iterator[dict[str, Any]]:
         return
     for value in node.values():
         yield from _iter_nested_json_schemas(value)
+
+
+def iter_request_json_schemas(structured_outputs: Any) -> Iterator[Any]:
+    """Yield every JSON schema a request carries, whichever route it arrived by.
+
+    ``json`` is the ``response_format`` route. The structural tag is the tool
+    route: a tool's parameters are wrapped in a tag before they reach the
+    grammar, so a screen that reads only ``json`` passes every tool call
+    through unchecked.
+    """
+    if structured_outputs is None:
+        return
+    if (schema := getattr(structured_outputs, "json", None)) is not None:
+        yield schema
+    yield from iter_structural_tag_schemas(getattr(structured_outputs, "structural_tag", None))
+
+
+def get_json_schema_backends_for_request(structured_outputs: Any) -> frozenset[str]:
+    """Backends that enforce every keyword across all of a request's schemas."""
+    backends = JSON_SCHEMA_BACKENDS
+    for schema in iter_request_json_schemas(structured_outputs):
+        backends &= get_json_schema_backends(schema)
+    return backends
+
+
+def get_structured_outputs_schema_error(structured_outputs: Any) -> str | None:
+    """Return why this request's schemas cannot be enforced, or None if they can.
+
+    The single screen behind both the API entrypoints and the engine, covering
+    both routes into the grammar, so that neither the two layers nor the two
+    routes can drift apart.
+    """
+    schemas = list(iter_request_json_schemas(structured_outputs))
+    # Well-formedness first: the keywords of a malformed schema mean nothing.
+    for schema in schemas:
+        if (invalid := get_schema_validation_error(schema)) is not None:
+            return schema_validation_message(invalid)
+    for schema in schemas:
+        if unenforceable := get_unenforceable_json_schema_keys(schema):
+            return unenforceable_keys_message(unenforceable)
+    for schema in schemas:
+        if conflict := get_json_schema_backend_conflict(schema):
+            return backend_conflict_message(conflict)
+    return None

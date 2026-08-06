@@ -26,6 +26,7 @@ from aphrodite.entrypoints.openai.engine.protocol import (
 from aphrodite.entrypoints.openai.responses.protocol import (
     ResponsesRequest,
 )
+from aphrodite.exceptions import AphroditeValidationError
 from aphrodite.logger import init_logger
 from aphrodite.sampling_params import (
     StructuredOutputsParams,
@@ -38,6 +39,38 @@ from aphrodite.utils.import_utils import import_from_path
 __all__ = ["Tool"]
 
 logger = init_logger(__name__)
+
+# `response_format: {"type": "text"}` is the API default and constrains nothing,
+# so it is not in conflict with anything.
+_CONSTRAINING_RESPONSE_FORMATS = frozenset({"json_object", "json_schema", "structural_tag"})
+
+
+def reject_reply_schema_conflict(request: ChatCompletionRequest | ResponsesRequest) -> None:
+    """Refuse a request whose reply schema and tool schema both want the decoder.
+    """
+    if isinstance(request, ResponsesRequest):
+        conflict = getattr(request.text, "format", None) is not None
+        parameter = "text.format"
+    else:
+        response_format = request.response_format
+        conflict = (
+            response_format is not None and getattr(response_format, "type", None) in _CONSTRAINING_RESPONSE_FORMATS
+        )
+        parameter = "response_format"
+
+    if not conflict and getattr(request, "structured_outputs", None) is not None:
+        conflict = True
+        parameter = "structured_outputs"
+
+    if not conflict:
+        return
+
+    raise AphroditeValidationError(
+        f"`{parameter}` cannot be combined with tool calling: both constrain the same "
+        "decoder, and the tool schema takes the grammar. Send them as separate "
+        "requests, or set tool_choice='none' if the reply schema is what you want.",
+        parameter=parameter,
+    )
 
 
 class ToolParser:
@@ -125,6 +158,9 @@ class ToolParser:
         json_schema_from_tool = get_json_schema_from_tools(tool_choice=request.tool_choice, tools=request.tools)
         # Set structured output params for tool calling
         if json_schema_from_tool is not None:
+            # The tool schema is about to take the grammar. Refuse rather than
+            # quietly outrank a reply schema the caller asked for.
+            reject_reply_schema_conflict(request)
             if isinstance(request, ChatCompletionRequest):
                 # tool_choice: "Forced Function" or "required" will override
                 # structured output json settings to make tool calling work correctly

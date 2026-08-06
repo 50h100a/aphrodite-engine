@@ -32,7 +32,11 @@ from aphrodite.parser.utils import count_history_tool_calls
 from aphrodite.reasoning.abs_reasoning_parsers import ReasoningParser
 from aphrodite.sampling_params import StructuredOutputsParams
 from aphrodite.tokenizers import TokenizerLike
-from aphrodite.tool_parsers.abstract_tool_parser import Tool, ToolParser
+from aphrodite.tool_parsers.abstract_tool_parser import (
+    Tool,
+    ToolParser,
+    reject_reply_schema_conflict,
+)
 from aphrodite.tool_parsers.streaming import (
     extract_named_tool_call_streaming,
     extract_required_tool_call_streaming,
@@ -523,6 +527,10 @@ class DelegatingParser(Parser):
         )
         if structure_tag is None:
             return request
+
+        # The tool structural tag is about to take the grammar. Refuse rather
+        # than quietly outrank a reply schema the caller asked for.
+        reject_reply_schema_conflict(request)
 
         structural_tag = json.dumps(structure_tag.model_dump())
         request.structured_outputs = StructuredOutputsParams(  # type: ignore[call-arg]

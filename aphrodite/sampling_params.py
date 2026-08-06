@@ -3,8 +3,8 @@
 """Sampling parameters for text generation."""
 
 import copy
-import json as json_mod
 import math
+from collections.abc import Callable
 from dataclasses import field
 from enum import Enum, IntEnum
 from functools import cached_property
@@ -1081,10 +1081,7 @@ class SamplingParams(
                 "structured_outputs to disable structured outputs"
             )
 
-        from aphrodite.v1.structured_output.backend_guidance import (
-            is_guidance_backend_supported,
-            validate_guidance_grammar,
-        )
+        from aphrodite.v1.structured_output.backend_guidance import validate_guidance_grammar
         from aphrodite.v1.structured_output.backend_lm_format_enforcer import (
             validate_structured_output_request_lm_format_enforcer,
         )
@@ -1093,30 +1090,27 @@ class SamplingParams(
         )
         from aphrodite.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
         from aphrodite.v1.structured_output.schema_features import (
-            get_schema_validation_error,
-            get_unenforceable_json_schema_keys,
-            iter_structural_tag_schemas,
-            schema_validation_message,
-            unenforceable_keys_message,
+            get_json_schema_backends_for_request,
+            get_structured_outputs_schema_error,
         )
 
         # Reject constraints that no backend can enforce while decoding, before
         # dispatching. Otherwise we get an exception (xgrammar, guidance) or a
         # silent omission (outlines, lm-format-enforcer). API entrypoints screen
         # for this, this check is just-in-case for direct engine use.
-        unenforceable = get_unenforceable_json_schema_keys(self.structured_outputs.json)
-        if unenforceable:
-            raise ValueError(unenforceable_keys_message(unenforceable))
+        # (Now also rejects malformed schemas here)
+        schema_error = get_structured_outputs_schema_error(self.structured_outputs)
+        if schema_error is not None:
+            raise ValueError(schema_error)
 
-        # Reject malformed schemas up-front and well-formatted, instead
-        # of counting on the inconsistent backends to handle it.
-        for candidate_schema in (
-            self.structured_outputs.json,
-            *iter_structural_tag_schemas(self.structured_outputs.structural_tag),
-        ):
-            invalid = get_schema_validation_error(candidate_schema)
-            if invalid is not None:
-                raise ValueError(schema_validation_message(invalid))
+        capable = get_json_schema_backends_for_request(self.structured_outputs)
+        configured = backend.split(":", 1)[0]
+        if configured != "auto" and configured not in capable:
+            raise ValueError(
+                f"The '{configured}' structured output backend does not enforce every "
+                "keyword in this request's JSON schema, and would decode as though the "
+                f"schema said less than it does. Backends that would: {sorted(capable)}."
+            )
 
         if backend.startswith("xgrammar"):
             # xgrammar with no fallback
@@ -1156,42 +1150,54 @@ class SamplingParams(
             # will satisfy the most use cases without having to worry about
             # this setting. We include fallback behavior here, but not with any
             # other setting where a specific backend was specified.
-            try:
-                validate_xgrammar_grammar(self)
-                self.structured_outputs._backend = "xgrammar"
-            except ValueError as xgrammar_err:
-                # The request either failed validation
-                # or includes some jsonschema feature(s) that
-                # are not supported in xgrammar.
+            # Backends will cheerfully degrade a schema to "any json object" if
+            # it happens to contain something they don't like, hence this
+            # song-and-dance.
+            candidates: list[tuple[str, Callable[[], None]]] = [
+                ("xgrammar", lambda: validate_xgrammar_grammar(self)),
+                (
+                    "guidance",
+                    lambda: validate_guidance_grammar(self, tokenizer=_get_llg_tokenizer(tokenizer)),
+                ),
+                ("outlines", lambda: validate_structured_output_request_outlines(self)),
+            ]
+            if _is_non_tekken_mistral(tokenizer):
+                capable -= {"guidance"}
 
-                skip_guidance = _is_non_tekken_mistral(tokenizer)
-
-                # Check if schema has features unsupported by guidance
-                so_params = self.structured_outputs
-                if not skip_guidance and so_params.json:
-                    if isinstance(so_params.json, str):
-                        schema = json_mod.loads(so_params.json)
-                    else:
-                        schema = so_params.json
-                    skip_guidance = not is_guidance_backend_supported(schema)
-
+            first_err: ValueError | None = None
+            for name, validate in candidates:
+                if name not in capable:
+                    continue
                 try:
-                    if skip_guidance:
-                        # Fall back to outlines if the tokenizer is non-tekken Mistral or
-                        # the schema contains features unsupported by guidance
-                        validate_structured_output_request_outlines(self)
-                        self.structured_outputs._backend = "outlines"
-                    else:
-                        # Fall back to guidance by default.
-                        validate_guidance_grammar(
-                            self,
-                            tokenizer=_get_llg_tokenizer(tokenizer),
-                        )
-                        self.structured_outputs._backend = "guidance"
-                except ValueError as fallback_err:
-                    # Report why the first choice declined, not the second.
-                    logger.debug("Fallback backend also declined: %s", fallback_err)
-                    raise xgrammar_err from fallback_err
+                    validate()
+                except ValueError as err:
+                    # Capable of the keywords, but declined for another reason
+                    # (an unparseable regex, a tokenizer it cannot use).
+                    logger.debug("Structured output backend %s declined: %s", name, err)
+                    first_err = first_err or err
+                    continue
+                self.structured_outputs._backend = name
+                break
+            else:
+                if first_err is not None:
+                    # Report why the preferred backend declined.
+                    raise first_err
+                if capable:
+                    # A backend could enforce this, but it is not one `auto`
+                    # rotates through. Naming it beats decoding unconstrained.
+                    raise ValueError(
+                        "No structured output backend available under backend='auto' "
+                        f"can enforce this request's schema; it needs one of "
+                        f"{sorted(capable)}. Set structured_outputs_config.backend to "
+                        "one of those, or simplify the schema."
+                    )
+                # The request carries several schemas (tools, or a tool plus a
+                # reply schema) that individually have a home but share none.
+                raise ValueError(
+                    "This request's schemas cannot be enforced together: no one "
+                    "structured output backend enforces all the keywords they use "
+                    "between them, and a request decodes with one backend."
+                )
             # Remember that this backend was set automatically
             self.structured_outputs._backend_was_auto = True
 
