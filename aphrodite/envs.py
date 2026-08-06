@@ -202,6 +202,7 @@ if TYPE_CHECKING:
     APHRODITE_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     APHRODITE_XGRAMMAR_CACHE_MB: int = 0
     APHRODITE_REGEX_COMPILATION_TIMEOUT_S: int = 5
+    APHRODITE_STRUCTURED_OUTPUT_BEST_EFFORT: bool = False
     APHRODITE_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
     APHRODITE_ALLOW_INSECURE_SERIALIZATION: bool = False
     APHRODITE_DISABLE_REQUEST_ID_RANDOMIZATION: bool = False
@@ -1369,6 +1370,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # adversarial patterns cause exponential DFA state-space explosion.
     # Set to 0 to disable the timeout (not recommended in production).
     "APHRODITE_REGEX_COMPILATION_TIMEOUT_S": lambda: int(os.getenv("APHRODITE_REGEX_COMPILATION_TIMEOUT_S", "5")),
+    # Best-effort structured output. A schema using a keyword that no backend
+    # can enforce while decoding -- `uniqueItems`, `contains`, `if`/`then`,
+    # `not`, the `dependent*` pair -- is rejected with a 400 by default, because
+    # accepting it would promise a constraint nothing applies. Set this to 1 and
+    # those keywords are instead stripped from the schema before it is compiled:
+    # the request succeeds, everything else in the schema is still enforced, and
+    # the dropped keywords are the caller's to validate afterwards. Nothing is
+    # said to the caller; the drop is logged once per keyword set on the server.
+    # Only keywords no backend enforces are affected -- a schema whose keywords
+    # are individually enforceable but have no backend in common is still a 400,
+    # since one of the two is enforceable and picking which to break is not ours.
+    "APHRODITE_STRUCTURED_OUTPUT_BEST_EFFORT": lambda: bool(
+        int(os.getenv("APHRODITE_STRUCTURED_OUTPUT_BEST_EFFORT", "0"))
+    ),
     # Control the threshold for msgspec to use 'zero copy' for
     # serialization/deserialization of tensors. Tensors below
     # this limit will be encoded into the msgpack buffer, and

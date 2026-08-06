@@ -26,6 +26,7 @@ keep. Those end at runtime with `finish_reason="constraint"` instead.
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Iterator
 from typing import Any
@@ -33,6 +34,11 @@ from typing import Any
 import jsonschema
 import jsonschema.exceptions
 import jsonschema.validators
+
+import aphrodite.envs as envs
+from aphrodite.logger import init_logger
+
+logger = init_logger(__name__)
 
 # Value is a single subschema ("items" also accepts the draft-04 tuple form).
 _SUBSCHEMA_KEYS = frozenset(
@@ -120,6 +126,15 @@ _VACUOUS_WHEN = {
     "unevaluatedProperties": True,
     "uniqueItems": False,
 }
+
+# The keywords nothing can enforce -- read off the table rather than repeated,
+# so a keyword that later gains a backend leaves this set on its own.
+#
+# The set is closed under companionship: `if` cannot be here without `then` and
+# `else`, nor `contains` without `minContains`/`maxContains`. That is what makes
+# dropping the whole set in best-effort mode safe -- no keyword is left behind
+# whose meaning depended on one that left. A test holds the table to it.
+_UNENFORCEABLE_KEYWORDS = frozenset(key for key, backends in _KEYWORD_BACKENDS.items() if not backends)
 
 
 def _constrains(node: dict[str, Any], key: str) -> bool:
@@ -411,18 +426,134 @@ def get_json_schema_backends_for_request(structured_outputs: Any) -> frozenset[s
     return backends
 
 
+def _strip_unenforceable_in_place(schema: dict[str, Any]) -> set[str]:
+    """Remove every unenforceable keyword from ``schema``, returning what went.
+
+    Exactly the keywords ``get_unenforceable_json_schema_keys`` would have
+    reported: a keyword that is present but inert is not reported, is not the
+    reason for any rejection, and so is left where it is.
+    """
+    removed: set[str] = set()
+    # Materialised before the first deletion: the walk is about to read each
+    # node's keys, and mutating a node it has not descended into yet would pull
+    # the ground out from under it.
+    for node in list(iter_schema_nodes(schema)):
+        # Decided for the whole node before anything is removed. `if`, `then`
+        # and `else` each constrain only in the company of the others, so
+        # deleting one first would make the rest look inert and spare them.
+        doomed = {key for key in _UNENFORCEABLE_KEYWORDS & node.keys() if _constrains(node, key)}
+        for key in doomed:
+            del node[key]
+        removed |= doomed
+    return removed
+
+
+def _without_unenforceable(schema: Any) -> tuple[Any, set[str]]:
+    """``schema`` minus its unenforceable keywords, and which those were.
+
+    The original is never touched -- a tool's parameters dict may be shared with
+    whatever else the caller does with the tool -- and it is handed straight back
+    when there was nothing to remove. JSON text in, JSON text out.
+    """
+    parsed = _as_schema(schema)
+    if not isinstance(parsed, dict):
+        return schema, set()
+    stripped = copy.deepcopy(parsed)
+    removed = _strip_unenforceable_in_place(stripped)
+    if not removed:
+        return schema, set()
+    return (json.dumps(stripped) if isinstance(schema, str) else stripped), removed
+
+
+def _without_unenforceable_tag(structural_tag: Any) -> tuple[Any, set[str]]:
+    """The same, for the schemas riding inside a structural tag.
+
+    A tool's parameters arrive by this route and no other, so a tag left
+    unwalked is a tool call still rejected for a keyword the flag said to drop.
+    """
+    parsed = structural_tag
+    if isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except ValueError:
+            # Malformed; whoever parses it for real is the one to say so.
+            return structural_tag, set()
+    if not isinstance(parsed, dict):
+        return structural_tag, set()
+
+    stripped = copy.deepcopy(parsed)
+    removed: set[str] = set()
+    # The schemas come back by reference, so stripping them lands on the copy.
+    for schema in list(iter_structural_tag_schemas(stripped)):
+        removed |= _strip_unenforceable_in_place(schema)
+    if not removed:
+        return structural_tag, set()
+    return (json.dumps(stripped) if isinstance(structural_tag, str) else stripped), removed
+
+
+def relax_unenforceable_keywords(structured_outputs: Any) -> list[str]:
+    """Drop the keywords nothing enforces from a request's schemas, in place.
+
+    Best-effort mode: what would have been a 400 becomes a schema the decoder
+    can actually compile, with everything still enforceable left standing and
+    the dropped keywords the caller's to check afterwards.
+
+    The request's own fields are rewritten rather than a cleaned copy returned,
+    because the schema that reaches the grammar has to be the one that was
+    screened. Routing asks which backends can enforce this request the moment
+    the screen returns; a keyword left behind for that question to find would
+    answer "none of them" and fail the request anyway, one layer further down.
+
+    Returns the keywords removed, sorted.
+    """
+    removed: set[str] = set()
+
+    schema = getattr(structured_outputs, "json", None)
+    if schema is not None:
+        structured_outputs.json, gone = _without_unenforceable(schema)
+        removed |= gone
+
+    tag = getattr(structured_outputs, "structural_tag", None)
+    if tag is not None:
+        structured_outputs.structural_tag, gone = _without_unenforceable_tag(tag)
+        removed |= gone
+
+    return sorted(removed)
+
+
 def get_structured_outputs_schema_error(structured_outputs: Any) -> str | None:
     """Return why this request's schemas cannot be enforced, or None if they can.
 
     The single screen behind both the API entrypoints and the engine, covering
     both routes into the grammar, so that neither the two layers nor the two
     routes can drift apart.
+
+    In best-effort mode this also *edits* ``structured_outputs``, dropping the
+    keywords it would otherwise have rejected. It belongs here rather than at
+    either call site for the same reason the screen does: two layers doing it
+    separately is two layers that can come to disagree about what was dropped.
     """
     schemas = list(iter_request_json_schemas(structured_outputs))
     # Well-formedness first: the keywords of a malformed schema mean nothing.
     for schema in schemas:
         if (invalid := get_schema_validation_error(schema)) is not None:
             return schema_validation_message(invalid)
+
+    if envs.APHRODITE_STRUCTURED_OUTPUT_BEST_EFFORT:
+        # Only the keywords with no backend at all. The two conflict checks
+        # below still reject, because there the keywords *are* enforceable and
+        # choosing which of them to break is the caller's call, not ours.
+        if dropped := relax_unenforceable_keywords(structured_outputs):
+            logger.warning_once(
+                "APHRODITE_STRUCTURED_OUTPUT_BEST_EFFORT is set: dropped JSON schema "
+                "keyword(s) %s from a request, which no structured output backend can "
+                "enforce while decoding. The rest of the schema is still enforced; "
+                "these are the caller's to validate on the generated output.",
+                str(dropped),
+            )
+            # Not the same objects any more.
+            schemas = list(iter_request_json_schemas(structured_outputs))
+
     for schema in schemas:
         if unenforceable := get_unenforceable_json_schema_keys(schema):
             return unenforceable_keys_message(unenforceable)

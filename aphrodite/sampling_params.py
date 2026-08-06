@@ -1100,6 +1100,9 @@ class SamplingParams(
         # silent omission (outlines, lm-format-enforcer). API entrypoints screen
         # for this, this check is just-in-case for direct engine use.
         # (Now also rejects malformed schemas here)
+        # Under APHRODITE_STRUCTURED_OUTPUT_BEST_EFFORT this edits the request
+        # instead of refusing it, so the routing question below is asked of the
+        # schema that will actually be compiled.
         schema_error = get_structured_outputs_schema_error(self.structured_outputs)
         if schema_error is not None:
             raise ValueError(schema_error)
