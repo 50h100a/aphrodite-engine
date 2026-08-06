@@ -546,6 +546,12 @@ class DelegatingParser(Parser):
         request.structured_outputs = StructuredOutputsParams(  # type: ignore[call-arg]
             structural_tag=structural_tag,
         )
+        # The tag spans the whole reply, reasoning segment included, so there is
+        # no prelude to wait out. Without this the bitmask is withheld until the
+        # reasoning parser sees its end marker -- and a reply that is nothing but
+        # a tool call never emits one, so the grammar would compile and never
+        # apply to the very requests it was built for.
+        request._grammar_from_tool_parser = True
         if isinstance(request, ResponsesRequest):
             request.text = None
         else:

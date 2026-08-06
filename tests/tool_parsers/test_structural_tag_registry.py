@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -326,6 +327,89 @@ def test_harmony_tag_always_admits_the_analysis_channel(
     tag = out.structured_outputs.structural_tag
     assert tag is not None
     assert "<|channel|>analysis<|message|>" in tag
+
+
+def test_harmony_tag_admits_the_commentary_preamble(
+    monkeypatch: pytest.MonkeyPatch,
+    sample_tools_strict: list[ChatCompletionToolsParam],
+):
+    """gpt-oss narrates on `commentary` with no recipient before it calls a
+    tool, and HarmonyParser reads that segment back as content. The xgrammar
+    template omits the form, so the grammar has to be told about it."""
+    from aphrodite.parser.harmony import HarmonyParser
+
+    monkeypatch.setattr(HarmonyParser, "tool_parser_cls", GptOssToolParser)
+    monkeypatch.setattr(HarmonyParser, "reasoning_parser_cls", None)
+
+    request = ChatCompletionRequest(
+        messages=[],
+        model="m",
+        tools=sample_tools_strict,
+        tool_choice="required",
+    )
+    parser = HarmonyParser(MagicMock(), tools=sample_tools_strict)
+
+    out = parser.adjust_request(request)
+
+    assert out.structured_outputs is not None
+    raw_tag = out.structured_outputs.structural_tag
+    assert raw_tag is not None
+    tag = json.loads(raw_tag)
+    begins = [t["begin"] for t in tag["format"]["tags"]]
+    assert "<|channel|>commentary<|message|>" in begins
+    # The preamble is free text, not a tool call misfiled under it.
+    preamble = next(t for t in tag["format"]["tags"] if t["begin"] == "<|channel|>commentary<|message|>")
+    assert preamble["content"]["type"] == "any_text"
+
+
+def test_structural_tag_marks_the_grammar_as_covering_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+    sample_tools_strict: list[ChatCompletionToolsParam],
+):
+    """The tag spans the whole reply, so there is no reasoning prelude to wait
+    out. Without the flag the bitmask is withheld until the reasoning parser
+    sees an end marker, and a reply that is only a tool call never emits one --
+    the grammar would compile and never apply."""
+    from aphrodite.parser.harmony import HarmonyParser
+
+    monkeypatch.setattr(HarmonyParser, "tool_parser_cls", GptOssToolParser)
+    monkeypatch.setattr(HarmonyParser, "reasoning_parser_cls", None)
+
+    request = ChatCompletionRequest(
+        messages=[],
+        model="m",
+        tools=sample_tools_strict,
+        tool_choice="required",
+    )
+    assert request._grammar_from_tool_parser is False
+
+    out = HarmonyParser(MagicMock(), tools=sample_tools_strict).adjust_request(request)
+
+    assert out._grammar_from_tool_parser is True
+
+
+def test_no_structural_tag_leaves_the_reasoning_gate_alone(
+    sample_tools_strict: list[ChatCompletionToolsParam],
+):
+    """A parser that never installs a tag must not claim to cover reasoning.
+    Its schema constraint applies to the arguments alone, so the bitmask still
+    has to wait for whatever comes before them."""
+
+    class NonStructuralTagToolParser(ToolParser):
+        pass
+
+    class TestParser(DelegatingParser):
+        tool_parser_cls = NonStructuralTagToolParser
+
+    request = ChatCompletionRequest(
+        messages=[],
+        model="m",
+        tools=sample_tools_strict,
+        tool_choice="auto",
+    )
+    out = TestParser(MagicMock(), tools=sample_tools_strict).adjust_request(request)
+
+    assert out._grammar_from_tool_parser is False
 
 
 def test_xgrammar_function_parameters_are_preserved(
