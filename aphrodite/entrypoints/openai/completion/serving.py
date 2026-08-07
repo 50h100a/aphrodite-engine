@@ -393,6 +393,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                             logprob_token_ids=request.logprob_token_ids,
                             initial_text_offset=previous_text_lens[i],
                             return_as_token_id=request.return_tokens_as_token_ids,
+                            skip_special_tokens=request.skip_special_tokens,
                         )
                     else:
                         logprobs = None
@@ -570,6 +571,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                         num_output_top_logprobs=request.logprobs,
                         logprob_token_ids=request.logprob_token_ids,
                         return_as_token_id=request.return_tokens_as_token_ids,
+                        skip_special_tokens=request.skip_special_tokens,
                     )
                 else:
                     logprobs = None
@@ -647,6 +649,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
         logprob_token_ids: list[int] | None = None,
         initial_text_offset: int = 0,
         return_as_token_id: bool | None = None,
+        skip_special_tokens: bool = True,
     ) -> CompletionLogProbs:
         """Create logprobs for OpenAI Completion API."""
         out_text_offset: list[int] = []
@@ -660,6 +663,11 @@ class OpenAIServingCompletion(GenerateBaseServing):
         should_return_as_token_id = (
             return_as_token_id if return_as_token_id is not None else self.return_tokens_as_token_ids
         )
+        # Ids whose spelling never reaches the text, so they must not advance
+        # the offsets either. Empty when the caller asked to see them.
+        hidden_ids: frozenset[int] = frozenset()
+        if skip_special_tokens and tokenizer is not None and not should_return_as_token_id:
+            hidden_ids = frozenset(getattr(tokenizer, "all_special_ids", None) or ())
         for i, token_id in enumerate(token_ids):
             step_top_logprobs = top_logprobs[i]
             if step_top_logprobs is None:
@@ -710,6 +718,11 @@ class OpenAIServingCompletion(GenerateBaseServing):
                         if logprob_token_ids or num_output_top_logprobs >= i
                     }
                 )
+
+            if token_id in hidden_ids and i + 1 < len(token_ids):
+                # Tokens that contribute no characters should contribute no width.
+                token = ""
+                out_tokens[-1] = ""
 
             out_token_ids.append(token_id)
 
