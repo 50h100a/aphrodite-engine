@@ -222,6 +222,7 @@ if TYPE_CHECKING:
     APHRODITE_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
     APHRODITE_ENFORCE_STRICT_TOOL_CALLING: bool = True
     APHRODITE_CONSTRAIN_AUTO_TOOL_CALLS: bool = False
+    APHRODITE_FORCE_BOS: bool = False
     APHRODITE_MQ_MAX_CHUNK_BYTES_MB: int = 16
     APHRODITE_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300
     APHRODITE_WORKER_SHUTDOWN_TIMEOUT_SECONDS: int = 5
@@ -1488,6 +1489,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "APHRODITE_CONSTRAIN_AUTO_TOOL_CALLS": lambda: (
         os.getenv("APHRODITE_CONSTRAIN_AUTO_TOOL_CALLS", "False").lower() in ("true", "1")
     ),
+    # Prepend BOS when add_special_tokens was requested but the tokenizer did
+    # not emit one. Needed for model repos whose tokenizer.json ships an empty
+    # TemplateProcessing post-processor, which silently makes add_special_tokens
+    # a no-op; BOS-trained models (Gemma) then degenerate into repetition loops.
+    # Off by default: models that intentionally omit BOS must not get one.
+    "APHRODITE_FORCE_BOS": lambda: (os.getenv("APHRODITE_FORCE_BOS", "False").lower() in ("true", "1")),
     # Control the max chunk bytes (in MB) for the rpc message queue.
     # Object larger than this threshold will be broadcast to worker
     # processes via zmq.

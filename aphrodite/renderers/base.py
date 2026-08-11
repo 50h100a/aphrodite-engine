@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Generic, overload
 
 from typing_extensions import TypeVar
 
+from aphrodite import envs
 from aphrodite.inputs import (
     EmbedsInput,
     EmbedsPrompt,
@@ -445,6 +446,31 @@ class BaseRenderer(ABC, Generic[_T]):
             )
         return TokensPrompt(prompt_token_ids=list(token_ids), **prompt)
 
+    @staticmethod
+    def _ensure_bos(
+        tokenizer: TokenizerLike,
+        token_ids: list[int],
+        offset_mapping: Any | None,
+    ) -> tuple[list[int], Any | None]:
+        """Prepend BOS when the tokenizer declares one but did not emit it.
+
+        Opt-in via `APHRODITE_FORCE_BOS=1`: a model that deliberately omits BOS
+        must not be given one, so this cannot be on by default.
+        """
+        if not envs.APHRODITE_FORCE_BOS:
+            return token_ids, offset_mapping
+
+        bos_id = getattr(tokenizer, "bos_token_id", None)
+        if bos_id is None or (token_ids and token_ids[0] == bos_id):
+            return token_ids, offset_mapping
+
+        token_ids = [bos_id, *token_ids]
+        if offset_mapping is not None:
+            # BOS spans no source characters, so it gets an empty span at 0 and
+            # the real tokens keep the offsets the tokenizer reported.
+            offset_mapping = [(0, 0), *offset_mapping]
+        return token_ids, offset_mapping
+
     def _tokenize_prompt(
         self,
         prompt: TextPrompt,
@@ -456,10 +482,14 @@ class BaseRenderer(ABC, Generic[_T]):
         if want_offsets:
             kwargs = {**kwargs, "return_offsets_mapping": True}
         encoding = tokenizer(prompt["prompt"], **kwargs)
+        token_ids = list(encoding["input_ids"])
+        offset_mapping = encoding["offset_mapping"] if want_offsets else None
+        if kwargs.get("add_special_tokens"):
+            token_ids, offset_mapping = self._ensure_bos(tokenizer, token_ids, offset_mapping)
         return self._build_tokens_prompt(
-            encoding["input_ids"],
+            token_ids,
             prompt,
-            offset_mapping=encoding["offset_mapping"] if want_offsets else None,
+            offset_mapping=offset_mapping,
         )
 
     def _detokenize_prompt(self, prompt: TokensPrompt) -> TokensPrompt:
