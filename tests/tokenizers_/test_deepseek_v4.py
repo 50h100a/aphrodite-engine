@@ -58,6 +58,7 @@ def _render_reference_case(case_id: int, **kwargs):
         _model_config(),
         content_format="string",
     )
+    kwargs.setdefault("add_generation_prompt", False)
     return _tokenizer().apply_chat_template(
         conversation=conversation,
         messages=messages,
@@ -266,41 +267,194 @@ def test_deepseek_v4_maps_xhigh_to_reference_max_reasoning_effort():
     assert prompt.startswith("<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum")
 
 
+_NO_TRAILING_USER = [
+    pytest.param(
+        [
+            {"role": "system", "content": "a"},
+            {"role": "system", "content": "b"},
+            {"role": "system", "content": "c"},
+        ],
+        "<｜begin▁of▁sentence｜>abc",
+        id="system-only",
+    ),
+    pytest.param(
+        [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "note"},
+        ],
+        "<｜begin▁of▁sentence｜><｜User｜>hinote",
+        id="system-last",
+    ),
+]
+
+
+@pytest.mark.parametrize(("messages", "body"), _NO_TRAILING_USER)
 @pytest.mark.parametrize(
-    "messages",
+    ("kwargs", "opener"),
     [
-        pytest.param(
-            [
-                {"role": "system", "content": "a"},
-                {"role": "system", "content": "b"},
-                {"role": "system", "content": "c"},
-            ],
-            id="system-only",
-        ),
-        pytest.param(
-            [
-                {"role": "user", "content": "hi"},
-                {"role": "system", "content": "note"},
-            ],
-            id="system-last",
-        ),
+        ({}, "<｜Assistant｜></think>"),
+        ({"thinking": True}, "<｜Assistant｜><think>"),
+    ],
+    ids=["chat", "thinking"],
+)
+def test_deepseek_v4_adds_generation_prefix_without_trailing_user(messages, body, kwargs, opener):
+    """The reference encoder appends the opener only when the last message is
+    user/developer (or carries a task), so these conversations used to render
+    with no think marker at all -- which wedged the structured-output bitmask
+    closed for the whole request, because the gate reads "no marker" as
+    "reasoning still pending". `add_generation_prompt` now supplies it.
+
+    See TestIsReasoningEnd in tests/parser/engine/test_parser_engine.py for the
+    gate-side half of that fix.
+    """
+    prompt = _tokenizer().apply_chat_template(messages, tokenize=False, **kwargs)
+
+    assert prompt == body + opener
+
+
+@pytest.mark.parametrize(("messages", "body"), _NO_TRAILING_USER)
+def test_deepseek_v4_generation_prefix_can_be_suppressed(messages, body):
+    prompt = _tokenizer().apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+
+    assert prompt == body
+
+
+def test_deepseek_v4_suppresses_generation_prefix_after_user():
+    """The flag is live in both directions, not merely additive."""
+    prompt = _tokenizer().apply_chat_template(
+        [{"role": "system", "content": "a"}, {"role": "user", "content": "hi"}],
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+
+    assert prompt == "<｜begin▁of▁sentence｜>a<｜User｜>hi"
+
+
+def test_deepseek_v4_adds_exactly_one_prefix_after_user():
+    """A conversation already in generation position must not gain a second
+    opener."""
+    prompt = _tokenizer().apply_chat_template(
+        [{"role": "system", "content": "a"}, {"role": "user", "content": "hi"}],
+        tokenize=False,
+    )
+
+    assert prompt == "<｜begin▁of▁sentence｜>a<｜User｜>hi<｜Assistant｜></think>"
+
+
+def test_deepseek_v4_keeps_reminder_after_the_opener():
+    """`latest_reminder` is injected *after* the opener by design, so a
+    trailing reminder must not be mistaken for a missing prefix."""
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {"role": "user", "content": "hi"},
+            {"role": "latest_reminder", "content": "r"},
+        ],
+        tokenize=False,
+    )
+
+    assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think><｜latest_reminder｜>r")
+    assert prompt.count("<｜Assistant｜>") == 1
+
+
+@pytest.mark.parametrize(
+    ("task", "expected"),
+    [
+        ("query", "<｜begin▁of▁sentence｜><｜User｜>hi<｜query｜>"),
+        ("action", "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think><｜action｜>"),
     ],
 )
-def test_deepseek_v4_omits_generation_prefix_without_trailing_user(messages):
-    """The reference encoder appends `<｜Assistant｜>` and the think marker
-    only when the last message is user/developer (or carries a task), so
-    these conversations render with no think marker at all.
+def test_deepseek_v4_task_tokens_are_structural(task, expected):
+    """Task special tokens mark the generation position themselves, so they are
+    emitted regardless of the flag and never gain an extra opener."""
+    messages = [{"role": "user", "content": "hi", "task": task}]
 
-    Pinned because consumers must not assume the prompt carries `</think>`:
-    the structured-output gate used to infer "reasoning still pending" from
-    its absence and wedged the grammar bitmask closed for the whole request.
-    See TestIsReasoningEnd in tests/parser/engine/test_parser_engine.py.
-    """
-    prompt = _tokenizer().apply_chat_template(messages, tokenize=False)
+    assert _tokenizer().apply_chat_template(messages, tokenize=False) == expected
+    assert (
+        _tokenizer().apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        == expected
+    )
 
-    assert "</think>" not in prompt
-    assert "<think>" not in prompt
-    assert "<｜Assistant｜>" not in prompt
+
+def test_deepseek_v4_continue_final_message_leaves_turn_open():
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "partial"},
+    ]
+    original = [dict(message) for message in messages]
+
+    prompt = _tokenizer().apply_chat_template(
+        messages,
+        tokenize=False,
+        continue_final_message=True,
+    )
+
+    assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>partial")
+    # No closing EOS, and no second opener after the prefill.
+    assert "<｜end▁of▁sentence｜>" not in prompt
+    assert prompt.count("<｜Assistant｜>") == 1
+    # The caller's message dicts must survive untouched.
+    assert messages == original
+
+
+def test_deepseek_v4_tool_result_needs_no_extra_opener():
+    """Tool results are merged into a user turn, which already ends in the
+    opener, so a tool-terminated conversation must not gain a second one."""
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": '{"x": 1}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "r"},
+        ],
+        tokenize=False,
+    )
+
+    assert prompt.endswith("<｜User｜><tool_result>r</tool_result><｜Assistant｜></think>")
+    assert prompt.count("<｜Assistant｜>") == 2  # one per user turn
+
+
+def test_deepseek_v4_accepts_an_empty_conversation():
+    assert _tokenizer().apply_chat_template([], tokenize=False) == ("<｜begin▁of▁sentence｜><｜Assistant｜></think>")
+    assert (
+        _tokenizer().apply_chat_template(
+            [],
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        == "<｜begin▁of▁sentence｜>"
+    )
+
+
+def test_deepseek_v4_closed_assistant_turn_gets_a_fresh_opener():
+    """Without `continue_final_message` a trailing assistant turn is closed, so
+    asking for a generation prompt opens a new one."""
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "done"},
+        ],
+        tokenize=False,
+    )
+
+    assert prompt == (
+        "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>done<｜end▁of▁sentence｜><｜Assistant｜></think>"
+    )
 
 
 @pytest.mark.parametrize(
@@ -313,7 +467,29 @@ def test_deepseek_v4_omits_generation_prefix_without_trailing_user(messages):
     ],
 )
 def test_deepseek_v4_matches_reference_golden_fixtures(case_id, kwargs):
+    """The fixtures are training-format renderings -- every one ends in a
+    closed assistant turn -- so they are compared with the generation prompt
+    switched off."""
     prompt = _render_reference_case(case_id, **kwargs)
 
     expected = (FIXTURES_DIR / f"test_output_{case_id}.txt").read_text()
     assert prompt == expected
+
+
+@pytest.mark.parametrize(
+    ("case_id", "kwargs", "opener"),
+    [
+        (1, {"thinking": True}, "<｜Assistant｜><think>"),
+        (2, {"thinking": True}, "<｜Assistant｜><think>"),
+        (3, {"thinking": True}, "<｜Assistant｜><think>"),
+        (4, {}, "<｜Assistant｜></think>"),
+    ],
+)
+def test_deepseek_v4_reference_cases_gain_an_opener_when_asked(case_id, kwargs, opener):
+    """Guards the `add_generation_prompt=False` default in
+    `_render_reference_case`: the goldens are unchanged only because the flag
+    is off, not because the flag is inert."""
+    prompt = _render_reference_case(case_id, add_generation_prompt=True, **kwargs)
+
+    expected = (FIXTURES_DIR / f"test_output_{case_id}.txt").read_text()
+    assert prompt == expected + opener

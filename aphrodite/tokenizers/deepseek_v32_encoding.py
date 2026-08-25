@@ -41,7 +41,10 @@ thinking_start_token: str = "<think>"
 thinking_end_token: str = "</think>"
 dsml_token: str = "｜DSML｜"
 system_msg_template: str = "{content}"
-user_msg_template: str = "<｜User｜>{content}<｜Assistant｜>"
+assistant_sp_token: str = "<｜Assistant｜>"
+# The reference template is "<｜User｜>{content}<｜Assistant｜>"; the opener is
+# split out so `add_generation_prompt=False` can suppress the trailing one.
+user_msg_template: str = "<｜User｜>{content}"
 assistant_msg_template: str = "{reasoning}{content}{tool_calls}<｜end▁of▁sentence｜>"
 thinking_template = "{reasoning}"
 
@@ -116,7 +119,56 @@ def find_last_user_index(messages: list[dict[str, Any]]) -> int:
     return last_user_index
 
 
-def render_message(index: int, messages: list[dict[str, Any]], thinking_mode: str) -> str:
+def render_generation_prompt(thinking_mode: str) -> str:
+    """The assistant turn opener: `<｜Assistant｜>` plus the think marker.
+
+    In chat mode the model is handed a closed `</think>`; in thinking mode it
+    is handed an open `<think>` and reasons first.
+    """
+    marker = thinking_start_token if thinking_mode == "thinking" else thinking_end_token
+    return assistant_sp_token + marker
+
+
+def has_generation_prompt(messages: list[dict[str, Any]]) -> bool:
+    """Whether `render_message` already left the prompt in generation position.
+
+    Determined structurally rather than by inspecting the rendered string.
+    True for a trailing user/developer turn (whose template ends in the
+    opener), for the tool result that closes a call group (which ends in a
+    think marker), and for a prefill assistant message the model continues.
+    """
+    if not messages:
+        return False
+
+    index = len(messages) - 1
+    msg = messages[index]
+    role = msg.get("role")
+
+    if role in ["user", "developer"]:
+        return True
+
+    if role == "assistant":
+        return bool(msg.get("prefix", False)) and not msg.get("tool_calls")
+
+    if role == "tool":
+        # Only the last result of a call group is followed by a think marker.
+        prev_assistant_idx = index - 1
+        while prev_assistant_idx >= 0 and messages[prev_assistant_idx].get("role") == "tool":
+            prev_assistant_idx -= 1
+        if prev_assistant_idx < 0:
+            return False
+        tool_calls = messages[prev_assistant_idx].get("tool_calls") or []
+        return index - prev_assistant_idx == len(tool_calls)
+
+    return False
+
+
+def render_message(
+    index: int,
+    messages: list[dict[str, Any]],
+    thinking_mode: str,
+    add_generation_prompt: bool = True,
+) -> str:
     if not (0 <= index < len(messages)):
         raise ValueError(f"Index {index} out of range for messages list of length {len(messages)}")
     if thinking_mode not in ["chat", "thinking"]:
@@ -133,6 +185,10 @@ def render_message(index: int, messages: list[dict[str, Any]], thinking_mode: st
     tool_calls = msg.get("tool_calls")
     reasoning = msg.get("reasoning")
     is_prefix = msg.get("prefix", False)
+
+    # `add_generation_prompt` only governs the opener that would end the prompt;
+    # mid-conversation openers are structural and always emitted.
+    emit_opener = add_generation_prompt or index != len(messages) - 1
 
     if tools:
         tools = tools_from_openai_format(tools)
@@ -160,18 +216,22 @@ def render_message(index: int, messages: list[dict[str, Any]], thinking_mode: st
         content_developer += "\n\n# The user's message is: {}".format(content)
 
         prompt += user_msg_template.format(content=content_developer)
-        if index == last_user_idx and thinking_mode == "thinking":
-            prompt += thinking_start_token
-        else:
-            prompt += thinking_end_token
+        if emit_opener:
+            prompt += assistant_sp_token
+            if index == last_user_idx and thinking_mode == "thinking":
+                prompt += thinking_start_token
+            else:
+                prompt += thinking_end_token
 
     elif role == "user":
         prompt += user_msg_template.format(content=content)
 
-        if index == last_user_idx and thinking_mode == "thinking":
-            prompt += thinking_start_token
-        else:
-            prompt += thinking_end_token
+        if emit_opener:
+            prompt += assistant_sp_token
+            if index == last_user_idx and thinking_mode == "thinking":
+                prompt += thinking_start_token
+            else:
+                prompt += thinking_end_token
 
     elif role == "tool":
         prev_assistant_idx = index - 1
@@ -196,10 +256,11 @@ def render_message(index: int, messages: list[dict[str, Any]], thinking_mode: st
         if tool_call_order == len(assistant_tool_calls):
             prompt += "\n</function_results>"
 
-            if index >= last_user_idx and thinking_mode == "thinking":
-                prompt += "\n\n" + thinking_start_token
-            else:
-                prompt += "\n\n" + thinking_end_token
+            if emit_opener:
+                if index >= last_user_idx and thinking_mode == "thinking":
+                    prompt += "\n\n" + thinking_start_token
+                else:
+                    prompt += "\n\n" + thinking_end_token
 
     elif role == "assistant":
         prev_assistant_idx = index
@@ -221,7 +282,9 @@ def render_message(index: int, messages: list[dict[str, Any]], thinking_mode: st
 
         summary_content = content or ""
 
-        if thinking_mode == "thinking" and index > last_user_idx:
+        if thinking_mode == "thinking" and index > last_user_idx and not is_prefix:
+            # A prefill carries the partial reply the model is to continue, so it
+            # has no reasoning of its own to render.
             if not (reasoning or tool_calls):
                 raise ValueError(
                     f"ThinkingMode: {thinking_mode}, invalid message without reasoning/tool_calls `{msg}` after last user message"
@@ -265,8 +328,20 @@ def encode_messages(
     context: list[dict[str, Any]] | None = None,
     drop_thinking: bool = True,
     add_default_bos_token: bool = True,
+    add_generation_prompt: bool = True,
+    continue_final_message: bool = False,
 ) -> str:
     context = context if context else []
+
+    # A prefill is already in generation position; adding an opener after it
+    # would start a second assistant turn.
+    continue_final_message = continue_final_message and bool(messages) and messages[-1].get("role") == "assistant"
+    if continue_final_message:
+        add_generation_prompt = False
+        # Copy before marking: unlike the V4 encoder this module never copies,
+        # and callers pass their own message dicts straight through.
+        messages = messages[:-1] + [{**messages[-1], "prefix": True}]
+
     full_messages = context + messages
 
     prompt = bos_token if add_default_bos_token and len(context) == 0 else ""
@@ -275,6 +350,18 @@ def encode_messages(
         full_messages = drop_thinking_messages(full_messages)
 
     for idx in range(len(messages)):
-        prompt += render_message(idx + len(context), full_messages, thinking_mode=thinking_mode)
+        prompt += render_message(
+            idx + len(context),
+            full_messages,
+            thinking_mode=thinking_mode,
+            add_generation_prompt=add_generation_prompt,
+        )
+
+    if add_generation_prompt and not has_generation_prompt(full_messages):
+        # The conversation does not end in a turn that already opens the
+        # assistant reply, so the model would be asked to continue raw text --
+        # and the missing think marker also wedges the structured-output
+        # bitmask closed.
+        prompt += render_generation_prompt(thinking_mode)
 
     return prompt

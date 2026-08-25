@@ -43,9 +43,14 @@ def get_deepseek_v32_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
 
             # Historical reasoning content is dropped when a new user message
             # is introduced
-            drop_thinking = messages[-1]["role"] == "user"
+            drop_thinking = bool(messages) and messages[-1].get("role") == "user"  # type: ignore[union-attr]
 
-            encode_config = dict(thinking_mode=thinking_mode, drop_thinking=drop_thinking)
+            encode_config = dict(
+                thinking_mode=thinking_mode,
+                drop_thinking=drop_thinking,
+                add_generation_prompt=kwargs.get("add_generation_prompt", True),
+                continue_final_message=kwargs.get("continue_final_message", False),
+            )
 
             prompt_str = encode_messages(messages, **encode_config)  # type: ignore
 

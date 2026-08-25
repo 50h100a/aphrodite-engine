@@ -186,11 +186,25 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
     return last_user_index
 
 
+def generation_anchor_index(messages: List[Dict[str, Any]]) -> int:
+    """Index of the message that decides where generation starts, or -1.
+
+    This is the last message, except that trailing `latest_reminder` messages
+    are skipped: the reference encoder deliberately injects reminders *after*
+    the assistant opener (see the transition-token exemption in
+    `render_message`), so a trailing reminder does not move the anchor.
+    """
+    index = len(messages) - 1
+    while index >= 0 and messages[index].get("role") == "latest_reminder":
+        index -= 1
+    return index
+
+
 # ============================================================
 # Message Rendering
 # ============================================================
 
-def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: str, drop_thinking: bool = True, reasoning_effort: Optional[str] = None) -> str:
+def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: str, drop_thinking: bool = True, reasoning_effort: Optional[str] = None, add_generation_prompt: bool = True) -> str:
     """
     Render a single message at the given index into its encoded string form.
 
@@ -203,6 +217,9 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
         thinking_mode: Either "chat" or "thinking".
         drop_thinking: Whether to drop reasoning content from earlier turns.
         reasoning_effort: Optional reasoning effort level ("max", "high", or None).
+        add_generation_prompt: Whether the assistant turn opener may be emitted
+            after a user/developer message. Task special tokens are structural
+            and are always emitted.
 
     Returns:
         Encoded string for this message.
@@ -351,8 +368,12 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
             prompt += thinking_end_token if thinking_mode != "thinking" else thinking_start_token
             prompt += task_sp_token
 
-    elif messages[index].get("role") in ["user", "developer"]:
-        # Normal generation: append Assistant + thinking token
+    elif messages[index].get("role") in ["user", "developer"] and (
+        add_generation_prompt or index != generation_anchor_index(messages)
+    ):
+        # Normal generation: append Assistant + thinking token.
+        # `add_generation_prompt` only governs the opener that ends the prompt;
+        # mid-conversation openers are structural and always emitted.
         prompt += ASSISTANT_SP_TOKEN
         if not drop_thinking and thinking_mode == "thinking":
             prompt += thinking_start_token
@@ -362,6 +383,31 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
             prompt += thinking_end_token
 
     return prompt
+
+
+def render_generation_prompt(thinking_mode: str) -> str:
+    """The assistant turn opener: `<｜Assistant｜>` plus the think marker.
+
+    In chat mode the model is handed a closed `</think>`; in thinking mode it
+    is handed an open `<think>` and reasons first.
+    """
+    marker = thinking_start_token if thinking_mode == "thinking" else thinking_end_token
+    return ASSISTANT_SP_TOKEN + marker
+
+
+def has_generation_prompt(messages: List[Dict[str, Any]]) -> bool:
+    """Whether `render_message` already left the prompt in generation position.
+
+    Determined structurally rather than by inspecting the rendered string. A
+    task token counts: for non-action tasks it *is* the generation position,
+    and for `action` the opener precedes it.
+    """
+    index = generation_anchor_index(messages)
+    if index < 0:
+        return False
+
+    anchor = messages[index]
+    return anchor.get("task") is not None or anchor.get("role") in ["user", "developer"]
 
 
 # ============================================================
@@ -480,6 +526,8 @@ def encode_messages(
     drop_thinking: bool = True,
     add_default_bos_token: bool = True,
     reasoning_effort: Optional[str] = None,
+    add_generation_prompt: bool = True,
+    continue_final_message: bool = False,
 ) -> str:
     """
     Encode a list of messages into the DeepSeek-V4 prompt format.
@@ -498,11 +546,23 @@ def encode_messages(
                       (only keep reasoning for messages after the last user message).
         add_default_bos_token: Whether to prepend BOS token at conversation start.
         reasoning_effort: Optional reasoning effort level ("max", "high", or None).
+        add_generation_prompt: Whether to end the prompt in assistant-generation
+                      position. The reference encoder only emits the opener after a
+                      user/developer turn, so conversations ending in anything else
+                      (a system message, say) get it appended here.
+        continue_final_message: Prefill. The final assistant message is left open
+                      (no EOS) for the model to continue, and no opener is added.
 
     Returns:
         The encoded prompt string.
     """
     context = context if context else []
+
+    # A prefill is already in generation position; adding an opener after it
+    # would start a second assistant turn.
+    continue_final_message = continue_final_message and bool(messages) and messages[-1].get("role") == "assistant"
+    if continue_final_message:
+        add_generation_prompt = False
 
     # Preprocess: merge tool messages and sort tool results
     messages = merge_tool_messages(messages)
@@ -512,6 +572,11 @@ def encode_messages(
         context = sort_tool_results_by_call_order(context)
 
     full_messages = context + messages
+
+    if continue_final_message:
+        # Leave the final assistant turn open for the model to continue.
+        # Safe to mutate: merge_tool_messages deep-copies every message.
+        full_messages[-1]["wo_eos"] = True
 
     prompt = bos_token if add_default_bos_token and len(context) == 0 else ""
 
@@ -537,7 +602,15 @@ def encode_messages(
             thinking_mode=thinking_mode,
             drop_thinking=effective_drop_thinking,
             reasoning_effort=reasoning_effort,
+            add_generation_prompt=add_generation_prompt,
         )
+
+    if add_generation_prompt and not has_generation_prompt(full_messages):
+        # The conversation does not end in a human turn, so `render_message`
+        # emitted no opener. Without one the model is asked to continue a raw
+        # document rather than to answer -- and the missing think marker also
+        # wedges the structured-output bitmask closed.
+        prompt += render_generation_prompt(thinking_mode)
 
     return prompt
 
