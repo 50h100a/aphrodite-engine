@@ -274,6 +274,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.kv_event_publisher = Mock()
     scheduler.finished_req_ids = set()
     scheduler.finished_req_ids_dict = None
+    scheduler.failed_grammar_reqs = []
     scheduler.aphrodite_config = Mock()
     scheduler.aphrodite_config.model_config.enable_return_routed_experts = False
     scheduler.enable_return_routed_experts = False
@@ -360,3 +361,88 @@ def test_no_placeholder_underflow_on_discarded_spec_frame():
     assert req.num_computed_tokens == computed_before
     assert req.async_tokens_to_discard == num_spec - 1
     assert req.status == RequestStatus.RUNNING
+
+
+def _spec_decode_model_runner_output(
+    scheduler_output: SchedulerOutput,
+    num_accepted: int,
+) -> ModelRunnerOutput:
+    """Model output in which every request emits its bonus token plus up to
+    `num_accepted` of the draft tokens it was scheduled to verify."""
+    req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+    sampled_token_ids = []
+    for req_id in req_ids:
+        num_drafts = len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
+        sampled_token_ids.append([7] * (min(num_accepted, num_drafts) + 1))
+    return ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+        sampled_token_ids=sampled_token_ids,
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
+@pytest.mark.parametrize("num_spec_tokens", [1, 3, 5])
+def test_spec_decode_stays_within_max_model_len(num_spec_tokens: int):
+    """A request saturating the context is never scheduled past it, and finishes.
+
+    Guards the scheduler-side accounting that feeds the model runner's
+    `max_model_len` bound: rejected drafts walk `num_computed_tokens` backwards,
+    and the acceptance count varies step to step when K changes with the batch
+    size, so the headroom calculation is easy to get wrong. Also pins that the
+    request terminates as length-capped rather than stalling unschedulable below
+    `max_model_len`, which is how an over-eager headroom reserve would fail.
+
+    NOTE: this is an invariant guard, not a reproduction of the "Sampled token
+    IDs exceed the max model length" crash - that divergence is not visible from
+    the scheduler alone.
+    """
+    max_model_len = 64
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        num_speculative_tokens=num_spec_tokens,
+        # Async scheduling only accepts EAGLE/MTP/draft-model/ngram-GPU/DSpark.
+        speculative_method="ngram_gpu",
+    )
+    # `Scheduler.max_model_len` comes from the model config, not from the
+    # `max_model_len` that `create_scheduler` forwards to `SchedulerConfig`,
+    # so shorten the context by assigning it directly.
+    scheduler.max_model_len = max_model_len
+    req = create_requests(num_requests=1, num_tokens=16, max_tokens=1000, ignore_eos=True)[0]
+    scheduler.add_request(req)
+
+    # Vary how many drafts are accepted so the walk-back size differs from step
+    # to step, as it does when K changes with the batch size (5 -> 3 -> 1).
+    acceptance_cycle = [0, num_spec_tokens, 1, num_spec_tokens, 0]
+
+    for step in range(1000):
+        if not scheduler.get_num_unfinished_requests():
+            break
+        projected_before = req.num_tokens + req.num_output_placeholders
+        sched_output = scheduler.schedule()
+        if not sched_output.num_scheduled_tokens:
+            break
+        num_drafts = len(sched_output.scheduled_spec_decode_tokens.get(req.request_id, ()))
+
+        # Positions computed so far must stay inside the context window, leaving
+        # room for the token this step samples.
+        assert req.num_computed_tokens < max_model_len
+        # ...and so must the projected token count, which is what the worker
+        # mirrors into `num_tokens_no_spec`.
+        assert req.num_tokens + req.num_output_placeholders <= max_model_len
+        # Drafts may only be scheduled when the whole verify step fits.
+        if num_drafts:
+            assert projected_before + num_drafts + 1 <= max_model_len
+
+        scheduler.update_from_output(
+            sched_output,
+            _spec_decode_model_runner_output(sched_output, acceptance_cycle[step % len(acceptance_cycle)]),
+        )
+    else:
+        raise AssertionError("request never finished")
+
+    assert scheduler.get_num_unfinished_requests() == 0
+    assert req.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert req.num_tokens == max_model_len

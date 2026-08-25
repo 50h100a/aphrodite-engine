@@ -1324,7 +1324,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnec
                     # We must recover the output token ids for resumed requests in the
                     # async scheduling case, so that correct input_ids are obtained.
                     resumed_token_ids = req_data.all_token_ids[req_id]
-                    req_state.output_token_ids = resumed_token_ids[-num_output_tokens:]
+                    confirmed_token_ids = resumed_token_ids[req_state.num_prompt_tokens :]
+                    num_placeholders = num_output_tokens - len(confirmed_token_ids)
+                    req_state.output_token_ids = list(confirmed_token_ids) + [-1] * num_placeholders
 
                 reqs_to_add.append(req_state)
                 # Track resumed requests for ngram_gpu full tensor copy
@@ -3488,13 +3490,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnec
             if not sampled_ids:
                 continue
 
-            start_idx = self.input_batch.num_tokens_no_spec[req_idx]
+            start_idx = int(self.input_batch.num_tokens_no_spec[req_idx])
             end_idx = start_idx + num_sampled_ids
-            assert end_idx <= self.max_model_len, (
-                "Sampled token IDs exceed the max model length. "
-                f"Total number of tokens: {end_idx} > max_model_len: "
-                f"{self.max_model_len}"
-            )
+            if end_idx > self.max_model_len:
+                # clamp specdecs to context limits
+                num_sampled_ids = self.max_model_len - start_idx
+                if num_sampled_ids <= 0:
+                    continue
+                sampled_ids = sampled_ids[:num_sampled_ids]
+                end_idx = start_idx + num_sampled_ids
 
             self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
             self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True

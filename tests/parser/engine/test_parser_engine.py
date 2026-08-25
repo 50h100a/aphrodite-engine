@@ -7,6 +7,7 @@ DeltaMessage / ExtractedToolCallInformation protocol.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -24,6 +25,13 @@ from aphrodite.entrypoints.openai.engine.protocol import (
     FunctionDefinition,
 )
 from aphrodite.parser.abstract_parser import DelegatingParser
+from aphrodite.parser.deepseek_v4 import (
+    DSML_THINK_END,
+    DSML_THINK_START,
+    DSML_TOOL_END,
+    DSML_TOOL_START,
+    DeepSeekV4Parser,
+)
 from aphrodite.parser.engine.adapters import make_adapters
 from aphrodite.parser.engine.events import EventType, SemanticEvent
 from aphrodite.parser.engine.parser_engine import ParserEngine
@@ -1628,3 +1636,70 @@ class TestDropSpecialTokens:
         assert EventType.TEXT_CHUNK in types
         reasoning_text = "".join(e.value for e in events if e.type == EventType.REASONING_CHUNK)
         assert "<bos>" not in reasoning_text
+
+
+# ── TestIsReasoningEnd ───────────────────────────────────────────────
+
+
+def _dsv4_parser(thinking: bool = False) -> DeepSeekV4Parser:
+    """A real DeepSeekV4Parser over a mock vocab of its DSML terminals."""
+    vocab = {
+        DSML_THINK_START: 128821,
+        DSML_THINK_END: 128822,
+        DSML_TOOL_START: 128823,
+        DSML_TOOL_END: 128824,
+    }
+    tokenizer = make_mock_tokenizer(vocab)
+    return DeepSeekV4Parser(tokenizer, chat_template_kwargs={"thinking": thinking})
+
+
+class TestIsReasoningEnd:
+    """The structured-output gate reads is_reasoning_end() to decide when
+    the grammar bitmask may be applied. A prompt carrying no think marker
+    at all must not wedge it closed for models whose marker lives in the
+    prompt rather than the output.
+    """
+
+    def test_chat_mode_no_marker_is_ended(self):
+        """deepseek_v4 chat mode renders `<|Assistant|></think>` only when
+        the last message is user/developer. Messages that never hit that
+        branch (e.g. system-only conversations) produce a prompt with no
+        marker, and reasoning was never pending to begin with.
+        """
+        parser = _dsv4_parser(thinking=False)
+        assert parser.is_reasoning_end([1, 2, 3]) is True
+
+    def test_thinking_mode_no_marker_is_not_ended(self):
+        """In thinking mode the model still owes us a `</think>`."""
+        parser = _dsv4_parser(thinking=True)
+        assert parser.is_reasoning_end([1, 2, 3]) is False
+
+    @pytest.mark.parametrize("thinking", [False, True])
+    def test_trailing_end_marker_is_ended(self, thinking: bool):
+        parser = _dsv4_parser(thinking=thinking)
+        assert parser.is_reasoning_end([1, 128822]) is True
+
+    @pytest.mark.parametrize("thinking", [False, True])
+    def test_trailing_start_marker_is_not_ended(self, thinking: bool):
+        """An open `<think>` re-closes the gate even in chat mode, where
+        the model opened the block on its own.
+        """
+        parser = _dsv4_parser(thinking=thinking)
+        assert parser.is_reasoning_end([1, 128822, 128821]) is False
+
+    def test_end_marker_after_start_marker_is_ended(self):
+        parser = _dsv4_parser(thinking=True)
+        assert parser.is_reasoning_end([128821, 5, 128822, 6]) is True
+
+    @pytest.mark.parametrize(
+        ("initial_state", "expected"),
+        [(ParserState.CONTENT, True), (ParserState.REASONING, False)],
+    )
+    def test_empty_and_markerless_agree(self, initial_state: ParserState, expected: bool):
+        """The markerless path must match the empty-input path — they are
+        the same question asked of the same config.
+        """
+        cfg = dataclasses.replace(_combined_config(), initial_state=initial_state)
+        engine = _make_engine(config=cfg)
+        assert engine.is_reasoning_end([]) is expected
+        assert engine.is_reasoning_end([1, 2, 3]) is expected

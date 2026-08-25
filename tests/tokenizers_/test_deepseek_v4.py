@@ -267,6 +267,43 @@ def test_deepseek_v4_maps_xhigh_to_reference_max_reasoning_effort():
 
 
 @pytest.mark.parametrize(
+    "messages",
+    [
+        pytest.param(
+            [
+                {"role": "system", "content": "a"},
+                {"role": "system", "content": "b"},
+                {"role": "system", "content": "c"},
+            ],
+            id="system-only",
+        ),
+        pytest.param(
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "note"},
+            ],
+            id="system-last",
+        ),
+    ],
+)
+def test_deepseek_v4_omits_generation_prefix_without_trailing_user(messages):
+    """The reference encoder appends `<｜Assistant｜>` and the think marker
+    only when the last message is user/developer (or carries a task), so
+    these conversations render with no think marker at all.
+
+    Pinned because consumers must not assume the prompt carries `</think>`:
+    the structured-output gate used to infer "reasoning still pending" from
+    its absence and wedged the grammar bitmask closed for the whole request.
+    See TestIsReasoningEnd in tests/parser/engine/test_parser_engine.py.
+    """
+    prompt = _tokenizer().apply_chat_template(messages, tokenize=False)
+
+    assert "</think>" not in prompt
+    assert "<think>" not in prompt
+    assert "<｜Assistant｜>" not in prompt
+
+
+@pytest.mark.parametrize(
     ("case_id", "kwargs"),
     [
         (1, {"thinking": True}),

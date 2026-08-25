@@ -585,7 +585,7 @@ class ParserEngine(Parser):
                     return True
                 if start_id is not None and input_ids[i] == start_id:
                     return False
-            return False
+            return self.parser_engine_config.initial_state != ParserState.REASONING
         return self._reasoning_ended
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
