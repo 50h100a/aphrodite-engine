@@ -8,7 +8,6 @@ from unittest.mock import MagicMock
 import pytest
 from xgrammar import StructuralTag
 
-import aphrodite.envs as envs
 from aphrodite.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedFunction,
     ChatCompletionNamedToolChoiceParam,
@@ -260,14 +259,29 @@ def test_get_structural_tag_disables_reasoning(
     assert captured == [False]
 
 
-@pytest.mark.parametrize("has_reasoning_parser", [True, False])
+@pytest.mark.parametrize(
+    ("grammar_needs_reasoning", "expected"),
+    [
+        # A model that opens on reasoning needs the segment listed, or the
+        # grammar forbids its own first token.
+        (True, True),
+        # A model handed an already-closed `</think>` never generates the end
+        # marker, so listing the segment strands the grammar in its free-text
+        # prefix and nothing downstream is ever constrained.
+        (False, False),
+        # No reasoning parser at all.
+        (None, False),
+    ],
+)
 def test_unified_parser_matches_reasoning_to_the_parser(
     monkeypatch: pytest.MonkeyPatch,
     sample_tools_strict: list[ChatCompletionToolsParam],
-    has_reasoning_parser: bool,
+    grammar_needs_reasoning: bool | None,
+    expected: bool,
 ):
-    """The tag is a closed alternation, so a model that reasons needs its
-    reasoning segment listed or the grammar forbids its own first token."""
+    """The tag is a closed alternation, so the reasoning segment has to be
+    listed exactly when the model will actually emit it -- neither more nor
+    less. A configured reasoning parser is not on its own the answer."""
     captured: list[bool] = []
 
     def fake_get_model_structural_tag(*, reasoning: bool, **kwargs):
@@ -289,12 +303,15 @@ def test_unified_parser_matches_reasoning_to_the_parser(
         tool_choice="auto",
     )
     parser = TestParser(MagicMock(), tools=sample_tools_strict)
-    if has_reasoning_parser:
-        parser.reasoning_parser = MagicMock(adjust_request=lambda request: request)
+    if grammar_needs_reasoning is not None:
+        parser.reasoning_parser = MagicMock(
+            adjust_request=lambda request: request,
+            grammar_needs_reasoning=grammar_needs_reasoning,
+        )
 
     parser.adjust_request(request)
 
-    assert captured == [has_reasoning_parser]
+    assert captured == [expected]
 
 
 @pytest.mark.parametrize("has_reasoning_parser", [True, False])
@@ -462,29 +479,17 @@ def test_xgrammar_function_parameters_are_preserved(
 
 
 @pytest.mark.parametrize("model", sorted(XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS))
-def test_auto_tool_choice_skips_structural_tag_without_strict(
+def test_auto_tool_choice_builds_structural_tag_without_strict(
     model: str,
     sample_tools: list[ChatCompletionToolsParam],
 ):
-    tag = get_model_structural_tag(
-        model=model,
-        tools=sample_tools,
-        tool_choice="auto",
-        reasoning=False,
-    )
+    """"auto" chooses between text and a tool call, not between tool names.
 
-    assert tag is None
-
-
-@pytest.mark.parametrize("model", sorted(XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS))
-def test_constrain_auto_tool_calls_builds_tag_without_strict(
-    model: str,
-    sample_tools: list[ChatCompletionToolsParam],
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """The operator override constrains "auto" that no client opted into."""
-    monkeypatch.setattr(envs, "APHRODITE_CONSTRAIN_AUTO_TOOL_CALLS", True)
-
+    It used to be skipped unless a client set `strict` on some tool, which left
+    the tool name unconstrained by construction -- the model could invoke a name
+    that was never declared. `strict` governs whether *arguments* are enforced,
+    per tool, and says nothing about which tools exist.
+    """
     tag = get_model_structural_tag(
         model=model,
         tools=sample_tools,
@@ -495,13 +500,30 @@ def test_constrain_auto_tool_calls_builds_tag_without_strict(
     assert isinstance(tag, StructuralTag)
 
 
-def test_constrain_auto_tool_calls_still_skips_tool_choice_none(
+def test_auto_tool_choice_names_exactly_the_declared_tools(
     sample_tools: list[ChatCompletionToolsParam],
-    monkeypatch: pytest.MonkeyPatch,
 ):
-    """ "none" means no call at all, so there is nothing to constrain."""
-    monkeypatch.setattr(envs, "APHRODITE_CONSTRAIN_AUTO_TOOL_CALLS", True)
+    """The declared names are in the grammar, and nothing else is."""
+    tag = get_model_structural_tag(
+        model="deepseek_v4",
+        tools=sample_tools,
+        tool_choice="auto",
+        reasoning=False,
+    )
 
+    assert tag is not None
+    serialized = json.dumps(tag.model_dump())
+    declared = [tool.function.name for tool in sample_tools]
+    for name in declared:
+        assert f'invoke name=\\"{name}\\"' in serialized
+    # Exactly those: one invoke tag per declared tool, no extras.
+    assert serialized.count("invoke name=") == len(declared)
+
+
+def test_tool_choice_none_skips_structural_tag(
+    sample_tools: list[ChatCompletionToolsParam],
+):
+    """"none" means no call at all, so there is nothing to constrain."""
     tag = get_model_structural_tag(
         model="deepseek_v4",
         tools=sample_tools,

@@ -265,6 +265,50 @@ def test_get_aphrodite_registry_structural_tag_returns_structural_tag(
         assert isinstance(tag, StructuralTag)
 
 
+def _invoked_tool_names(node, found: list[str] | None = None) -> list[str]:
+    """Every tool name the tag's invoke tags can open, in order.
+
+    Read off the structure rather than the serialized text: the DSML markers
+    carry quotes, which JSON escapes, and a substring check against the escaped
+    form is one backslash away from passing vacuously.
+    """
+    found = [] if found is None else found
+    if isinstance(node, dict):
+        begin = node.get("begin")
+        if isinstance(begin, str) and begin.startswith(INV_START):
+            found.append(begin[len(INV_START) :].split('"', 1)[0])
+        for value in node.values():
+            _invoked_tool_names(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            _invoked_tool_names(value, found)
+    return found
+
+
+def test_auto_tool_choice_constrains_names_without_strict(
+    sample_tools: list[ChatCompletionToolsParam],
+) -> None:
+    """Plain "auto" is tagged too, and the tag lists the declared tools.
+
+    `strict` decides whether a tool's *arguments* are schema-enforced. It never
+    decided which tools exist -- but "auto" used to be skipped without it,
+    leaving the model free to invoke a name nobody declared.
+    """
+    parser = make_parser()
+    req = ChatCompletionRequest(
+        messages=[],
+        model="m",
+        tools=sample_tools,
+        tool_choice="auto",
+    )
+
+    tag = parser.get_structural_tag(req)
+    assert isinstance(tag, StructuralTag)
+
+    invoked = _invoked_tool_names(tag.model_dump())
+    assert invoked == [tool.function.name for tool in sample_tools]
+
+
 def test_extract_tool_calls_arguments_wrapper():
     mock_tokenizer = MagicMock()
     mock_tokenizer.get_vocab.return_value = {}

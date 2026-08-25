@@ -59,6 +59,11 @@ class ReasoningParser:
         """
         return None
 
+    @property
+    def grammar_needs_reasoning(self) -> bool:
+        """Whether the *generated* text will open on a reasoning segment."""
+        return True
+
     def has_engine_confirmed_reasoning_end(self) -> bool:
         """Whether the engine has confirmed the reasoning end transition.
 

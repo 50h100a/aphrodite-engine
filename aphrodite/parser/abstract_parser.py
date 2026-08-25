@@ -511,8 +511,17 @@ class DelegatingParser(Parser):
         but the grammar does not list is a form the model cannot emit. So a
         model that reasons needs its reasoning segment spelled out, or the
         grammar forbids the very first thing it tries to say.
+
+        It cuts both ways, which is why a configured reasoning parser is not on
+        its own the answer. The reasoning form of the tag makes the segment
+        *mandatory* -- a `...</think>` prefix standing in front of the tool
+        tags. Templates that hand the model an already-closed `</think>` (the
+        DeepSeek V4/V3.2 non-thinking prompts) generate no end marker at all, so
+        that prefix is never satisfied and the reply falls through the free-text
+        span with nothing constrained. Ask the parser which of the two its model
+        will actually produce.
         """
-        return self._reasoning_parser is not None
+        return self._reasoning_parser is not None and self._reasoning_parser.grammar_needs_reasoning
 
     def _apply_structural_tag(
         self, request: ChatCompletionRequest | ResponsesRequest
