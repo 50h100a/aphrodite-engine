@@ -365,7 +365,7 @@ def test_resolve_chat_template_kwargs_with_template_name():
         ("Qwen/Qwen3.5-4B", "openai"),
         ("fixie-ai/ultravox-v0_5-llama-3_2-1b", "string"),
         ("Qwen/Qwen2-Audio-7B-Instruct", "openai"),
-        ("meta-llama/Llama-Guard-3-1B", "openai"),
+        ("alpindale/Llama-Guard-3-1B", "openai"),  # canonical is gated
     ],
 )
 def test_resolve_content_format_hf_defined(model, expected_format):

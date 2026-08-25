@@ -326,7 +326,8 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     "LlamaForCausalLM": _HfExamplesInfo(
         "meta-llama/Llama-3.2-1B-Instruct",
         extras={
-            "guard": "meta-llama/Llama-Guard-3-1B",
+            # Canonical "meta-llama/Llama-Guard-3-1B" is gated
+            "guard": "alpindale/Llama-Guard-3-1B",
             "hermes": "NousResearch/Hermes-3-Llama-3.1-8B",
             "fp8": "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8",
             "tiny": "hmellor/tiny-random-LlamaForCausalLM",
