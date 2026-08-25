@@ -242,6 +242,11 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
                 ParserState.TOOL_NAME,
                 (EventType.TOOL_CALL_START,),
             ),
+            # A tool block the model opens and immediately closes without an invoke.
+            (ParserState.TOOL_PREAMBLE, "TOOL_END"): Transition(
+                ParserState.CONTENT,
+                (),
+            ),
             (ParserState.TOOL_NAME, "INVOKE_NAME_END"): Transition(
                 ParserState.TOOL_ARGS,
                 (),

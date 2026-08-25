@@ -9,6 +9,9 @@ from aphrodite.entrypoints.openai.engine.protocol import DeltaMessage
 from aphrodite.reasoning import ReasoningParserManager
 from aphrodite.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
 from aphrodite.reasoning.deepseek_v3_reasoning_parser import DeepSeekV3ReasoningParser
+from aphrodite.reasoning.deepseek_v4_engine_reasoning_parser import (
+    DeepSeekV4ParserReasoningAdapter,
+)
 from aphrodite.reasoning.identity_reasoning_parser import IdentityReasoningParser
 
 REASONING_MODEL_NAME = "deepseek-ai/DeepSeek-V3.1"
@@ -32,10 +35,9 @@ def test_parser_selection(tokenizer, thinking, expected_parser_type):
     assert isinstance(parser._parser, expected_parser_type)
 
 
-def test_deepseek_v4_reasoning_parser_alias():
-    parser_cls = ReasoningParserManager.get_reasoning_parser("deepseek_v4")
-
-    assert parser_cls is DeepSeekV3ReasoningParser
+def test_deepseek_reasoning_parser_registrations():
+    assert ReasoningParserManager.get_reasoning_parser("deepseek_v4") is DeepSeekV4ParserReasoningAdapter
+    assert ReasoningParserManager.get_reasoning_parser("deepseek_v3") is DeepSeekV3ReasoningParser
 
 
 def test_identity_reasoning_parser_basic(tokenizer):

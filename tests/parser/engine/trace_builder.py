@@ -22,6 +22,8 @@ from aphrodite.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionToolsParam,
 )
 from aphrodite.parser.engine.registered_adapters import (
+    DeepSeekV4Parser,
+    DeepSeekV32Parser,
     Gemma4Parser,
     Glm47MoeParser,
     InklingParser,
@@ -866,6 +868,129 @@ def _build_inkling(scenario: Scenario, validate: bool = True) -> Sample:
     return sample
 
 
+# ── DeepSeek V4 / V3.2 (DSML invoke format) ──────────────────────────
+
+_DSML = "｜DSML｜"
+
+_DEEPSEEK_V4_VOCAB: dict[str, int] = {
+    "<think>": 50,
+    "</think>": 51,
+    f"<{_DSML}tool_calls>": 60,
+    f"</{_DSML}tool_calls>": 61,
+}
+
+_DEEPSEEK_V32_VOCAB: dict[str, int] = {
+    f"<{_DSML}function_calls>": 60,
+    f"</{_DSML}function_calls>": 61,
+}
+
+
+def _dsml_tool_segments(tool_calls: list[ToolCallSpec], wrapper: str) -> list[tuple[str, bool]]:
+    segs: list[tuple[str, bool]] = [(f"<{_DSML}{wrapper}>", True)]
+    for tc in tool_calls:
+        segs.append((f'<{_DSML}invoke name="{tc.name}">', False))
+        for key, value in tc.arguments.items():
+            # The model declares the value's kind with string="…"; the parser
+            # trusts the tool schema over the flag, so the flag only has to be
+            # what a model would plausibly emit.
+            is_str = "true" if isinstance(value, str) else "false"
+            rendered = _minimax_m2_arg_value(value)
+            segs.append(
+                (
+                    f'<{_DSML}parameter name="{key}" string="{is_str}">'
+                    f"{rendered}</{_DSML}parameter>",
+                    False,
+                )
+            )
+        segs.append((f"</{_DSML}invoke>", False))
+    segs.append((f"</{_DSML}{wrapper}>", True))
+    return segs
+
+
+def _deepseek_v4_segments(scenario: Scenario) -> list[tuple[str, bool]]:
+    segs: list[tuple[str, bool]] = []
+    # deepseek_v4 starts in CONTENT (chat mode is the default), so reasoning is
+    # opened explicitly rather than assumed the way qwen3 does -- this is the
+    # only coverage of the (CONTENT, THINK_START) transition.
+    if scenario.reasoning is not None:
+        segs.append(("<think>", True))
+        segs.append((scenario.reasoning, False))
+        segs.append(("</think>", True))
+    if scenario.tool_calls is not None and not scenario.tool_calls:
+        segs.append((f"<{_DSML}tool_calls>", True))
+        segs.append((f"</{_DSML}tool_calls>", True))
+    if scenario.content is not None:
+        segs.append((scenario.content, False))
+    if scenario.tool_calls:
+        segs.extend(_dsml_tool_segments(scenario.tool_calls, "tool_calls"))
+    return segs
+
+
+def _build_deepseek_v4(scenario: Scenario, validate: bool = True) -> Sample:
+    sample = _make_sample(
+        sample_id=f"deepseek_v4-{scenario.id}",
+        description=scenario.description,
+        vocab=_DEEPSEEK_V4_VOCAB,
+        segments=_deepseek_v4_segments(scenario),
+        expected_reasoning=scenario.reasoning if scenario.reasoning is not None else "",
+        expected_content=_qwen3_expected_content(scenario),
+        expected_tool_calls=_expected_tc(scenario),
+        tools=_expected_tools(scenario),
+    )
+    if validate:
+        _validate_sample(sample, DeepSeekV4Parser)
+    return sample
+
+
+def _deepseek_v32_segments(scenario: Scenario) -> list[tuple[str, bool]]:
+    segs: list[tuple[str, bool]] = []
+    if scenario.tool_calls is not None and not scenario.tool_calls:
+        segs.append((f"<{_DSML}function_calls>", True))
+        segs.append((f"</{_DSML}function_calls>", True))
+    if scenario.content is not None:
+        segs.append((scenario.content, False))
+    if scenario.tool_calls:
+        segs.extend(_dsml_tool_segments(scenario.tool_calls, "function_calls"))
+    return segs
+
+
+def _build_deepseek_v32(scenario: Scenario, validate: bool = True) -> Sample:
+    sample = _make_sample(
+        sample_id=f"deepseek_v32-{scenario.id}",
+        description=scenario.description,
+        vocab=_DEEPSEEK_V32_VOCAB,
+        segments=_deepseek_v32_segments(scenario),
+        expected_reasoning=None,
+        expected_content=_qwen3_expected_content(scenario),
+        expected_tool_calls=_expected_tc(scenario),
+        tools=_expected_tools(scenario),
+    )
+    if validate:
+        _validate_sample(sample, DeepSeekV32Parser)
+    return sample
+
+
+# deepseek_v32 has no <think>/</think> terminals at all -- the format carries no
+# reasoning segment. Folding each scenario's reasoning into its content keeps the
+# scenario's *shape* (text before a tool call, text alone, …) while rendering it
+# in the only channel the format has, instead of dropping the text silently.
+_DEEPSEEK_V32_SCENARIOS = [
+    Scenario(
+        id=s.id,
+        description=s.description,
+        reasoning=None,
+        content=(
+            s.content
+            if s.reasoning is None
+            else (s.reasoning if s.content is None else f"{s.reasoning} {s.content}")
+        ),
+        tool_calls=s.tool_calls,
+        after_tool_response=s.after_tool_response,
+    )
+    for s in SCENARIOS
+]
+
+
 # ── Registry and public API ──────────────────────────────────────────
 
 _BUILDERS: dict[str, Any] = {
@@ -877,6 +1002,13 @@ _BUILDERS: dict[str, Any] = {
     "glm47_moe": _build_glm47_moe,
     "kimi_k2": _build_kimi_k2,
     "inkling": _build_inkling,
+    "deepseek_v4": _build_deepseek_v4,
+    "deepseek_v32": _build_deepseek_v32,
+}
+
+_SCENARIO_OVERRIDES: dict[str, list[Scenario]] = {
+    "kimi_k2": _KIMI_K2_SCENARIOS,
+    "deepseek_v32": _DEEPSEEK_V32_SCENARIOS,
 }
 
 
@@ -884,7 +1016,7 @@ _BUILDERS: dict[str, Any] = {
 def build_samples(model: str) -> tuple[Sample, ...]:
     """Build all scenario samples for a model, self-validated."""
     builder = _BUILDERS[model]
-    scenarios = _KIMI_K2_SCENARIOS if model == "kimi_k2" else SCENARIOS
+    scenarios = _SCENARIO_OVERRIDES.get(model, SCENARIOS)
     return tuple(builder(s) for s in scenarios)
 
 
