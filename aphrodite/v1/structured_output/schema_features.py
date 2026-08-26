@@ -92,9 +92,10 @@ _KEYWORD_BACKENDS: dict[str, frozenset[str]] = {
     # No backend enforces these. A CFG cannot count, compare across the
     # document, or remember what it already emitted.
     #
-    # `contains`/`minContains` are still enforceable, by `postconditions` on top
-    # of whichever backend decodes, so ask `_LayerVerdict.backends` about a
-    # particular node rather than reading them off this table.
+    # `contains`/`minContains`/`uniqueItems` are still enforceable, by
+    # `postconditions` on top of whichever backend decodes, and only where they
+    # sit -- so ask `_LayerVerdict.backends` about a particular node rather than
+    # reading them off this table.
     "contains": frozenset(),
     "dependentRequired": frozenset(),
     "dependentSchemas": frozenset(),
@@ -128,8 +129,8 @@ _KEYWORD_BACKENDS: dict[str, frozenset[str]] = {
 # Which backends can carry a keyword the postcondition layer enforces. The
 # layer works with any backend, but the schema still has to *compile*, which is
 # measured the same way as the table above: xgrammar, outlines and
-# lm-format-enforcer read `contains`, ignore it, and enforce the rest, so the
-# layer supplies only what they dropped. llguidance refuses the whole schema
+# lm-format-enforcer read these keywords, ignore them, and enforce the rest, so
+# the layer supplies only what they dropped. llguidance refuses the whole schema
 # ("Unimplemented keys"), so routing has to divert before it dispatches or the
 # compile throws on the grammar thread and reaches the caller as a 500.
 _LAYER_ENFORCED_BACKENDS = JSON_SCHEMA_BACKENDS - {"guidance"}
@@ -139,7 +140,6 @@ _LAYER_ENFORCED_BACKENDS = JSON_SCHEMA_BACKENDS - {"guidance"}
 _VACUOUS_WHEN = {
     "unevaluatedItems": True,
     "unevaluatedProperties": True,
-    "uniqueItems": False,
 }
 
 # The keywords no *backend* enforces -- read off the table rather than repeated,
@@ -153,8 +153,9 @@ def _constrains(node: dict[str, Any], key: str) -> bool:
     """Whether ``node[key]`` actually restricts anything.
 
     A keyword that is present but inert should not cost the caller a backend or
-    a rejection: `uniqueItems: false` says nothing, and `if` without a `then` or
-    an `else` to apply is a no-op the caller most likely did not intend as one.
+    a rejection: `unevaluatedItems: true` says nothing, and `if` without a
+    `then` or an `else` to apply is a no-op the caller most likely did not
+    intend as one.
     """
     value = node[key]
     if key in _VACUOUS_WHEN and value is _VACUOUS_WHEN[key]:
@@ -171,6 +172,8 @@ def _constrains(node: dict[str, Any], key: str) -> bool:
         # layer asks, so a keyword it would never fire on is not one the caller
         # is refused for.
         return postconditions.contains_obligation(node) is not None
+    if key == "uniqueItems":
+        return postconditions.unique_obligation(node)
     return True
 
 
@@ -213,22 +216,23 @@ class _LayerVerdict:
     what was promised.
     """
 
-    __slots__ = ("_enforced", "reasons")
+    __slots__ = ("_analysis",)
 
     def __init__(self, schema: Any, available: bool = True):
         if not available or not isinstance(schema, dict):
             # The structural-tag route, which the layer does not serve: the
             # scanner would have to find the schema body inside the tag's own
             # trigger/begin/end output to know where the array starts.
-            self._enforced: set[int] = set()
-            self.reasons: list[str] = []
-            return
-        analysis = postconditions.analyze(schema)
-        self._enforced = analysis.obligations
-        self.reasons = analysis.problems
+            self._analysis = postconditions.SchemaAnalysis()
+        else:
+            self._analysis = postconditions.analyze(schema)
+
+    @property
+    def reasons(self) -> list[str]:
+        return self._analysis.problems
 
     def backends(self, node: dict[str, Any], key: str) -> frozenset[str]:
-        if key in postconditions.LAYER_ENFORCED_KEYWORDS and id(node) in self._enforced:
+        if self._analysis.enforces(node, key):
             return _LAYER_ENFORCED_BACKENDS
         return _KEYWORD_BACKENDS[key]
 

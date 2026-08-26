@@ -74,8 +74,8 @@ class _PermitEverything(StructuredOutputGrammar):
 
 def build(schema, inner=None):
     analysis = analyze(schema)
-    assert not analysis.problems, f"schema was refused: {analysis.problems[0].reason}"
-    assert analysis.obligations, "schema carries nothing for this layer to enforce"
+    assert not analysis.problems, f"schema was refused: {analysis.problems[0]}"
+    assert analysis, "schema carries nothing for this layer to enforce"
     return PostconditionGrammar(
         inner=inner or _PermitEverything(),
         schema=schema,
@@ -164,6 +164,115 @@ def test_contains_may_be_structural():
 def test_equality_is_by_value_not_by_bytes():
     """`1.0` and `1` are the same JSON value, and whitespace is not part of it."""
     assert closable({"type": "array", "contains": {"const": 1}}, "[ 1.0 ")
+
+
+# ---------------------------------------------------------------------------
+# uniqueItems
+# ---------------------------------------------------------------------------
+
+COLOURS = {"type": "array", "items": {"enum": ["red", "green", "blue"]}, "uniqueItems": True}
+
+
+def test_a_repeat_is_refused_where_it_commits_rather_than_where_it_finishes():
+    """By the time `"red"` is spelled the model is already committed to it, so
+    the byte that goes is the one that first picks the used value out of the
+    ones left."""
+    grammar = build(COLOURS)
+    assert emit(grammar, '["red","')[-1] == {"b", "g"}
+
+
+def test_the_last_value_closes_the_array():
+    """With nothing left to say, a comma would commit the array to an item it
+    could not spell -- so the comma goes, and closing is all that is left."""
+    grammar = build(COLOURS)
+    assert emit(grammar, '["red","green","blue"')[-1] == {"]", *" \t\n\r"}
+
+
+def test_an_item_already_spelling_a_used_value_is_pushed_past_it():
+    """`1` is used and `12` is not, so the prefix `1` is legal and it is the
+    end of it that is refused. A veto that fired on the prefix would wall an
+    array that still had somewhere to go."""
+    schema = {"type": "array", "items": {"enum": [1, 12]}, "uniqueItems": True}
+    grammar = build(schema)
+    assert emit(grammar, "[1,1")[-1] == {"2"}
+
+
+def test_a_separator_inside_a_value_is_not_a_separator():
+    """The trie knows which bytes are still inside the string, so a comma or a
+    bracket in the value itself does not end the item."""
+    schema = {"type": "array", "items": {"enum": ["a,b", "c]d"]}, "uniqueItems": True}
+    grammar = build(schema)
+    assert emit(grammar, '["a')[-1] == {","}
+    assert emit(grammar, ',b"')[-1] == {",", "]", *" \t\n\r"}
+
+
+def test_whitespace_around_an_item_is_not_part_of_it():
+    grammar = build(COLOURS)
+    assert emit(grammar, '[ "red" , "')[-1] == {"b", "g"}
+
+
+def test_only_the_array_the_keyword_names_is_policed():
+    schema = {
+        "type": "object",
+        "properties": {
+            "free": {"type": "array", "items": {"enum": ["red"]}},
+            "held": COLOURS,
+        },
+    }
+    grammar = build(schema)
+    assert emit(grammar, '{"free":["red","red"],"held":["red","')[-1] == {"b", "g"}
+
+
+def test_a_branch_without_the_keyword_permits_the_repeat():
+    """The same permissiveness `contains` gets: while the document is still
+    live in a branch that never asked for distinct items, it can come out valid
+    under that branch."""
+    schema = {"anyOf": [COLOURS, {"type": "array", "items": {"enum": ["red", "green", "blue"]}}]}
+    grammar = build(schema)
+    assert "r" in emit(grammar, '["red","')[-1]
+
+
+def test_a_token_that_spans_two_items_is_judged_whole():
+    """A veto has to look at what a token spells. `,"red"` is a comma and a
+    repeat, and the comma alone would have been fine."""
+    grammar = build(COLOURS)
+    emit(grammar, '["red"')
+    grammar.profile = _VocabProfile([b",", b',"red"', b',"blue"'])
+    grammar.vocab_size = 3
+    grammar.num_words = 1
+    grammar._masks.clear()
+    bitmask = torch.full((1, 1), -1, dtype=torch.int32)
+    grammar.fill_bitmask(bitmask, 0)
+    assert int(bitmask[0][0]) & 0b001, "a bare comma was masked"
+    assert not int(bitmask[0][0]) & 0b010, "a token spelling a repeat was allowed"
+    assert int(bitmask[0][0]) & 0b100, "a token spelling an unused value was masked"
+
+
+def test_uniqueness_survives_rollback():
+    grammar = build(COLOURS)
+    emit(grammar, '["red","green"')
+    grammar.rollback(len('"green"'))
+    assert emit(grammar, '"')[-1] == {"b", "g"}, "the rolled-back green was still counted"
+
+
+def test_a_floor_and_a_prohibition_hold_the_same_array():
+    """`contains` masks the close and `uniqueItems` masks the comma. They meet
+    only where the screen has already refused the schema, so here each one is
+    still visible on its own."""
+    schema = {**COLOURS, "contains": {"const": "blue"}}
+    grammar = build(schema)
+    assert emit(grammar, '["red"')[-1] == {",", *" \t\n\r"}, "the array closed without its `contains`"
+    assert emit(grammar, ',"green"')[-1] == {",", *" \t\n\r"}
+    assert emit(grammar, ',"blue"')[-1] == {"]", *" \t\n\r"}
+
+
+def test_the_array_is_never_left_with_nothing_to_say():
+    """The wall this layer must not build. Every prefix of a legal document has
+    somewhere to go, including the ones where the veto is doing the most work."""
+    schema = {**COLOURS, "minItems": 3, "contains": {"const": "blue"}}
+    grammar = build(schema)
+    for permitted in emit(grammar, '["green","red","blue"]'):
+        assert permitted, "the array was walled"
 
 
 # ---------------------------------------------------------------------------
@@ -372,13 +481,113 @@ def test_reset_forgets_the_document():
             {"type": "array", "contains": {"const": 7}, "items": {"$ref": "https://example.com/x"}},
             "cannot follow",
         ),
+        (
+            {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
+            "needs those values in advance",
+        ),
+        (
+            {"type": "array", "items": {"enum": ["a", "b"]}, "uniqueItems": True, "minItems": 3},
+            "the array runs out before it is long enough",
+        ),
+        (
+            {
+                "type": "array",
+                "items": {"enum": ["a", "b", "c"]},
+                "uniqueItems": True,
+                "contains": {"const": "c"},
+                "minContains": 2,
+            },
+            "only 1 of the values `items` allows match `contains`",
+        ),
+        (
+            {"type": "array", "prefixItems": [{"const": "a"}], "items": {"enum": ["b"]}, "uniqueItems": True},
+            "positions have their own schemas",
+        ),
+        (
+            {"type": "array", "items": {"enum": ["café"]}, "uniqueItems": True},
+            "needs those values in advance",
+        ),
+        (
+            {"type": "array", "items": {"enum": [{"a": 1}]}, "uniqueItems": True},
+            "needs those values in advance",
+        ),
+        (
+            {"type": "object", "unevaluatedProperties": {**COLOURS}},
+            "cannot follow it",
+        ),
     ],
-    ids=["maxContains", "maxItems", "unevaluated", "remote-ref"],
+    ids=[
+        "maxContains",
+        "maxItems",
+        "unevaluated",
+        "remote-ref",
+        "open-items",
+        "minItems",
+        "minContains",
+        "positional",
+        "non-ascii",
+        "non-scalar",
+        "unique-unevaluated",
+    ],
 )
 def test_schemas_this_layer_refuses(schema, expected):
     problems = analyze(schema).problems
     assert problems, "expected a refusal"
     assert expected in problems[0]
+
+
+def test_unique_items_false_is_inert():
+    """The keyword at its permissive setting constrains nothing, so it is not
+    something to enforce and not something to refuse a schema over."""
+    analysis = analyze({"type": "array", "items": {"enum": ["a"]}, "uniqueItems": False})
+    assert not analysis
+    assert not analysis.problems
+
+
+def test_a_domain_is_narrowed_by_the_rest_of_the_item_schema():
+    """`enum` says which values are possible and the keywords beside it say
+    which of those are allowed. Reading only the first would leave the counts
+    below overstated and `minItems` waved through on values the array can never
+    actually spell."""
+    schema = {
+        "type": "array",
+        "items": {"enum": ["a", "bb", "ccc"], "maxLength": 2},
+        "uniqueItems": True,
+        "minItems": 3,
+    }
+    assert "allows only 2 values" in analyze(schema).problems[0]
+
+
+def test_the_two_keywords_meet_even_when_they_sit_in_different_branches():
+    """An `allOf` can put `uniqueItems` in one branch and `contains` in another
+    and they still land on the same array, where one holds it open and the
+    other runs it out of values. Read per node, this pair looks fine."""
+    schema = {
+        "allOf": [
+            {"type": "array", "items": {"enum": ["a", "b"]}, "uniqueItems": True},
+            {"type": "array", "contains": {"const": "c"}},
+        ]
+    }
+    analysis = analyze(schema)
+    assert not analysis.domains
+    assert "only 0 of the values" in analysis.problems[0]
+    assert analysis.obligations, "the `contains` was given up along with the uniqueItems"
+
+
+def test_one_node_can_have_one_keyword_served_and_the_other_refused():
+    """`_ROTA`-shaped: the refusal has to name the keyword with no home rather
+    than the one beside it that works."""
+    schema = {
+        "type": "array",
+        "items": {"type": "object"},
+        "contains": {"type": "object", "properties": {"slot": {"const": "night"}}},
+        "uniqueItems": True,
+    }
+    analysis = analyze(schema)
+    assert analysis.obligations, "the `contains` was given up along with the uniqueItems"
+    assert not analysis.domains
+    assert not analysis.enforces(schema, "uniqueItems")
+    assert analysis.enforces(schema, "contains")
 
 
 def test_min_contains_zero_is_inert():
@@ -472,6 +681,19 @@ def test_a_vocabulary_that_cannot_spell_around_a_veto_is_left_unenforced():
     tokenizer = _FakeHFTokenizer(["[", "7]", ",", "7", "<eos>"])
     inner = _PermitEverything()
     assert maybe_wrap(inner, StructuredOutputOptions.JSON, json.dumps(CONTAINS_SEVEN), tokenizer, 5) is inner
+
+
+def test_a_vocabulary_that_cannot_spell_a_domain_a_byte_at_a_time_is_left_unenforced():
+    """The detour past an item that would repeat is the next byte of one that
+    would not, so `uniqueItems` needs the values spellable byte by byte and not
+    only in the pieces the tokenizer happens to have."""
+    inner = _PermitEverything()
+    spec = json.dumps({"type": "array", "items": {"enum": ["ab", "cd"]}, "uniqueItems": True})
+    whole_words = _FakeHFTokenizer(["[", "]", ",", '"', '"ab"', '"cd"', "<eos>"])
+    assert maybe_wrap(inner, StructuredOutputOptions.JSON, spec, whole_words, 7) is inner
+
+    spelled_out = _FakeHFTokenizer(["[", "]", ",", '"', "a", "b", "c", "d", "<eos>"])
+    assert isinstance(maybe_wrap(inner, StructuredOutputOptions.JSON, spec, spelled_out, 9), PostconditionGrammar)
 
 
 def test_an_unenforceable_schema_that_slips_past_the_screen_is_not_half_enforced():

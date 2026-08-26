@@ -1370,9 +1370,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # adversarial patterns cause exponential DFA state-space explosion.
     # Set to 0 to disable the timeout (not recommended in production).
     "APHRODITE_REGEX_COMPILATION_TIMEOUT_S": lambda: int(os.getenv("APHRODITE_REGEX_COMPILATION_TIMEOUT_S", "5")),
-    # Best-effort structured output. A schema using a keyword that no backend
-    # can enforce while decoding -- `uniqueItems`, `contains`, `if`/`then`,
-    # `not`, the `dependent*` pair -- is rejected with a 400 by default, because
+    # Best-effort structured output. A schema using a keyword nothing can
+    # enforce while decoding -- `if`/`then`, `not`, the `dependent*` pair, and
+    # `contains`/`uniqueItems` where they sit somewhere the decode-time layer
+    # cannot keep them -- is rejected with a 400 by default, because
     # accepting it would promise a constraint nothing applies. Set this to 1 and
     # those keywords are instead stripped from the schema before it is compiled:
     # the request succeeds, everything else in the schema is still enforced, and

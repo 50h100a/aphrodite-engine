@@ -346,10 +346,42 @@ def test_best_effort_covers_every_screened_out_keyword(best_effort, keyword):
 def test_best_effort_leaves_the_enforced_keywords_alone(best_effort, keyword):
     """Best-effort drops what cannot be enforced and nothing else; stripping an
     enforced keyword would quietly widen the caller's schema."""
-    schema = {"type": "array", "items": {"type": "string"}, "contains": {"const": "x"}}
-    if keyword == "minContains":
-        schema["minContains"] = 2
+    if keyword == "uniqueItems":
+        schema = {"type": "array", "items": {"enum": ["x", "y"]}, "uniqueItems": True}
+    else:
+        schema = {"type": "array", "items": {"type": "string"}, "contains": {"const": "x"}}
+        if keyword == "minContains":
+            schema["minContains"] = 2
 
     structured_outputs = FakeStructuredOutputs(json=dict(schema))
     assert get_structured_outputs_schema_error(structured_outputs) is None
     assert structured_outputs.json == schema
+
+
+def test_best_effort_drops_a_keyword_that_is_enforceable_elsewhere(best_effort):
+    """`uniqueItems` is enforced where the items come from a known set and
+    refused where they do not, so the strip has to be as position-dependent as
+    the screen. A keyword left behind would fail routing one layer down, which
+    is the 400 the flag promised to prevent."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "picked": {"type": "array", "items": {"enum": ["x", "y"]}, "uniqueItems": True},
+            "notes": {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
+        },
+    }
+    structured_outputs = FakeStructuredOutputs(json=schema)
+
+    assert get_structured_outputs_schema_error(structured_outputs) is None
+    kept = structured_outputs.json["properties"]
+    assert kept["picked"]["uniqueItems"] is True
+    assert "uniqueItems" not in kept["notes"]
+
+
+def test_a_serveable_uniqueitems_schema_is_refused_as_a_tool():
+    """The asymmetry the layer cannot help: a tool's parameters ride a
+    structural tag, and the scanner would have to find the array inside the
+    tag's own output to know where the items start."""
+    schema = {"type": "array", "items": {"enum": ["x", "y"]}, "uniqueItems": True}
+    assert get_unenforceable_json_schema_keys(schema) == []
+    assert get_unenforceable_json_schema_keys(schema, postconditions_available=False) == ["uniqueItems"]

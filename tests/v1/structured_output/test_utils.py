@@ -43,10 +43,10 @@ def unsupported_number_schemas():
 
 @pytest.fixture
 def unsupported_array_schemas():
-    # `contains`/`minContains` belong here only alongside `maxContains`: on
-    # their own the postcondition layer enforces them on top of xgrammar.
+    # `contains`/`minContains`/`uniqueItems` belong here only alongside
+    # `maxContains`: on their own the postcondition layer enforces them on top
+    # of xgrammar, which needs xgrammar to be allowed to compile the rest.
     return [
-        {"type": "array", "uniqueItems": True},
         {"type": "array", "contains": {"type": "string"}, "maxContains": 5},
     ]
 

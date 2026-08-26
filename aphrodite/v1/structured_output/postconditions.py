@@ -2,15 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Enforce, while decoding, the JSON Schema keywords no grammar can express.
 
-A context-free grammar cannot count how many items matched a subschema, so no
-backend enforces `contains`/`minContains`. `StructuredOutputGrammar` is a
+A context-free grammar cannot count how many items matched a subschema, nor
+compare an item against the ones before it, so no backend enforces
+`contains`/`minContains` or `uniqueItems`. `StructuredOutputGrammar` is a
 per-request stateful object, so enforcement lands here instead: a decorator
 around whatever grammar the backend compiled, scanning the bytes the model has
 emitted and ANDing extra vetoes into the bitmask.
 
-`contains` is decided by handing each completed array item to `jsonschema`, so
-the matched subschema may be arbitrarily structural; only array item boundaries
-are tracked incrementally. Vetoes are empty except at an array's closing bracket.
+The two keywords are held from opposite ends. `contains` is a floor, so it is
+kept by refusing to close the array, and the decision can wait until the array
+ends: each completed item is handed to `jsonschema`, and the matched subschema
+may be arbitrarily structural. `uniqueItems` is a prohibition on an item that
+has not been emitted yet, and by the time the repeat is complete the model is
+already committed to it -- so it is kept instead by keeping every item on a
+path to a value the array has not used, which needs the possible values in
+advance. That is what confines it to a finite domain of scalars.
 
 Two invariants tie this to the screen in `schema_features`:
 
@@ -18,8 +24,10 @@ Two invariants tie this to the screen in `schema_features`:
   somewhere this scanner cannot navigate to, using `analyze` below -- the same
   walk, so the two cannot disagree about what is enforceable.
 - **No walls.** Every veto leaves at least one legal continuation, given the
-  static rules the screen applies (notably: `minContains` alongside `maxItems`
-  is refused, because masking `]` in a bounded array can wall).
+  static rules the screen applies: `minContains` alongside `maxItems` is
+  refused because masking `]` in a bounded array can wall, and a `uniqueItems`
+  array is refused unless its domain is large enough to reach `minItems` and
+  whatever `contains` asks for beside it.
 """
 
 from __future__ import annotations
@@ -50,10 +58,61 @@ else:
 
 logger = init_logger(__name__)
 
-LAYER_ENFORCED_KEYWORDS = frozenset({"contains", "minContains"})
+LAYER_ENFORCED_KEYWORDS = frozenset({"contains", "minContains", "uniqueItems"})
 
 # Ceiling on the DNF expansion of one schema position. `anyOf` sites multiply.
 _MAX_ALTERNATIVES = 64
+
+# Ceiling on the item domain a `uniqueItems` array may draw from. The cost of a
+# larger one is the trie, not the count, so this is a bound on how much of a
+# schema is worth reading rather than on how much the veto can afford.
+_MAX_DOMAIN = 128
+
+
+class _Domain:
+    """The values an array's items may take, as a trie over their spellings.
+
+    A repeat has to be refused before the item that would be one is finished,
+    so what the veto reads is not the values but their prefixes: it keeps the
+    item on a path towards one the array has not used, and the byte that leaves
+    every such path is the byte that goes.
+    """
+
+    __slots__ = ("values", "index", "children", "terminal", "reachable")
+
+    def __init__(self, values: tuple[bytes, ...]):
+        self.values = values
+        self.index = {spelling: position for position, spelling in enumerate(values)}
+        self.children: list[dict[int, int]] = [{}]
+        self.terminal: list[int | None] = [None]
+        reachable: list[set[int]] = [set()]
+        for position, spelling in enumerate(values):
+            node = 0
+            reachable[0].add(position)
+            for byte in spelling:
+                child = self.children[node].get(byte)
+                if child is None:
+                    child = len(self.children)
+                    self.children[node][byte] = child
+                    self.children.append({})
+                    self.terminal.append(None)
+                    reachable.append(set())
+                node = child
+                reachable[node].add(position)
+            self.terminal[node] = position
+        # Which values are still spellable from each node, so a subtree the
+        # array has used up can be recognised without walking it.
+        self.reachable: list[frozenset[int]] = [frozenset(found) for found in reachable]
+
+    def locate(self, prefix: bytes) -> int | None:
+        """The node `prefix` reaches, or None if it left the domain."""
+        node = 0
+        for byte in prefix:
+            child = self.children[node].get(byte)
+            if child is None:
+                return None
+            node = child
+        return node
 
 
 # ---------------------------------------------------------------------------
@@ -65,16 +124,29 @@ _MAX_ALTERNATIVES = 64
 class SchemaAnalysis:
     """What `analyze` found: the obligations, and every reason one was refused.
 
-    A refused obligation is simply absent from `obligations`, which is what the
-    screen reads. `problems` says why, and decides nothing.
+    A refused obligation is simply absent, which is what the screen reads.
+    `problems` says why, and decides nothing.
     """
 
     problems: list[str] = field(default_factory=list)
     # Nodes carrying a live `contains` obligation, by identity.
     obligations: set[int] = field(default_factory=set)
+    # Nodes carrying an enforceable `uniqueItems`, with the values their items
+    # may take. The two are kept apart because one node can carry both keywords
+    # and have only one of them served.
+    domains: dict[int, _Domain] = field(default_factory=dict)
     # Nodes from which an obligation is reachable. Navigation stops where this
     # does, so an ordinary subtree costs nothing to walk past.
     relevant: set[int] = field(default_factory=set)
+
+    def enforces(self, node: dict[str, Any], key: str) -> bool:
+        """Whether this layer keeps `key` where it sits in `node`."""
+        if key == "uniqueItems":
+            return id(node) in self.domains
+        return key in ("contains", "minContains") and id(node) in self.obligations
+
+    def __bool__(self) -> bool:
+        return bool(self.obligations or self.domains)
 
 
 class _Unresolvable(Exception):
@@ -255,6 +327,125 @@ def contains_obligation(node: dict[str, Any]) -> int | None:
     return minimum
 
 
+def unique_obligation(node: dict[str, Any]) -> bool:
+    """Whether `node`'s `uniqueItems` asks for anything.
+
+    `uniqueItems: false` is the keyword at its permissive setting, and a node
+    typed away from arrays never has items to compare. Read by the screen too,
+    so a keyword this layer would never fire on is not one the caller is
+    refused for.
+    """
+    if node.get("uniqueItems") is not True:
+        return False
+    declared = node.get("type")
+    if isinstance(declared, str):
+        return declared == "array"
+    if isinstance(declared, list):
+        return "array" in declared
+    return True
+
+
+def _canonical(value: Any) -> bytes | None:
+    """The one spelling of `value` this layer will accept, or None for a value
+    it will not take on.
+
+    Items are compared as bytes, so a value the backends do not all spell the
+    same way would have to be normalised as it is read. A container has key
+    order and whitespace to normalise; a non-ASCII string is `\\uXXXX` to one
+    backend and raw UTF-8 to another. Refusing beats vetoing the spelling the
+    backend actually chose, which would wall the array.
+    """
+    if not (value is None or isinstance(value, (bool, int, float, str))):
+        return None
+    plain = json.dumps(value)
+    if plain != json.dumps(value, ensure_ascii=False):
+        return None
+    return plain.encode()
+
+
+def _spellings(values: Any) -> set[bytes] | None:
+    """`values` as canonical bytes, or None if any of them has no single spelling."""
+    if not isinstance(values, list):
+        return None
+    out: set[bytes] = set()
+    for value in values:
+        spelling = _canonical(value)
+        if spelling is None:
+            return None
+        out.add(spelling)
+    return out
+
+
+def _value_domain(node: Any, root: Any, path: tuple[int, ...] = ()) -> set[bytes] | None:
+    """Every value `node` can take, or None if it does not bound them.
+
+    A superset is enough here -- the caller narrows it back down by validating
+    each candidate against the whole subschema -- so only the keywords that
+    *pin* a value are read: `const`, `enum`, and a `type` of nothing but
+    booleans and nulls. `allOf` and `$ref` intersect, `anyOf`/`oneOf` unions,
+    and a branch that bounds nothing leaves the whole position unbounded.
+    """
+    if node is False:
+        return set()
+    if not isinstance(node, dict):
+        return None
+
+    bounds: list[set[bytes]] = []
+
+    listed: set[bytes] | None = None
+    if "const" in node:
+        if (listed := _spellings([node["const"]])) is None:
+            return None
+    if "enum" in node:
+        if (enumerated := _spellings(node["enum"])) is None:
+            return None
+        listed = enumerated if listed is None else listed & enumerated
+    if listed is not None:
+        bounds.append(listed)
+
+    declared = node.get("type")
+    kinds = [declared] if isinstance(declared, str) else declared if isinstance(declared, list) else None
+    if kinds is not None and set(kinds) <= {"boolean", "null"}:
+        finite: set[bytes] = set()
+        if "boolean" in kinds:
+            finite |= {b"true", b"false"}
+        if "null" in kinds:
+            finite.add(b"null")
+        bounds.append(finite)
+
+    for sub in node.get("allOf") or ():
+        if (nested := _value_domain(sub, root, path)) is not None:
+            bounds.append(nested)
+
+    if "$ref" in node:
+        if id(node) in path:
+            raise _Unresolvable(node["$ref"])
+        target = _resolve_pointer(root, node["$ref"])
+        if (nested := _value_domain(target, root, path + (id(node),))) is not None:
+            bounds.append(nested)
+
+    for key in ("anyOf", "oneOf"):
+        branches = node.get(key)
+        if not isinstance(branches, list) or not branches:
+            continue
+        union: set[bytes] | None = set()
+        for branch in branches:
+            nested = _value_domain(branch, root, path)
+            if nested is None:
+                union = None
+                break
+            union |= nested
+        if union is not None:
+            bounds.append(union)
+
+    if not bounds:
+        return None
+    narrowed = set(bounds[0])
+    for extra in bounds[1:]:
+        narrowed &= extra
+    return narrowed
+
+
 def _walk(root: Any, navigable_only: bool) -> Iterator[dict[str, Any]]:
     """Every node that can apply to some instance, `$ref` followed.
 
@@ -298,6 +489,37 @@ def _walk(root: Any, navigable_only: bool) -> Iterator[dict[str, Any]]:
                 stack.extend(value.values())
 
 
+# Keys that give some positions of an array a schema of their own, so the items
+# no longer share one domain.
+_POSITIONAL_KEYS = frozenset({"prefixItems", "additionalItems", "unevaluatedItems"})
+
+
+def _domain_for(node: dict[str, Any], root: Any, validator: Any, analysis: SchemaAnalysis) -> _Domain | None:
+    """The values `node`'s items may take, or None with the reason recorded.
+
+    `_value_domain` only reads the keywords that pin a value, so what comes back
+    is a superset; it is narrowed to the exact domain by validating each
+    candidate against `items` whole, which is what makes the counts in
+    `_refuse_walls` trustworthy.
+    """
+    items = node.get("items")
+    try:
+        candidates = _value_domain(items, root)
+    except _Unresolvable:
+        candidates = None
+    if candidates is None or len(candidates) > _MAX_DOMAIN:
+        analysis.problems.append(
+            "uniqueItems is enforced by keeping each item on a path to a value the "
+            "array has not used yet, which needs those values in advance: give "
+            f"`items` an `enum` or a `const` of at most {_MAX_DOMAIN} ASCII scalars, "
+            "or drop the keyword and check the generated output instead"
+        )
+        return None
+
+    matcher = validator.evolve(schema=items)
+    return _Domain(tuple(sorted(value for value in candidates if matcher.is_valid(json.loads(value)))))
+
+
 def analyze(schema: Any) -> SchemaAnalysis:
     """What this layer can enforce in `schema`, and every reason it cannot.
 
@@ -308,15 +530,21 @@ def analyze(schema: Any) -> SchemaAnalysis:
     if not isinstance(schema, dict):
         return analysis
 
-    applicable = [node for node in _walk(schema, navigable_only=False) if contains_obligation(node) is not None]
-    if not applicable:
+    counted: list[dict[str, Any]] = []
+    distinct: list[dict[str, Any]] = []
+    for node in _walk(schema, navigable_only=False):
+        if contains_obligation(node) is not None:
+            counted.append(node)
+        if unique_obligation(node):
+            distinct.append(node)
+    if not counted and not distinct:
         return analysis
 
     live = {id(node): node for node in _walk(schema, navigable_only=True)}
 
     # Static refusals, in schema order so the message names the first problem a
     # caller would look for.
-    for node in applicable:
+    for node in counted:
         if "maxContains" in node:
             analysis.problems.append(
                 "maxContains cannot be enforced while decoding: refusing an item "
@@ -342,27 +570,55 @@ def analyze(schema: Any) -> SchemaAnalysis:
 
         analysis.obligations.add(id(node))
 
-    if not analysis.obligations:
+    validator: Any = None
+    for node in distinct:
+        if isinstance(node.get("items"), list) or not _POSITIONAL_KEYS.isdisjoint(node):
+            analysis.problems.append(
+                "uniqueItems cannot be enforced on an array whose positions have "
+                "their own schemas: there is no one set of values for the items to "
+                "be distinct within"
+            )
+            continue
+
+        if validator is None:
+            validator = jsonschema.validators.validator_for(schema)(schema)
+        domain = _domain_for(node, schema, validator, analysis)
+        if domain is None:
+            continue
+
+        if id(node) not in live:
+            analysis.problems.append(
+                "this `uniqueItems` sits where the decoder cannot follow it "
+                f"(reachable only through {' or '.join(_UNREACHABLE_KEYS)})"
+            )
+            continue
+
+        analysis.domains[id(node)] = domain
+
+    if not analysis:
         return analysis
 
     # The cursor set has to be buildable everywhere on the way down, or the
-    # runtime would navigate past an obligation without seeing it.
+    # runtime would navigate past an obligation without seeing it. What it
+    # builds is kept: which keywords land on one array together is the question
+    # the wall check below asks, and this is the walk that answers it.
+    conjunctions: list[_Alternative] = []
     try:
-        _expand(schema, schema)
+        conjunctions += _expand(schema, schema)
         for node in live.values():
             for key in _NAV_SINGLE:
                 if key in node:
-                    _expand(node[key], schema)
+                    conjunctions += _expand(node[key], schema)
             for key in _NAV_LIST:
                 value = node.get(key)
                 if isinstance(value, list):
                     for sub in value:
-                        _expand(sub, schema)
+                        conjunctions += _expand(sub, schema)
             for key in _NAV_MAP:
                 value = node.get(key)
                 if isinstance(value, dict):
                     for sub in value.values():
-                        _expand(sub, schema)
+                        conjunctions += _expand(sub, schema)
     except _Unresolvable as err:
         return _refuse_everything(
             analysis,
@@ -376,8 +632,67 @@ def analyze(schema: Any) -> SchemaAnalysis:
             f"({err.args[0]}) at one position, too many to track while decoding",
         )
 
+    if analysis.domains:
+        _refuse_walls(analysis, conjunctions, validator)
     _mark_relevant(schema, analysis)
     return analysis
+
+
+def _refuse_walls(analysis: SchemaAnalysis, conjunctions: list[_Alternative], validator: Any) -> None:
+    """Drop any `uniqueItems` whose array could be left with nothing legal to say.
+
+    This is where the two vetoes meet. One holds an array open until enough
+    items match `contains`; the other closes it when the domain runs out of
+    values. If the values run out first there is no token either of them
+    allows, so the pair is refused rather than decoded into a wall -- and so is
+    a `minItems` no domain is long enough to reach.
+
+    Asked per conjunction rather than per node because the keywords need not sit
+    on the same one: an `allOf` can put `uniqueItems` in one branch and
+    `contains` in another, and they still land on the same array.
+    """
+    doomed: set[int] = set()
+    for conjunction in conjunctions:
+        domains = [analysis.domains[id(node)] for node in conjunction if id(node) in analysis.domains]
+        if not domains:
+            continue
+        values = set(domains[0].values)
+        for extra in domains[1:]:
+            values &= set(extra.values)
+
+        floors = [
+            node["minItems"]
+            for node in conjunction
+            if isinstance(node.get("minItems"), int) and not isinstance(node["minItems"], bool)
+        ]
+        floor = max(floors, default=0)
+        problem: str | None = None
+        if floor > len(values):
+            problem = (
+                f"minItems asks for {floor} items, all distinct under uniqueItems, but "
+                f"`items` allows only {len(values)} values, so the array runs out before "
+                "it is long enough"
+            )
+        for node in conjunction:
+            if problem is not None:
+                break
+            minimum = contains_obligation(node)
+            if minimum is None or id(node) not in analysis.obligations:
+                continue
+            matcher = validator.evolve(schema=node["contains"])
+            matching = sum(1 for value in values if matcher.is_valid(json.loads(value)))
+            if minimum > matching:
+                problem = (
+                    f"minContains asks for {minimum} matching items, all distinct under "
+                    f"uniqueItems, but only {matching} of the values `items` allows match "
+                    "`contains` at all"
+                )
+        if problem is not None:
+            analysis.problems.append(problem)
+            doomed |= {id(node) for node in conjunction}
+
+    for node_id in doomed:
+        analysis.domains.pop(node_id, None)
 
 
 def _refuse_everything(analysis: SchemaAnalysis, reason: str) -> SchemaAnalysis:
@@ -389,6 +704,7 @@ def _refuse_everything(analysis: SchemaAnalysis, reason: str) -> SchemaAnalysis:
     """
     analysis.problems.append(reason)
     analysis.obligations.clear()
+    analysis.domains.clear()
     return analysis
 
 
@@ -425,7 +741,7 @@ def _mark_relevant(root: Any, analysis: SchemaAnalysis) -> None:
                 for sub in value.values():
                     link(node, sub)
 
-    pending = list(analysis.obligations)
+    pending = list(analysis.obligations | analysis.domains.keys())
     while pending:
         current = pending.pop()
         if current in analysis.relevant:
@@ -596,6 +912,81 @@ def _probe(state: int, kinds: tuple[bool, ...], data: bytes) -> tuple[tuple[int 
     return None
 
 
+# Where a token leaves an array whose items come from a `_Domain`. Coarser than
+# the lexer above, and it can be: the items are scalars, so nothing nests inside
+# one, and the trie already knows which bytes are inside a string and which have
+# ended it.
+_P_BETWEEN = 0  # a comma has committed to another item, or the array just opened
+_P_INSIDE = 1  # part of an item has been spelled
+_P_AFTER = 2  # an item finished: expecting a comma or the close
+_P_CLOSED = 3  # the array ended; the rest of the token is not this frame's business
+
+# Where a token leaves the array, and which values it finished on the way.
+_Landing = tuple[int, int, tuple[int, ...]]
+
+
+def _walk_unique(domain: _Domain, position: int, node: int, data: bytes) -> _Landing | None:
+    """Where `data` leaves an array sitting at `(position, node)`.
+
+    None if it steps off the domain. That is a veto rather than a shrug: every
+    legal item spells one of a known set of values, so a byte that leaves them
+    all is one the backend's own `enum` would have refused too, and treating it
+    as unreachable is what keeps the trie an exact account of where the array
+    can still go.
+
+    Independent of which values the array has already used, so a position is
+    walked once per vocabulary and the used set only filters what comes back.
+    """
+    finished: list[int] = []
+    for byte in data:
+        if position == _P_CLOSED:
+            break
+        if position == _P_INSIDE:
+            child = domain.children[node].get(byte)
+            if child is not None:
+                # Checked before the separators, so a comma or a bracket inside
+                # a string value stays inside it.
+                node = child
+                continue
+            value = domain.terminal[node]
+            if value is None:
+                return None
+            finished.append(value)
+            position, node = _P_AFTER, 0
+        if byte in _WS:
+            continue
+        if byte == _RBRACKET:
+            position = _P_CLOSED
+        elif position == _P_AFTER:
+            if byte != _COMMA:
+                return None
+            position = _P_BETWEEN
+        else:
+            child = domain.children[0].get(byte)
+            if child is None:
+                return None
+            position, node = _P_INSIDE, child
+    return position, node, tuple(finished)
+
+
+def _permits(domain: _Domain, landing: _Landing, used: set[int]) -> bool:
+    """Whether `landing` keeps every item distinct and leaves somewhere to go."""
+    position, node, finished = landing
+    seen = used
+    for value in finished:
+        if value in seen:
+            return False
+        seen = seen | {value}
+    if position == _P_INSIDE:
+        # Mid-item, so the array is committed to finishing this one.
+        return bool(domain.reachable[node] - seen)
+    if position == _P_BETWEEN:
+        # A comma committed to another item; without a value left for it the
+        # next step would have nothing legal at all.
+        return len(seen) < len(domain.values)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Per-vocabulary lookahead tables.
 # ---------------------------------------------------------------------------
@@ -604,23 +995,87 @@ def _probe(state: int, kinds: tuple[bool, ...], data: bytes) -> tuple[tuple[int 
 class _VocabProfile:
     """Everything about a tokenizer this layer needs, derived once.
 
-    Only tokens spelling a `]` can close an array, which keeps the lookahead
-    affordable: a few hundred candidates out of a vocabulary of a hundred
-    thousand, and the answer for each depends only on the lexer state and the
-    nesting offset.
+    Both lookaheads are affordable because both start from a handful of bytes
+    rather than from the vocabulary: only a token spelling a `]` can close an
+    array, and only a token starting on the domain's trie can continue an item.
+    A few hundred candidates out of a hundred thousand, and what each one does
+    depends on the position alone, so it is answered once and reused.
     """
 
     def __init__(self, token_bytes: list[bytes]):
         self.token_bytes = token_bytes
-        self.closers: tuple[int, ...] = tuple(
-            token_id for token_id, text in enumerate(self.token_bytes) if _RBRACKET in text
-        )
-        # A veto is only escapable if the model has another way to spell the
-        # same bytes. Without these, an over-broad veto becomes a dead end.
-        self.can_spell_singly = all(
-            any(text == bytes([byte]) for text in self.token_bytes) for byte in (_RBRACKET, _COMMA)
-        )
+        closers: list[int] = []
+        nothing: list[int] = []
+        buckets: list[list[int]] = [[] for _ in range(256)]
+        singles: set[int] = set()
+        for token_id, text in enumerate(token_bytes):
+            if not text:
+                nothing.append(token_id)
+                continue
+            buckets[text[0]].append(token_id)
+            if len(text) == 1:
+                singles.add(text[0])
+            if _RBRACKET in text:
+                closers.append(token_id)
+        self.closers = tuple(closers)
+        # Tokens by the byte they start with, which is how a `uniqueItems` array
+        # narrows a vocabulary of a hundred thousand down to the handful that
+        # could continue the item in hand.
+        self.by_first_byte = [tuple(bucket) for bucket in buckets]
+        # Tokens contributing no document text -- special tokens, and ids the
+        # tokenizer does not use. They move no array, so they are never vetoed.
+        self.spell_nothing = frozenset(nothing)
+        # The bytes the model can emit one at a time, which is what makes a veto
+        # a detour rather than a dead end.
+        self.singles = frozenset(singles)
         self._tables: dict[tuple[int, tuple[bool, ...]], tuple[tuple[_CloseKey, frozenset[int]], ...]] = {}
+        self._landings: dict[tuple[bytes, ...], dict[tuple[int, int], tuple[tuple[_Landing, frozenset[int]], ...]]] = {}
+        self._nothing_words: np.ndarray | None = None
+
+    def nothing_words(self, num_words: int) -> "np.ndarray":
+        """A bitmask of the tokens that spell nothing, the floor every
+        `uniqueItems` mask is built up from."""
+        if self._nothing_words is None or len(self._nothing_words) < num_words:
+            words = np.zeros(max(num_words, (len(self.token_bytes) + 31) // 32), dtype=np.uint32)
+            for token in self.spell_nothing:
+                words[token >> 5] |= np.uint32(1 << (token & 31))
+            self._nothing_words = words
+        return self._nothing_words[:num_words]
+
+    def landing_groups(
+        self, domain: _Domain, position: int, node: int
+    ) -> tuple[tuple[_Landing, frozenset[int]], ...]:
+        """The tokens that could continue an array sitting at `(position, node)`,
+        grouped by where they leave it.
+
+        Only tokens starting with a byte the array can legally take next are
+        walked; everything else is off the domain by its first byte, and the
+        caller masks it in one go rather than naming it token by token.
+        """
+        table = self._landings.setdefault(domain.values, {})
+        groups = table.get((position, node))
+        if groups is None:
+            collected: dict[_Landing, set[int]] = {}
+            for token_id in self._candidates(domain, position, node):
+                landing = _walk_unique(domain, position, node, self.token_bytes[token_id])
+                if landing is not None:
+                    collected.setdefault(landing, set()).add(token_id)
+            groups = tuple((landing, frozenset(ids)) for landing, ids in collected.items())
+            table[(position, node)] = groups
+        return groups
+
+    def _candidates(self, domain: _Domain, position: int, node: int) -> Iterator[int]:
+        first: set[int] = set(_WS)
+        if position == _P_INSIDE:
+            first |= domain.children[node].keys()
+            if domain.terminal[node] is not None:
+                first |= {_COMMA, _RBRACKET}
+        elif position == _P_BETWEEN:
+            first |= domain.children[0].keys() | {_RBRACKET}
+        else:
+            first |= {_COMMA, _RBRACKET}
+        for byte in first:
+            yield from self.by_first_byte[byte]
 
     def closing_groups(self, state: int, kinds: tuple[bool, ...]) -> tuple[tuple[_CloseKey, frozenset[int]], ...]:
         """The candidate tokens that close that array, grouped by what they do.
@@ -722,10 +1177,13 @@ class _Frame:
         "rules",
         "counts",
         "groups",
+        "domains",
+        "used",
+        "unique_groups",
         "_matched",
     )
 
-    def __init__(self, is_array: bool, alternatives: list[_Alternative], validator: Any):
+    def __init__(self, is_array: bool, alternatives: list[_Alternative], validator: Any, domains: dict[int, _Domain]):
         self.is_array = is_array
         # Alternatives that cannot describe this kind of container are dropped
         # here rather than at the veto: descending from one yields a cursor that
@@ -743,28 +1201,43 @@ class _Frame:
         self.rules: list[tuple[Any, int]] = []
         self.groups: list[tuple[int, ...]] = []
         self.counts: list[int] = []
+        # The same arrangement for `uniqueItems`, and read the other way round:
+        # a token is refused only when *every* alternative refuses it.
+        self.domains: list[_Domain] = []
+        self.unique_groups: list[tuple[int, ...]] = []
+        self.used: list[set[int]] = []
         # Which rules an item's bytes satisfy. A pure function of those bytes,
         # so it survives rollback; the lookahead asks about the same handful of
         # candidate endings on every token of the array.
         self._matched: dict[bytes, tuple[int, ...]] = {}
         if is_array:
-            self._build_rules(validator)
+            self._build_rules(validator, domains)
 
-    def _build_rules(self, validator: Any) -> None:
-        positions: dict[int, int] = {}
+    def _build_rules(self, validator: Any, domains: dict[int, _Domain]) -> None:
+        counted: dict[int, int] = {}
+        distinct: dict[int, int] = {}
         for conjunction in self.alternatives:
             group: list[int] = []
+            unique_group: list[int] = []
             for node in conjunction:
                 minimum = contains_obligation(node)
-                if minimum is None:
-                    continue
-                position = positions.get(id(node))
-                if position is None:
-                    position = positions[id(node)] = len(self.rules)
-                    self.rules.append((validator.evolve(schema=node["contains"]), minimum))
-                group.append(position)
+                if minimum is not None:
+                    position = counted.get(id(node))
+                    if position is None:
+                        position = counted[id(node)] = len(self.rules)
+                        self.rules.append((validator.evolve(schema=node["contains"]), minimum))
+                    group.append(position)
+                domain = domains.get(id(node))
+                if domain is not None:
+                    position = distinct.get(id(node))
+                    if position is None:
+                        position = distinct[id(node)] = len(self.domains)
+                        self.domains.append(domain)
+                    unique_group.append(position)
             self.groups.append(tuple(group))
+            self.unique_groups.append(tuple(unique_group))
         self.counts = [0] * len(self.rules)
+        self.used = [set() for _ in self.domains]
 
     def matched(self, raw: bytes) -> tuple[int, ...]:
         """Which of this array's obligations the item `raw` satisfies."""
@@ -785,10 +1258,15 @@ class _Frame:
 
     def record(self, raw: bytes) -> None:
         """Count a finished item against every obligation on this array."""
-        if not self.rules:
-            return
-        for position in self.matched(raw):
-            self.counts[position] += 1
+        if self.rules:
+            for position in self.matched(raw):
+                self.counts[position] += 1
+        for position, domain in enumerate(self.domains):
+            # The veto keeps items on the trie, so the bytes are canonical
+            # already; only the whitespace around them is not part of the value.
+            value = domain.index.get(raw.strip())
+            if value is not None:
+                self.used[position].add(value)
 
     def permits_close(self, extra: dict[int, int] | None = None) -> bool:
         if not self.groups:
@@ -799,11 +1277,29 @@ class _Frame:
         return False
 
     def snapshot(self) -> tuple[Any, ...]:
-        return (self.index, self.key, self.key_start, self.item_start, tuple(self.counts))
+        return (
+            self.index,
+            self.key,
+            self.key_start,
+            self.item_start,
+            tuple(self.counts),
+            tuple(frozenset(seen) for seen in self.used),
+        )
 
     def restore(self, state: tuple[Any, ...]) -> None:
-        self.index, self.key, self.key_start, self.item_start, counts = state
+        self.index, self.key, self.key_start, self.item_start, counts, used = state
         self.counts = list(counts)
+        self.used = [set(seen) for seen in used]
+
+
+@dataclass(frozen=True)
+class _Vetoes:
+    """What one step takes away: groups the token may not come from, and groups
+    it must come from. `key` identifies the pair by content, for the mask cache."""
+
+    key: tuple[Any, ...]
+    refused: tuple[frozenset[int], ...]
+    confined: tuple[frozenset[int], ...]
 
 
 class _Document:
@@ -813,6 +1309,7 @@ class _Document:
     def __init__(self, schema: Any, analysis: SchemaAnalysis, validator: Any):
         self.schema = schema
         self.relevant = analysis.relevant
+        self.domains = analysis.domains
         self.validator = validator
         self.buf = bytearray()
         self.state = _S_VALUE
@@ -882,11 +1379,11 @@ class _Document:
         elif event == _E_VALUE_END_INCL:
             self._end_item(frame, index + 1)
         elif event == _E_PUSH_ARRAY:
-            pushed = _Frame(True, self.pending, self.validator)
+            pushed = _Frame(True, self.pending, self.validator, self.domains)
             self.stack.append(pushed)
             self.pending = self._descend(pushed.alternatives, lambda node: _item_schemas(node, 0))
         elif event == _E_PUSH_OBJECT:
-            self.stack.append(_Frame(False, self.pending, self.validator))
+            self.stack.append(_Frame(False, self.pending, self.validator, self.domains))
         elif event == _E_POP:
             if self.stack:
                 self.stack.pop()
@@ -916,28 +1413,96 @@ class _Document:
 
     # -- the veto ----------------------------------------------------------
 
-    def vetoed_tokens(self, profile: _VocabProfile) -> list[frozenset[int]] | None:
-        """Token groups that would close an array still short of its `minContains`.
+    def vetoed_tokens(self, profile: _VocabProfile) -> _Vetoes | None:
+        """What this step takes away, or None if it takes nothing.
 
-        Left as groups rather than merged: callers only test membership or build
-        a mask keyed on group identity, and merging would rebuild a
-        several-hundred-element set on every token.
+        Two shapes, because the two keywords rule out opposite amounts of the
+        vocabulary. `minContains` forbids a few hundred tokens spelling a `]`
+        and leaves the rest alone; `uniqueItems` allows only the tokens still on
+        the domain's trie and rules out everything else, which is far too many
+        to name. Both are left as groups: callers test membership or build a
+        mask, and merging would rebuild the sets on every token.
         """
+        refused = self._closes_too_early(profile)
+        confined, keys = self._confined_to_domain(profile)
+        if not refused and not confined:
+            return None
+        return _Vetoes(
+            key=(tuple(sorted(id(group) for group in refused)), keys),
+            refused=refused,
+            confined=confined,
+        )
+
+    def _closes_too_early(self, profile: _VocabProfile) -> tuple[frozenset[int], ...]:
+        """Tokens that would close an array still short of its `minContains`."""
         blocked = [
             (tuple(not f.is_array for f in self.stack[position:]), frame)
             for position, frame in enumerate(self.stack)
             if frame.is_array and frame.rules and not frame.permits_close()
         ]
-        if not blocked:
-            return None
-
         vetoed: list[frozenset[int]] = []
         for kinds, frame in blocked:
             for key, tokens in profile.closing_groups(self.state, kinds):
                 items = self._materialise(frame, key)
                 if not frame.permits_close(self._increments(frame, items)):
                     vetoed.append(tokens)
-        return vetoed or None
+        return tuple(vetoed)
+
+    def _confined_to_domain(
+        self, profile: _VocabProfile
+    ) -> tuple[tuple[frozenset[int], ...], tuple[Any, ...]]:
+        """The tokens that keep the innermost array's items distinct.
+
+        Only the innermost frame, and only when it is the array under the
+        keyword: an enforceable domain holds scalars, so nothing is open inside
+        one of its items and there is no deeper array to be in the middle of.
+
+        The second half of the return is a content key for the mask cache. The
+        sets are rebuilt each step, so their identity says nothing.
+        """
+        frame = self.stack[-1] if self.stack else None
+        if frame is None or not frame.domains:
+            return (), ()
+
+        allowed: set[int] = set()
+        keys: list[Any] = []
+        for group in frame.unique_groups:
+            if not group:
+                # An alternative with nothing to say about uniqueness. The
+                # document can still come out valid under it, so nothing goes.
+                return (), ()
+            within: set[int] | None = None
+            for position in group:
+                permitted = self._on_domain(frame, position, profile, keys)
+                if permitted is None:
+                    return (), ()
+                within = permitted if within is None else within & permitted
+            allowed |= within or set()
+        return (frozenset(allowed),), tuple(keys)
+
+    def _on_domain(
+        self, frame: _Frame, position: int, profile: _VocabProfile, keys: list[Any]
+    ) -> set[int] | None:
+        """The tokens that leave this array still able to finish, under one
+        domain. None if the document has left that domain, where saying nothing
+        beats guessing."""
+        domain = frame.domains[position]
+        used = frame.used[position]
+        if frame.item_start is None:
+            where, node = (_P_BETWEEN if self.state == _S_VALUE else _P_AFTER), 0
+        else:
+            where = _P_INSIDE
+            located = domain.locate(bytes(self.buf[frame.item_start :]))
+            if located is None:
+                return None
+            node = located
+        keys.append((id(domain), where, node, frozenset(used)))
+        return {
+            token
+            for landing, tokens in profile.landing_groups(domain, where, node)
+            if _permits(domain, landing, used)
+            for token in tokens
+        }
 
     def _materialise(self, frame: _Frame, key: _CloseKey) -> list[bytes]:
         items: list[bytes] = []
@@ -1013,9 +1578,9 @@ class PostconditionGrammar(StructuredOutputGrammar):
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
         for token in tokens:
             vetoed = self._document.vetoed_tokens(self.profile)
-            if _is_vetoed(vetoed, token):
+            if _is_vetoed(vetoed, token, self.profile):
                 logger.debug(
-                    "Request %s: token %d would close an array short of its minContains.",
+                    "Request %s: token %d would break a postcondition on an open array.",
                     request_id,
                     token,
                 )
@@ -1035,7 +1600,7 @@ class PostconditionGrammar(StructuredOutputGrammar):
         try:
             for position, token in enumerate(accepted):
                 vetoed = self._document.vetoed_tokens(self.profile)
-                if _is_vetoed(vetoed, token):
+                if _is_vetoed(vetoed, token, self.profile):
                     return accepted[:position]
                 self._advance(token)
                 probed += 1
@@ -1110,27 +1675,35 @@ class PostconditionGrammar(StructuredOutputGrammar):
         if text:
             self._document.feed(text)
 
-    def _mask_for(self, vetoed: list[frozenset[int]]) -> "torch.Tensor":
-        # Keyed on group identity, which the vocabulary profile keeps alive for
-        # the life of the process. Hashing the token ids would mean re-reading
-        # several hundred of them per token.
-        key = tuple(sorted(id(group) for group in vetoed))
-        mask = self._masks.get(key)
+    def _mask_for(self, vetoes: _Vetoes) -> "torch.Tensor":
+        mask = self._masks.get(vetoes.key)
         if mask is None:
             words = np.full(self.num_words, 0xFFFFFFFF, dtype=np.uint32)
-            for group in vetoed:
+            for group in vetoes.refused:
                 for token in group:
                     if token < self.vocab_size:
                         words[token >> 5] &= np.uint32(0xFFFFFFFF ^ (1 << (token & 31)))
+            for group in vetoes.confined:
+                # Built up from the tokens that spell nothing, which move no
+                # array and so are never the ones confined.
+                permitted = self.profile.nothing_words(self.num_words).copy()
+                for token in group:
+                    if token < self.vocab_size:
+                        permitted[token >> 5] |= np.uint32(1 << (token & 31))
+                words &= permitted
             mask = torch.from_numpy(words.view(np.int32))
             if len(self._masks) > 16:
                 self._masks.clear()
-            self._masks[key] = mask
+            self._masks[vetoes.key] = mask
         return mask
 
 
-def _is_vetoed(vetoed: list[frozenset[int]] | None, token: int) -> bool:
-    return vetoed is not None and any(token in group for group in vetoed)
+def _is_vetoed(vetoes: _Vetoes | None, token: int, profile: _VocabProfile) -> bool:
+    if vetoes is None:
+        return False
+    if any(token in group for group in vetoes.refused):
+        return True
+    return token not in profile.spell_nothing and any(token not in group for group in vetoes.confined)
 
 
 def maybe_wrap(
@@ -1159,7 +1732,7 @@ def maybe_wrap(
         return grammar
 
     analysis = analyze(schema)
-    if not analysis.obligations:
+    if not analysis:
         return grammar
     if analysis.problems:
         # The screen should have refused this. Enforcing half of it is worse
@@ -1172,11 +1745,18 @@ def maybe_wrap(
         return grammar
 
     profile = _vocab_profile(tokenizer, vocab_size)
-    if not profile.can_spell_singly:
+    # Every veto here assumes the model can spell its way around one, byte by
+    # byte if it has to: the detour past a refused `]` is a `,`, and the detour
+    # past an item that would repeat is the next byte of one that would not.
+    needed = {_RBRACKET, _COMMA}.union(
+        byte for domain in analysis.domains.values() for value in domain.values for byte in value
+    )
+    if not needed <= profile.singles:
         logger.warning_once(
-            "This tokenizer has no single-byte tokens for `]` or `,`, so the "
-            "contains/minContains layer could refuse a token the model has no "
-            "other way to spell. Leaving those keywords unenforced."
+            "This tokenizer cannot spell every byte these keywords may have to "
+            "steer around one at a time, so a veto could refuse a token the model "
+            "has no other way to say. Leaving contains/minContains/uniqueItems "
+            "unenforced."
         )
         return grammar
 
