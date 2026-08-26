@@ -35,8 +35,11 @@ from aphrodite.tokenizers import TokenizerLike
 from aphrodite.tool_parsers.abstract_tool_parser import (
     Tool,
     ToolParser,
-    reject_reply_schema_conflict,
+    reject_reply_schema_without_tool_grammar,
+    reject_unmergeable_reply_schema,
+    reply_schema_for_tool_grammar,
 )
+from aphrodite.tool_parsers.structural_tag_registry import merge_reply_schema
 from aphrodite.tool_parsers.streaming import (
     extract_named_tool_call_streaming,
     extract_required_tool_call_streaming,
@@ -526,7 +529,11 @@ class DelegatingParser(Parser):
     def _apply_structural_tag(
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
-        if self._tool_parser is None or self._tool_parser.structural_tag_model is None or not request.tools:
+        if self._tool_parser is None or not request.tools:
+            return request
+
+        structured_outputs = getattr(request, "structured_outputs", None)
+        if structured_outputs is not None and structured_outputs.structural_tag is not None:
             return request
 
         need_tool_calling = (
@@ -544,12 +551,21 @@ class DelegatingParser(Parser):
             request,
             reasoning=self._grammar_needs_reasoning(),
         )
+
+        # Tool calls and response formatting can sometimes coexist.
+        ignore_reply_schema = request.tool_choice != "auto" or self._tool_parser.merges_reply_schema
+        reply_schema = None if ignore_reply_schema else reply_schema_for_tool_grammar(request)
+
         if structure_tag is None:
+            if reply_schema is not None:
+                reject_reply_schema_without_tool_grammar(request)
             return request
 
-        # The tool structural tag is about to take the grammar. Refuse rather
-        # than quietly outrank a reply schema the caller asked for.
-        reject_reply_schema_conflict(request)
+        if reply_schema is not None:
+            merged = merge_reply_schema(structure_tag, reply_schema)
+            if merged is None:
+                reject_unmergeable_reply_schema(request)
+            structure_tag = merged
 
         structural_tag = json.dumps(structure_tag.model_dump())
         request.structured_outputs = StructuredOutputsParams(  # type: ignore[call-arg]

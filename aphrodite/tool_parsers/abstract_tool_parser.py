@@ -6,7 +6,7 @@ import json
 import os
 from collections.abc import Callable, Sequence
 from functools import cached_property
-from typing import Any
+from typing import Any, NoReturn
 
 from openai.types.responses import (
     ResponseFormatTextJSONSchemaConfig,
@@ -14,7 +14,6 @@ from openai.types.responses import (
 )
 from openai.types.responses.function_tool import FunctionTool
 
-import aphrodite.envs as envs
 from aphrodite.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionToolsParam,
@@ -40,35 +39,84 @@ __all__ = ["Tool"]
 
 logger = init_logger(__name__)
 
-# `response_format: {"type": "text"}` is the API default and constrains nothing,
-# so it is not in conflict with anything.
-_CONSTRAINING_RESPONSE_FORMATS = frozenset({"json_object", "json_schema", "structural_tag"})
 
+def reply_schema_for_tool_grammar(
+    request: ChatCompletionRequest | ResponsesRequest,
+) -> dict[str, Any] | bool | None:
+    """The reply constraint the caller asked for, as a schema the tool grammar
+    can carry alongside its tool calls. None when the caller asked for none.
 
-def reject_reply_schema_conflict(request: ChatCompletionRequest | ResponsesRequest) -> None:
-    """Refuse a request whose reply schema and tool schema both want the decoder.
+    Only a JSON schema is carried. The tool tag holds the reply in a slot shaped
+    like a schema, and a regex, a choice list or a caller's own structural tag
+    has nothing to sit in it.
     """
     if isinstance(request, ResponsesRequest):
-        conflict = getattr(request.text, "format", None) is not None
+        reply_format = getattr(request.text, "format", None)
         parameter = "text.format"
     else:
-        response_format = request.response_format
-        conflict = (
-            response_format is not None and getattr(response_format, "type", None) in _CONSTRAINING_RESPONSE_FORMATS
-        )
+        reply_format = request.response_format
         parameter = "response_format"
 
-    if not conflict and getattr(request, "structured_outputs", None) is not None:
-        conflict = True
-        parameter = "structured_outputs"
+    schema: dict[str, Any] | bool | None = None
+    kind = getattr(reply_format, "type", None)
+    if kind == "json_schema":
+        schema = _reply_json_schema(reply_format)
+    elif kind == "json_object":
+        schema = True
+    elif kind == "structural_tag":
+        raise _reply_schema_refused(parameter, "a structural tag of its own")
 
-    if not conflict:
-        return
+    structured_outputs = getattr(request, "structured_outputs", None)
+    if structured_outputs is not None:
+        for name in ("regex", "choice", "grammar", "structural_tag"):
+            if getattr(structured_outputs, name, None) is not None:
+                raise _reply_schema_refused("structured_outputs", f"`{name}`")
+        if structured_outputs.json is not None:
+            schema = structured_outputs.json
+        elif structured_outputs.json_object:
+            schema = True
 
+    return schema
+
+
+def _reply_json_schema(reply_format: Any) -> dict[str, Any] | None:
+    """The schema body out of either API's spelling of a json_schema format."""
+    # Responses states it inline; Chat Completions nests it one deeper.
+    if (schema := getattr(reply_format, "schema_", None)) is not None:
+        return schema
+    return getattr(getattr(reply_format, "json_schema", None), "json_schema", None)
+
+
+def _reply_schema_refused(parameter: str, what: str) -> AphroditeValidationError:
+    return AphroditeValidationError(
+        f"`{parameter}` asking for {what} cannot be combined with tool calling.",
+        parameter=parameter,
+    )
+
+
+def reject_unmergeable_reply_schema(
+    request: ChatCompletionRequest | ResponsesRequest,
+) -> NoReturn:
+    """Refuse a reply schema the tool grammar for this model cannot carry."""
+    parameter = "text.format" if isinstance(request, ResponsesRequest) else "response_format"
     raise AphroditeValidationError(
-        f"`{parameter}` cannot be combined with tool calling: both constrain the same "
-        "decoder, and the tool schema takes the grammar. Send them as separate "
-        "requests, or set tool_choice='none' if the reply schema is what you want.",
+        f"`{parameter}` cannot be combined with tool calling for this model.",
+        parameter=parameter,
+    )
+
+
+def reject_reply_schema_without_tool_grammar(
+    request: ChatCompletionRequest | ResponsesRequest,
+) -> NoReturn:
+    """Refuse a reply schema for a request whose tool calls get no grammar.
+
+    Without one the reply schema is the only grammar there is, and it spans the
+    whole reply -- so the model cannot spell a tool call at all, and the tools
+    are silently gone.
+    """
+    parameter = "text.format" if isinstance(request, ResponsesRequest) else "response_format"
+    raise AphroditeValidationError(
+        f"`{parameter}` cannot be combined with tool calling for this model.",
         parameter=parameter,
     )
 
@@ -93,11 +141,14 @@ class ToolParser:
     # xgrammar builtin structural tag model key. Subclasses set this when
     # their parsed tool-call syntax matches a builtin xgrammar format.
     structural_tag_model: str | None = None
+    # If True, `adjust_request` reads the reply constraints off the request
+    # and builds its own grammar to handle it alongside tool-calling.
+    merges_reply_schema: bool = False
     engine_based_streaming: bool = False
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
-        if cls.structural_tag_model is not None and envs.APHRODITE_ENFORCE_STRICT_TOOL_CALLING:
+        if cls.structural_tag_model is not None:
             cls.supports_required_and_named = False
 
     def __init__(
@@ -158,9 +209,9 @@ class ToolParser:
         json_schema_from_tool = get_json_schema_from_tools(tool_choice=request.tool_choice, tools=request.tools)
         # Set structured output params for tool calling
         if json_schema_from_tool is not None:
-            # The tool schema is about to take the grammar. Refuse rather than
-            # quietly outrank a reply schema the caller asked for.
-            reject_reply_schema_conflict(request)
+            # Reaching here means the tool call is forced, so the reply is a
+            # tool call and nothing else. A reply constraint has no reply left
+            # to constrain and is dropped rather than reported.
             if isinstance(request, ChatCompletionRequest):
                 # tool_choice: "Forced Function" or "required" will override
                 # structured output json settings to make tool calling work correctly
@@ -184,6 +235,7 @@ class ToolParser:
                         strict=True,
                     )
                 )
+                request.structured_outputs = None
 
         return request
 
@@ -194,8 +246,6 @@ class ToolParser:
         reasoning: bool = False,
     ):
         if self.structural_tag_model is None:
-            return None
-        if not envs.APHRODITE_ENFORCE_STRICT_TOOL_CALLING:
             return None
         from aphrodite.tool_parsers.structural_tag_registry import get_model_structural_tag
 

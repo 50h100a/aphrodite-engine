@@ -20,12 +20,14 @@ from xgrammar.structural_tag import (
     AnyTextFormat,
     ConstStringFormat,
     JSONSchemaFormat,
+    OrFormat,
     SequenceFormat,
     TagFormat,
     TagsWithSeparatorFormat,
     TriggeredTagsFormat,
 )
 
+from aphrodite import envs
 from aphrodite.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionToolsParam,
@@ -123,6 +125,59 @@ def get_model_structural_tag(
     )
 
 
+# A reply and a tool call can share one grammar only when they are immediately distinguishable.
+_JSON_OPENERS = frozenset('{["-0123456789tfn')
+
+# Harmony spells the reply out as a channel of its own, so the schema goes
+# inside that tag rather than beside it.
+_HARMONY_REPLY_CHANNEL = "<|channel|>final"
+
+
+def merge_reply_schema(tag: StructuralTag, schema: dict[str, Any] | bool) -> StructuralTag | None:
+    """Constrain the reply text of ``tag`` to ``schema``, leaving its tool calls
+    alone. None when the tag has no reply region a schema could take over."""
+
+    merged = _constrain_reply(copy.deepcopy(tag.format), JSONSchemaFormat(json_schema=schema))
+    return StructuralTag(format=merged) if merged is not None else None
+
+
+def _constrain_reply(fmt: Any, reply: JSONSchemaFormat) -> Any | None:
+    if isinstance(fmt, SequenceFormat):
+        # A reasoning prefix runs ahead of the reply; only the tail is the reply.
+        tail = _constrain_reply(fmt.elements[-1], reply)
+        if tail is None:
+            return None
+        fmt.elements[-1] = tail
+        return fmt
+
+    if isinstance(fmt, TagsWithSeparatorFormat):
+        replaced = False
+        for tag in fmt.tags:
+            if (
+                isinstance(tag.begin, str)
+                and _HARMONY_REPLY_CHANNEL in tag.begin
+                and isinstance(tag.content, AnyTextFormat)
+            ):
+                tag.content = reply
+                replaced = True
+        return fmt if replaced else None
+
+    if isinstance(fmt, TriggeredTagsFormat):
+        if any(trigger[:1] in _JSON_OPENERS for trigger in fmt.triggers):
+            return None
+        return OrFormat(
+            elements=[
+                reply,
+                TagsWithSeparatorFormat(tags=fmt.tags, separator="", at_least_one=True),
+            ]
+        )
+
+    if isinstance(fmt, AnyTextFormat):
+        return reply
+
+    return None
+
+
 def _open_freeform_objects(schema: Any) -> Any:
     """Bare object nodes must have `additionalProperties: true`, otherwise
     the guidance mistakenly forces them to be an empty `{}`.
@@ -143,21 +198,25 @@ def _dump_tool_for_xgrammar(
 ) -> dict[str, Any]:
     """Convert tool objects to xgrammar's Chat Completions tool protocol."""
 
+    default_strict = envs.APHRODITE_ENFORCE_STRICT_TOOL_CALLING
+
     if isinstance(tool, FunctionTool):
         function: dict[str, Any] = {"name": tool.name}
         if tool.description is not None:
             function["description"] = tool.description
         if tool.parameters is not None:
             function["parameters"] = _open_freeform_objects(tool.parameters)
-        if tool.strict is not None:
-            function["strict"] = tool.strict
+        function["strict"] = tool.strict if tool.strict is not None else default_strict
         return {"type": "function", "function": function}
     dumped_tool = tool.model_dump(mode="json", exclude_none=True)
     if not isinstance(tool, ChatCompletionToolsParam):
         dumped_tool = dict(dumped_tool)
     dumped_function = dumped_tool.get("function")
-    if isinstance(dumped_function, dict) and dumped_function.get("parameters") is not None:
-        dumped_function["parameters"] = _open_freeform_objects(dumped_function["parameters"])
+    if isinstance(dumped_function, dict):
+        if dumped_function.get("parameters") is not None:
+            dumped_function["parameters"] = _open_freeform_objects(dumped_function["parameters"])
+        # `exclude_none` dropped an unstated `strict`, so this only fills a gap.
+        dumped_function.setdefault("strict", default_strict)
     return dumped_tool
 
 

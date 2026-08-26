@@ -26,7 +26,6 @@ from aphrodite.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionToolsParam,
 )
-from aphrodite.exceptions import AphroditeValidationError
 from aphrodite.parser.parser_manager import ParserManager
 
 pytestmark = pytest.mark.cpu_test
@@ -192,17 +191,15 @@ def test_auto_tolerates_a_non_constraining_reply_format(
         },
     ],
 )
-def test_auto_refuses_a_competing_reply_schema(
+def test_auto_folds_a_reply_schema_into_the_tag(
     tools: list[ChatCompletionToolsParam],
     response_format: dict,
 ):
-    """Now that "auto" takes the grammar, it can collide with a reply schema.
+    """Now that "auto" takes the grammar, it has to carry the reply schema too.
 
-    Deliberate, and the policy `required` and named tool choice already follow:
-    both constrain one decoder, so the request is refused rather than one of
-    them silently winning. This is the visible consequence of tagging "auto" --
-    it used to pass by quietly dropping the tool constraint, which is the very
-    bug this file exists for.
+    A tool call and a reply are spelled differently, so the tag keeps its tool
+    branches and states the reply beside them. What must not happen is the
+    original bug of this file in reverse: one of the two silently winning.
     """
     request = ChatCompletionRequest(
         messages=[],
@@ -211,6 +208,11 @@ def test_auto_refuses_a_competing_reply_schema(
         tool_choice="auto",
         response_format=response_format,  # type: ignore[arg-type]
     )
+    _parser(tools, {}).adjust_request(request)
 
-    with pytest.raises(AphroditeValidationError, match="cannot be combined with tool calling"):
-        _parser(tools, {}).adjust_request(request)
+    assert request.structured_outputs is not None
+    assert request.structured_outputs.structural_tag is not None
+    tag = json.loads(request.structured_outputs.structural_tag)
+    reply, calls = tag["format"]["elements"]
+    assert reply["type"] == "json_schema"
+    assert f'invoke name=\\"{tools[0].function.name}\\"' in json.dumps(calls)

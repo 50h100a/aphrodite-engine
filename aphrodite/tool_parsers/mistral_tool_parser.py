@@ -106,6 +106,9 @@ class MistralToolParser(ToolParser):
 
     # Used to generate correct grammar in `adjust_request`
     model_can_reason: bool = False
+    # mistral-common builds one Lark grammar from the tools and the reply
+    # schema together, so both hold without a structural tag.
+    merges_reply_schema = True
 
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)

@@ -1480,7 +1480,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "APHRODITE_TOOL_PARSE_REGEX_TIMEOUT_SECONDS": lambda: int(
         os.getenv("APHRODITE_TOOL_PARSE_REGEX_TIMEOUT_SECONDS", "1")
     ),
-    # Enforce function parameter schemas in structural-tag based tool calling.
+    # This is sets 'strict=true' for tool definitions that do not have an explicit 'strict'.
     "APHRODITE_ENFORCE_STRICT_TOOL_CALLING": lambda: (
         os.getenv("APHRODITE_ENFORCE_STRICT_TOOL_CALLING", "True").lower() in ("true", "1")
     ),
