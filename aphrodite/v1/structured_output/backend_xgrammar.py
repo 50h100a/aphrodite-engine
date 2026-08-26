@@ -37,15 +37,28 @@ class XgrammarBackend(StructuredOutputBackend):
     def __post_init__(self):
         self.disable_any_whitespace = self.aphrodite_config.structured_outputs_config.disable_any_whitespace
 
+        self._engine_stop_ids: list[int] | None = None
+        self.compiler = self._build_compiler(None)
+        # Keyed by the stop token ids handed to xgrammar. Only populated for
+        # tags that need the default stop token as a grammar terminal, so most
+        # deployments never build a second one. See _compiler_for_structural_tag.
+        self._tag_compilers: dict[frozenset[int], xgr.GrammarCompiler] = {}
+
+        self.num_speculative_tokens = 0
+        if self.aphrodite_config.speculative_config is not None:
+            self.num_speculative_tokens = self.aphrodite_config.speculative_config.num_speculative_tokens
+
+    def _build_tokenizer_info(self, stop_token_ids: list[int] | None):
         if is_mistral_tokenizer(self.tokenizer):
             # NOTE: ideally, xgrammar should handle this accordingly.
             # refer to https://github.com/mlc-ai/xgrammar/blob/d77c0a0173ef14779c918e3be7966ba852f7910f/python/xgrammar/tokenizer_info.py#L98
-            stop_token_ids = [self.tokenizer.eos_token_id]
+            if stop_token_ids is None:
+                stop_token_ids = [self.tokenizer.eos_token_id]
 
             # not self.tokenizer.vocab_size as self.tokenizer.vocab
             # collapses all decoded errors into a single token.
             self.vocab_size = len(self.tokenizer.vocab)
-            tokenizer_info = xgr.TokenizerInfo(  # type: ignore
+            return xgr.TokenizerInfo(  # type: ignore
                 encoded_vocab=self.tokenizer.vocab,
                 # NOTE: https://github.com/mlc-ai/xgrammar/blob/5e141f6ff1ca02bc31f9e512e68b61f2a8ae88e5/tests/python/test_tokenizer_info.py#L43 # noqa: E501
                 vocab_type=xgr.VocabType.RAW if self.tokenizer.is_tekken else xgr.VocabType.BYTE_FALLBACK,
@@ -53,21 +66,113 @@ class XgrammarBackend(StructuredOutputBackend):
                 stop_token_ids=stop_token_ids,
                 add_prefix_space=True,
             )
-        else:
-            tokenizer_info = xgr.TokenizerInfo.from_huggingface(
-                self.tokenizer,
-                vocab_size=self.vocab_size,
-            )
-        self.compiler = xgr.GrammarCompiler(
-            tokenizer_info,
+        # `stop_token_ids=None` is what xgrammar defaults to, so this stays the
+        # behaviour it has always had unless a caller asks for something else.
+        return xgr.TokenizerInfo.from_huggingface(
+            self.tokenizer,
+            vocab_size=self.vocab_size,
+            stop_token_ids=stop_token_ids,
+        )
+
+    def _build_compiler(self, stop_token_ids: list[int] | None) -> xgr.GrammarCompiler:
+        return xgr.GrammarCompiler(
+            self._build_tokenizer_info(stop_token_ids),
             max_threads=8,
             cache_enabled=True,
             cache_limit_bytes=aphrodite.envs.APHRODITE_XGRAMMAR_CACHE_MB * 1024 * 1024,
         )
 
-        self.num_speculative_tokens = 0
-        if self.aphrodite_config.speculative_config is not None:
-            self.num_speculative_tokens = self.aphrodite_config.speculative_config.num_speculative_tokens
+    def _engine_stop_token_ids(self) -> list[int]:
+        """The token ids the engine itself will stop on, primary EOS first.
+
+        Mirrors what `SamplingParams.update_from_generation_config` assembles:
+        the tokenizer's EOS, plus every id in the model's
+        `generation_config.json`. gpt-oss contributes `<|return|>`,
+        `<|endoftext|>` and `<|call|>` here.
+        """
+        if self._engine_stop_ids is not None:
+            return self._engine_stop_ids
+
+        stop_ids: list[int] = []
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        if eos_token_id is not None:
+            stop_ids.append(eos_token_id)
+
+        try:
+            generation_config = self.aphrodite_config.model_config.try_get_generation_config()
+        except Exception:
+            # Resolved lazily, on the first tag that needs it. A model whose
+            # generation config cannot be read is not a reason to fail the
+            # request -- the tokenizer's EOS alone is what we had before.
+            logger.warning("Could not read the generation config; falling back to the tokenizer's EOS.")
+            generation_config = {}
+
+        configured = generation_config.get("eos_token_id")
+        if isinstance(configured, int):
+            configured = [configured]
+        for token_id in configured or ():
+            if token_id not in stop_ids:
+                stop_ids.append(token_id)
+
+        self._engine_stop_ids = stop_ids
+        return stop_ids
+
+    def _token_text(self, token_id: int) -> str | None:
+        convert = getattr(self.tokenizer, "convert_ids_to_tokens", None)
+        if convert is not None:
+            return convert(token_id)
+        return None
+
+    def _compiler_for_structural_tag(self, grammar_spec: str) -> xgr.GrammarCompiler:
+        """Pick a compiler whose stop tokens the tag does not need to emit.
+
+        xgrammar reserves its stop tokens: they are unmasked only once the
+        grammar is in an accepting state, and can never be produced as a
+        terminal *inside* a rule. That is fine for a schema, which ends by
+        running out of grammar, but not for a tag whose own terminator is the
+        model's EOS -- the harmony tag closes a `final` message with
+        `<|return|>`, which is exactly gpt-oss's EOS. Compiled against the
+        default tokenizer info, that tag can never be closed: the model sits in
+        the message with its intended next token masked and runs to max_tokens.
+
+        So when the tag's text contains the default stop token, compile it
+        against the remaining engine stop ids instead (for harmony, that leaves
+        `<|endoftext|>`). Every other grammar type keeps the default compiler,
+        which it must: a completed JSON schema leaves the real EOS as the only
+        legal token, and substituting it there would reintroduce the same hang.
+        """
+        stop_ids = self._engine_stop_token_ids()
+        if not stop_ids:
+            return self.compiler
+
+        usable = [
+            token_id
+            for token_id in stop_ids
+            if (text := self._token_text(token_id)) is None or text not in grammar_spec
+        ]
+        # The default stop token is not something this tag has to emit, so the
+        # compiler everything else uses is already correct for it.
+        if stop_ids[0] in usable:
+            return self.compiler
+        if not usable:
+            logger.warning(
+                "Structural tag uses every engine stop token (%s) as a grammar terminal, so none "
+                "can be reserved for xgrammar. The tag may be unable to terminate.",
+                stop_ids,
+            )
+            return self.compiler
+
+        key = frozenset(usable)
+        compiler = self._tag_compilers.get(key)
+        if compiler is None:
+            logger.info(
+                "Structural tag needs stop token %s as a grammar terminal; compiling it against "
+                "stop token ids %s so it can be emitted.",
+                stop_ids[0],
+                usable,
+            )
+            compiler = self._tag_compilers[key] = self._build_compiler(sorted(usable))
+        return compiler
 
     def compile_grammar(self, request_type: StructuredOutputOptions, grammar_spec: str) -> StructuredOutputGrammar:
         if request_type == StructuredOutputOptions.JSON:
@@ -84,6 +189,9 @@ class XgrammarBackend(StructuredOutputBackend):
                 grammar_spec,
             )
         elif request_type == StructuredOutputOptions.STRUCTURAL_TAG:
+            # A tag can name the model's EOS as one of its own terminators, and
+            # xgrammar will not hand back a token it has reserved for stopping.
+            compiler = self._compiler_for_structural_tag(grammar_spec)
             s_tag = json.loads(grammar_spec)
             if "structures" in s_tag:
                 # Falling back to deprecated method of compiling structural tag
@@ -95,9 +203,9 @@ class XgrammarBackend(StructuredOutputBackend):
                     )
                     for s in s_tag["structures"]
                 ]
-                ctx = self.compiler.compile_structural_tag(tags, s_tag["triggers"])
+                ctx = compiler.compile_structural_tag(tags, s_tag["triggers"])
             else:
-                ctx = self.compiler.compile_structural_tag(grammar_spec)
+                ctx = compiler.compile_structural_tag(grammar_spec)
         else:
             logger.error("Validation should have already occurred. Please file an issue.")
             raise ValueError(f"grammar is not of valid supported types. ({request_type!s})")
@@ -116,6 +224,7 @@ class XgrammarBackend(StructuredOutputBackend):
 
     def destroy(self):
         del self.compiler
+        self._tag_compilers.clear()
 
 
 @dataclass

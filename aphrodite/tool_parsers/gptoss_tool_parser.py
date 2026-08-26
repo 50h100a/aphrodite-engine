@@ -70,6 +70,20 @@ class GptOssToolParser(ToolParser):
         super().__init__(tokenizer, tools)
 
     def get_structural_tag(self, request, *, reasoning: bool = False):
+        """Build the harmony tag.
+
+        Note what the returned tag asks of the decoder: the `final` and
+        `analysis` tags end on `<|end|>` or `<|return|>`, and `<|return|>` is
+        gpt-oss's EOS. xgrammar reserves its stop tokens and will not offer one
+        as a terminal inside a rule, so this only decodes because
+        ``XgrammarBackend._compiler_for_structural_tag`` notices the tag needs
+        the EOS and compiles it against a different stop token. Without that,
+        the model reaches the end of its `final` message with the one token it
+        wants masked out, and runs to max_tokens instead of stopping.
+
+        The commentary preamble added below borrows the `final` tag's
+        terminators, so it inherits the same requirement.
+        """
         tag = super().get_structural_tag(request, reasoning=reasoning)
         if tag is None:
             return None
