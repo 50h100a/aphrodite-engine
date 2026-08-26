@@ -107,6 +107,11 @@ PROBES: dict[str, tuple[dict, object, object]] = {
         [7, 1],
         [7, 7],
     ),
+    "maxContains": (
+        {"type": "array", "items": {"type": "integer"}, "contains": {"const": 7}, "maxContains": 1},
+        [7, 7],
+        [7, 1],
+    ),
     "multipleOf": ({"type": "number", "multipleOf": 0.25}, 0.3, 0.25),
     "exclusiveMinimum": ({"type": "number", "exclusiveMinimum": 0}, 0, 0.5),
     "exclusiveMaximum": ({"type": "number", "exclusiveMaximum": 10}, 10, 9.5),
@@ -202,7 +207,13 @@ def test_probe_backends_are_the_recorded_backends():
     assert set(ACCEPTS) == set(JSON_SCHEMA_BACKENDS)
 
 
-@pytest.mark.parametrize("keyword", sorted(PROBES))
+# Enforced after the grammar rather than by it, so every backend measures as
+# enforcing none while `get_json_schema_backends` still admits the schema.
+# `test_postconditions` holds the layer to its own promises.
+LAYER_ENFORCED = {"contains", "minContains"}
+
+
+@pytest.mark.parametrize("keyword", sorted(set(PROBES) - LAYER_ENFORCED))
 def test_recorded_capability_matches_the_backends(keyword):
     """The table says who enforces this keyword; ask the backends directly."""
     schema, violating, legal = PROBES[keyword]
@@ -216,6 +227,16 @@ def test_recorded_capability_matches_the_backends(keyword):
         f"{keyword}: table says {sorted(recorded)}, backends do {sorted(measured)}. "
         "A backend changed -- update _KEYWORD_BACKENDS in schema_features."
     )
+
+
+@pytest.mark.parametrize("keyword", sorted(LAYER_ENFORCED))
+def test_no_backend_enforces_what_the_layer_took_on(keyword):
+    """The premise of the layer existing. If a backend gains one of these, the
+    keyword belongs back in `_KEYWORD_BACKENDS` and the vetoes should come off:
+    a grammar that can express the constraint will not dead-end on it."""
+    schema, violating, legal = PROBES[keyword]
+    measured = {backend for backend in ACCEPTS if _enforces(backend, schema, violating, legal)}
+    assert measured == set(), f"{keyword} is enforced by {sorted(measured)} now; revisit postconditions"
 
 
 def test_xgrammar_does_not_get_a_schema_it_would_silently_ignore():
@@ -254,7 +275,7 @@ def test_xgrammar_really_does_ignore_it():
         ("uniqueItems", {"type": "array", "items": {"type": "string"}, "uniqueItems": True}),
         ("if", {"type": "object", "if": {"required": ["a"]}, "then": {"required": ["b"]}}),
         ("dependentRequired", {"type": "object", "dependentRequired": {"a": ["b"]}}),
-        ("contains", {"type": "array", "contains": {"type": "string"}}),
+        ("maxContains", {"type": "array", "contains": {"type": "string"}, "maxContains": 2}),
     ],
 )
 def test_keywords_no_backend_enforces_are_rejected(keyword, schema):
@@ -262,6 +283,36 @@ def test_keywords_no_backend_enforces_are_rejected(keyword, schema):
     though it were."""
     assert keyword in get_unenforceable_json_schema_keys(schema)
     assert get_json_schema_backends(schema) == frozenset()
+
+
+def test_contains_is_admitted_but_still_routed_away_from_guidance():
+    """The schema has to compile before the layer can enforce anything, and
+    guidance refuses a keyword it has not implemented rather than ignoring it."""
+    schema = {"type": "array", "items": {"type": "string"}, "contains": {"const": "x"}}
+    assert get_unenforceable_json_schema_keys(schema) == []
+    assert get_json_schema_backends(schema) == JSON_SCHEMA_BACKENDS - {"guidance"}
+
+
+def test_the_backends_that_carry_contains_still_enforce_the_rest_of_the_schema():
+    """What has to stay true for those three to be safe to route to: they drop
+    `contains` and keep going. If one degraded the whole schema the way xgrammar
+    does with `allOf`, admitting it would trade a missing `contains` for a
+    missing everything."""
+    schema = {"type": "array", "items": {"type": "integer"}, "contains": {"const": 7}, "minItems": 2}
+    for backend in JSON_SCHEMA_BACKENDS - {"guidance"}:
+        accepts = ACCEPTS[backend]
+        assert accepts(schema, [7, 1]), f"{backend} refuses a legal instance"
+        assert not accepts(schema, ["a", 1]), f"{backend} stopped enforcing `items`"
+        assert not accepts(schema, [7]), f"{backend} stopped enforcing `minItems`"
+        assert not accepts(schema, {}), f"{backend} stopped enforcing `type`"
+
+
+def test_a_tool_call_cannot_have_contains_enforced():
+    """The layer reads a JSON document; a tool call arrives wrapped in a tag
+    whose trigger/begin/end text it would have to parse first. Refused at
+    arrival rather than decoded with the keyword quietly dropped."""
+    schema = {"type": "array", "items": {"type": "string"}, "contains": {"const": "x"}}
+    assert get_unenforceable_json_schema_keys(schema, postconditions_available=False) == ["contains"]
 
 
 @pytest.mark.parametrize(
@@ -407,6 +458,30 @@ def test_a_pinned_backend_that_would_ignore_the_schema_is_refused(route):
 def test_a_pinned_backend_that_can_enforce_the_schema_is_used(route):
     assert route(NEEDS_GUIDANCE, backend="guidance") == "guidance"
     assert route(ORDINARY, backend="xgrammar") == "xgrammar"
+
+
+NEEDS_POSTCONDITIONS = {"type": "array", "items": {"type": "string"}, "contains": {"const": "x"}}
+
+
+def test_contains_reaches_xgrammar_rather_than_being_refused(route):
+    """The request runs, on a backend that ignores the keyword and lets the
+    layer supply it."""
+    assert route(NEEDS_POSTCONDITIONS) == "xgrammar"
+
+
+def test_a_backend_pinned_to_guidance_cannot_take_contains(route):
+    """`auto` routes around guidance's refusal to compile; a server pinned to it
+    has to say so rather than 500 from the engine's grammar thread."""
+    with pytest.raises(ValueError, match="does not enforce every keyword"):
+        route(NEEDS_POSTCONDITIONS, backend="guidance")
+
+
+def test_contains_is_refused_when_it_arrives_as_a_tool(route):
+    """The same schema, the other route in. Nothing enforces it there, and the
+    bug this guards against is the inverse asymmetry: a 400 as a
+    `response_format` and a silent 200 as a tool."""
+    with pytest.raises(ValueError, match="cannot be enforced"):
+        route(structural_tag=_tag_around(NEEDS_POSTCONDITIONS))
 
 
 def test_requests_with_no_json_schema_are_never_refused_for_capability(route):

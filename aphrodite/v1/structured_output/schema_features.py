@@ -7,8 +7,9 @@ which backends can enforce them.
 entrypoints and the engine so the two layers cannot drift, and covering both
 routes into the grammar -- `response_format` and the structural tag a tool call
 is wrapped in -- so the two routes cannot drift either. It rejects schemas that
-are malformed (`get_schema_validation_error`), schemas using keywords no
-backend enforces (`get_unenforceable_json_schema_keys`), and schemas whose
+are malformed (`get_schema_validation_error`), schemas using keywords nothing
+enforces -- neither a backend nor the `postconditions` layer above them
+(`get_unenforceable_json_schema_keys`) -- and schemas whose
 keywords are individually enforceable but have no backend in common
 (`get_json_schema_backend_conflict`), since a request decodes with one backend.
 
@@ -37,6 +38,7 @@ import jsonschema.validators
 
 import aphrodite.envs as envs
 from aphrodite.logger import init_logger
+from aphrodite.v1.structured_output import postconditions
 
 logger = init_logger(__name__)
 
@@ -87,8 +89,12 @@ JSON_SCHEMA_BACKENDS = frozenset({"xgrammar", "guidance", "outlines", "lm-format
 # $defs, pattern, minLength/maxLength, minItems/maxItems, maxProperties.
 # `format` is deliberately absent: it is an annotation, not an assertion.
 _KEYWORD_BACKENDS: dict[str, frozenset[str]] = {
-    # Nothing enforces these. A CFG cannot count, compare across the document,
-    # or remember what it already emitted.
+    # No backend enforces these. A CFG cannot count, compare across the
+    # document, or remember what it already emitted.
+    #
+    # `contains`/`minContains` are still enforceable, by `postconditions` on top
+    # of whichever backend decodes, so ask `_LayerVerdict.backends` about a
+    # particular node rather than reading them off this table.
     "contains": frozenset(),
     "dependentRequired": frozenset(),
     "dependentSchemas": frozenset(),
@@ -119,6 +125,15 @@ _KEYWORD_BACKENDS: dict[str, frozenset[str]] = {
     "unevaluatedProperties": frozenset({"xgrammar", "outlines", "lm-format-enforcer"}),
 }
 
+# Which backends can carry a keyword the postcondition layer enforces. The
+# layer works with any backend, but the schema still has to *compile*, which is
+# measured the same way as the table above: xgrammar, outlines and
+# lm-format-enforcer read `contains`, ignore it, and enforce the rest, so the
+# layer supplies only what they dropped. llguidance refuses the whole schema
+# ("Unimplemented keys"), so routing has to divert before it dispatches or the
+# compile throws on the grammar thread and reaches the caller as a 500.
+_LAYER_ENFORCED_BACKENDS = JSON_SCHEMA_BACKENDS - {"guidance"}
+
 # Table keywords that constrain nothing when set to their permissive value, so
 # they are not held against the schema.
 _VACUOUS_WHEN = {
@@ -127,13 +142,10 @@ _VACUOUS_WHEN = {
     "uniqueItems": False,
 }
 
-# The keywords nothing can enforce -- read off the table rather than repeated,
-# so a keyword that later gains a backend leaves this set on its own.
-#
-# The set is closed under companionship: `if` cannot be here without `then` and
-# `else`, nor `contains` without `minContains`/`maxContains`. That is what makes
-# dropping the whole set in best-effort mode safe -- no keyword is left behind
-# whose meaning depended on one that left. A test holds the table to it.
+# The keywords no *backend* enforces -- read off the table rather than repeated,
+# so a keyword that later gains a backend leaves this set on its own. Not the
+# last word on whether a schema is enforceable: `contains` and `minContains` are
+# in here and the postcondition layer still enforces them.
 _UNENFORCEABLE_KEYWORDS = frozenset(key for key, backends in _KEYWORD_BACKENDS.items() if not backends)
 
 
@@ -154,27 +166,29 @@ def _constrains(node: dict[str, Any], key: str) -> bool:
         return "then" in node or "else" in node
     if key in ("then", "else"):
         return "if" in node
-    if key in ("minContains", "maxContains"):
-        return "contains" in node
+    if key in ("contains", "minContains", "maxContains"):
+        # All three stand or fall together, on the question the decode-time
+        # layer asks, so a keyword it would never fire on is not one the caller
+        # is refused for.
+        return postconditions.contains_obligation(node) is not None
     return True
 
 
-def _iter_constraining_keywords(schema: Any) -> Iterator[str]:
-    """Yield each keyword in ``schema`` that is in the table and constrains."""
-    for node in iter_schema_nodes(schema):
-        for key in _KEYWORD_BACKENDS.keys() & node.keys():
-            if _constrains(node, key):
-                yield key
-
-
 def iter_schema_nodes(schema: Any) -> Iterator[dict[str, Any]]:
-    """Yield every node of ``schema`` sitting in JSON Schema keyword position."""
+    """Yield every node of ``schema`` sitting in JSON Schema keyword position.
+
+    Subschemas under an inert keyword are skipped -- an `if` with no `then` or
+    `else` applies to nothing, so a keyword inside it can never constrain the
+    output and must not be held against the caller.
+    """
     if not isinstance(schema, dict):
         return
     yield schema
 
     for key, value in schema.items():
         if key in _SUBSCHEMA_KEYS:
+            if key in _KEYWORD_BACKENDS and not _constrains(schema, key):
+                continue
             if isinstance(value, list):
                 for item in value:
                     yield from iter_schema_nodes(item)
@@ -190,6 +204,43 @@ def iter_schema_nodes(schema: Any) -> Iterator[dict[str, Any]]:
                     yield from iter_schema_nodes(item)
 
 
+class _LayerVerdict:
+    """Which backends enforce a keyword *at one node* of one schema.
+
+    Everything but the postcondition keywords comes straight off the table. For
+    those, enforceability depends on where the keyword sits, so the answer comes
+    from the same `analyze` the runtime uses and the two cannot disagree about
+    what was promised.
+    """
+
+    __slots__ = ("_enforced", "reasons")
+
+    def __init__(self, schema: Any, available: bool = True):
+        if not available or not isinstance(schema, dict):
+            # The structural-tag route, which the layer does not serve: the
+            # scanner would have to find the schema body inside the tag's own
+            # trigger/begin/end output to know where the array starts.
+            self._enforced: set[int] = set()
+            self.reasons: list[str] = []
+            return
+        analysis = postconditions.analyze(schema)
+        self._enforced = analysis.obligations
+        self.reasons = analysis.problems
+
+    def backends(self, node: dict[str, Any], key: str) -> frozenset[str]:
+        if key in postconditions.LAYER_ENFORCED_KEYWORDS and id(node) in self._enforced:
+            return _LAYER_ENFORCED_BACKENDS
+        return _KEYWORD_BACKENDS[key]
+
+
+def _iter_constraining_nodes(schema: Any) -> Iterator[tuple[dict[str, Any], str]]:
+    """Yield each (node, keyword) in ``schema`` that is in the table and constrains."""
+    for node in iter_schema_nodes(schema):
+        for key in _KEYWORD_BACKENDS.keys() & node.keys():
+            if _constrains(node, key):
+                yield node, key
+
+
 def _as_schema(schema: Any) -> Any:
     """Parse ``schema`` if it is JSON text. Unparseable text is left alone;
     malformed JSON is reported by whoever parses it for real."""
@@ -201,23 +252,40 @@ def _as_schema(schema: Any) -> Any:
     return schema
 
 
-def get_unenforceable_json_schema_keys(schema: Any) -> list[str]:
-    """Return the keywords in ``schema`` that no backend enforces, sorted.
+def get_unenforceable_json_schema_keys(schema: Any, *, postconditions_available: bool = True) -> list[str]:
+    """Return the keywords in ``schema`` that nothing enforces, sorted.
 
     ``schema`` may be a dict or JSON text. Unparseable text yields nothing.
+
+    ``postconditions_available`` is False for routes the decode-time layer
+    cannot serve, which is how a keyword can be enforceable in a response format
+    and refused in a tool call.
     """
-    return sorted({key for key in _iter_constraining_keywords(_as_schema(schema)) if not _KEYWORD_BACKENDS[key]})
+    parsed = _as_schema(schema)
+    verdict = _LayerVerdict(parsed, postconditions_available)
+    return sorted({key for node, key in _iter_constraining_nodes(parsed) if not verdict.backends(node, key)})
 
 
-def get_json_schema_backends(schema: Any) -> frozenset[str]:
+def get_unenforceable_reasons(schema: Any) -> list[str]:
+    """Why the decode-time layer had to refuse ``schema``, if it did.
+
+    The keyword name alone does not distinguish a schema the caller should
+    rewrite from one they should give up on; the layer knows which.
+    """
+    return _LayerVerdict(_as_schema(schema)).reasons
+
+
+def get_json_schema_backends(schema: Any, *, postconditions_available: bool = True) -> frozenset[str]:
     """Return the backends that enforce every constraining keyword in ``schema``.
 
     Empty means the schema cannot be enforced by anything we have;
     ``get_unenforceable_json_schema_keys`` says which keyword is to blame.
     """
+    parsed = _as_schema(schema)
+    verdict = _LayerVerdict(parsed, postconditions_available)
     backends = JSON_SCHEMA_BACKENDS
-    for key in _iter_constraining_keywords(_as_schema(schema)):
-        backends &= _KEYWORD_BACKENDS[key]
+    for node, key in _iter_constraining_nodes(parsed):
+        backends &= verdict.backends(node, key)
         if not backends:
             break
     return backends
@@ -231,7 +299,9 @@ def get_json_schema_backend_conflict(schema: Any) -> list[str]:
     has a home (or when some keyword has no home at all, which
     ``get_unenforceable_json_schema_keys`` reports instead).
     """
-    keywords = {key: _KEYWORD_BACKENDS[key] for key in _iter_constraining_keywords(_as_schema(schema))}
+    parsed = _as_schema(schema)
+    verdict = _LayerVerdict(parsed)
+    keywords = {key: verdict.backends(node, key) for node, key in _iter_constraining_nodes(parsed)}
     if not keywords or not all(keywords.values()):
         return []
     remaining = JSON_SCHEMA_BACKENDS
@@ -294,19 +364,25 @@ def get_structural_tag_backend_conflict(structured_outputs: Any) -> list[str]:
     tag_backends = get_structural_tag_backends(tag)
     if get_json_schema_backends_for_request(structured_outputs) & tag_backends:
         return []
-    blame = {
-        key
-        for schema in iter_request_json_schemas(structured_outputs)
-        for key in _iter_constraining_keywords(_as_schema(schema))
-        if not (_KEYWORD_BACKENDS[key] & tag_backends)
-    }
+    blame: set[str] = set()
+    for schema in iter_request_json_schemas(structured_outputs):
+        parsed = _as_schema(schema)
+        verdict = _LayerVerdict(parsed, available=False)
+        blame |= {
+            key for node, key in _iter_constraining_nodes(parsed) if not (verdict.backends(node, key) & tag_backends)
+        }
     return sorted(blame)
 
 
-def unenforceable_keys_message(keys: list[str]) -> str:
-    """The rejection text, shared so the API and engine layers cannot drift."""
+def unenforceable_keys_message(keys: list[str], reasons: list[str] | None = None) -> str:
+    """The rejection text, shared so the API and engine layers cannot drift.
+
+    ``reasons`` says what the keyword name cannot: `contains` is enforceable in
+    general, so "this one is not" leaves the caller nowhere to go.
+    """
+    detail = f" ({reasons[0]})" if reasons else ""
     return (
-        f"JSON schema keyword(s) {keys} cannot be enforced by structured output. "
+        f"JSON schema keyword(s) {keys} cannot be enforced by structured output{detail}. "
         "Remove them from the schema and validate the generated output instead."
     )
 
@@ -419,10 +495,16 @@ def iter_request_json_schemas(structured_outputs: Any) -> Iterator[Any]:
 
 
 def get_json_schema_backends_for_request(structured_outputs: Any) -> frozenset[str]:
-    """Backends that enforce every keyword across all of a request's schemas."""
+    """Backends that enforce every keyword across all of a request's schemas.
+
+    The two routes are asked separately: the decode-time layer serves
+    `response_format` and not the tag a tool call rides in.
+    """
     backends = JSON_SCHEMA_BACKENDS
-    for schema in iter_request_json_schemas(structured_outputs):
+    if (schema := getattr(structured_outputs, "json", None)) is not None:
         backends &= get_json_schema_backends(schema)
+    for schema in iter_structural_tag_schemas(getattr(structured_outputs, "structural_tag", None)):
+        backends &= get_json_schema_backends(schema, postconditions_available=False)
     return backends
 
 
@@ -434,6 +516,7 @@ def _strip_unenforceable_in_place(schema: dict[str, Any]) -> set[str]:
     reason for any rejection, and so is left where it is.
     """
     removed: set[str] = set()
+    verdict = _LayerVerdict(schema)
     # Materialised before the first deletion: the walk is about to read each
     # node's keys, and mutating a node it has not descended into yet would pull
     # the ground out from under it.
@@ -441,7 +524,11 @@ def _strip_unenforceable_in_place(schema: dict[str, Any]) -> set[str]:
         # Decided for the whole node before anything is removed. `if`, `then`
         # and `else` each constrain only in the company of the others, so
         # deleting one first would make the rest look inert and spare them.
-        doomed = {key for key in _UNENFORCEABLE_KEYWORDS & node.keys() if _constrains(node, key)}
+        doomed = {
+            key
+            for key in _KEYWORD_BACKENDS.keys() & node.keys()
+            if _constrains(node, key) and not verdict.backends(node, key)
+        }
         for key in doomed:
             del node[key]
         removed |= doomed
@@ -554,9 +641,14 @@ def get_structured_outputs_schema_error(structured_outputs: Any) -> str | None:
             # Not the same objects any more.
             schemas = list(iter_request_json_schemas(structured_outputs))
 
+    # The same schema can be enforceable as a response format and refused as a
+    # tool, so each is asked by the route it arrived on.
+    tag = getattr(structured_outputs, "structural_tag", None)
+    tag_schemas = {id(schema) for schema in iter_structural_tag_schemas(tag)}
     for schema in schemas:
-        if unenforceable := get_unenforceable_json_schema_keys(schema):
-            return unenforceable_keys_message(unenforceable)
+        available = id(schema) not in tag_schemas
+        if unenforceable := get_unenforceable_json_schema_keys(schema, postconditions_available=available):
+            return unenforceable_keys_message(unenforceable, get_unenforceable_reasons(schema) if available else None)
     for schema in schemas:
         if conflict := get_json_schema_backend_conflict(schema):
             return backend_conflict_message(conflict)

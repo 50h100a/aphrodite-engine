@@ -43,11 +43,11 @@ def unsupported_number_schemas():
 
 @pytest.fixture
 def unsupported_array_schemas():
+    # `contains`/`minContains` belong here only alongside `maxContains`: on
+    # their own the postcondition layer enforces them on top of xgrammar.
     return [
         {"type": "array", "uniqueItems": True},
-        {"type": "array", "contains": {"type": "string"}},
-        {"type": "array", "minContains": 1},
-        {"type": "array", "maxContains": 5},
+        {"type": "array", "contains": {"type": "string"}, "maxContains": 5},
     ]
 
 
@@ -123,7 +123,13 @@ def test_supported_json_features(supported_schema):
         ({"$defs": {"A": {"type": "array", "uniqueItems": True}}, "$ref": "#/$defs/A"}, ["uniqueItems"]),
         ({"anyOf": [{"type": "array", "uniqueItems": True}, {"type": "string"}]}, ["uniqueItems"]),
         ({"type": "array", "items": [{"uniqueItems": True}]}, ["uniqueItems"]),
-        ({"type": "array", "contains": {"type": "string"}, "minContains": 1}, ["contains", "minContains"]),
+        # Enforced after the grammar rather than by it. `maxContains` has
+        # nowhere to go, and takes its companions down with it.
+        ({"type": "array", "contains": {"type": "string"}, "minContains": 1}, []),
+        (
+            {"type": "array", "contains": {"type": "string"}, "maxContains": 2},
+            ["contains", "maxContains"],
+        ),
         # A property *named* after a keyword is user data, not a constraint.
         ({"type": "object", "properties": {"uniqueItems": {"type": "string"}}}, []),
         ({"type": "string", "enum": ["uniqueItems", "contains"]}, []),

@@ -18,6 +18,7 @@ import json
 
 import pytest
 
+from aphrodite.v1.structured_output.postconditions import LAYER_ENFORCED_KEYWORDS
 from aphrodite.v1.structured_output.schema_features import (
     _KEYWORD_BACKENDS,
     _UNENFORCEABLE_KEYWORDS,
@@ -256,60 +257,80 @@ def test_best_effort_leaves_an_inert_keyword_alone(best_effort):
 
 
 def test_best_effort_drops_a_conditional_group_whole(best_effort):
-    """`if` constrains only in the company of `then`/`else`. Dropped one at a
-    time, whichever went first would make the rest look inert and spare them --
-    leaving a schema that still carries a keyword nothing can enforce."""
+    """`if` constrains only in the company of `then`/`else`, and `contains` is
+    unenforceable only in the company of `maxContains`. Dropped one at a time,
+    whichever went first would make the rest look inert and spare them, leaving
+    a schema that still carries a keyword nothing can enforce."""
     schema = {
-        "type": "object",
-        "properties": {"a": {"type": "string"}},
-        "if": {"required": ["a"]},
-        "then": {"required": ["b"]},
-        "else": {"required": ["c"]},
-        "contains": {"type": "integer"},
-        "minContains": 2,
+        "type": "array",
+        "items": {"type": "string"},
+        "if": {"minItems": 1},
+        "then": {"maxItems": 3},
+        "else": {"maxItems": 9},
+        "contains": {"const": "x"},
+        "maxContains": 2,
     }
     structured_outputs = FakeStructuredOutputs(json=schema)
 
     assert get_structured_outputs_schema_error(structured_outputs) is None
-    assert structured_outputs.json == {"type": "object", "properties": {"a": {"type": "string"}}}
+    assert structured_outputs.json == {"type": "array", "items": {"type": "string"}}
 
 
-def test_unenforceable_set_is_closed_under_companionship():
-    """What makes dropping the whole set safe: no keyword that needs a companion
-    can be in it without that companion, so nothing is ever left behind holding
-    a reference to something that left. If a keyword here gains a backend, its
-    companions have to be reconsidered with it."""
-    companions = [{"if", "then", "else"}, {"contains", "minContains", "maxContains"}]
+# Derived, not listed, so a keyword that gains an enforcer drops out on its own.
+SCREENED_OUT = sorted(_UNENFORCEABLE_KEYWORDS - LAYER_ENFORCED_KEYWORDS)
 
-    for group in companions:
+# Groups whose members are only meaningful together. `if`/`then`/`else` is
+# symmetric. The `contains` group is directional: `minContains`/`maxContains`
+# mean nothing alone, while `contains` is well-defined by itself, which is why
+# this group can be split where the other cannot.
+SYMMETRIC_GROUPS = [{"if", "then", "else"}]
+DEPENDENTS = {"minContains": "contains", "maxContains": "contains"}
+
+
+def test_a_companion_group_is_never_split():
+    """What makes dropping a group safe: nothing is left behind holding a
+    reference to something that left.
+
+    Symmetric groups are all-in or all-out. A dependent keyword may not outlive
+    what it modifies, but the reverse is fine -- which is what lets `contains`
+    be enforced while `maxContains` is refused.
+    """
+    for group in SYMMETRIC_GROUPS:
         present = group & _UNENFORCEABLE_KEYWORDS
         assert present in (set(), group), f"{sorted(group)} is split across the enforceability line"
+
+    for dependent, needed in DEPENDENTS.items():
+        if needed in _UNENFORCEABLE_KEYWORDS:
+            assert dependent in _UNENFORCEABLE_KEYWORDS, (
+                f"{needed} is unenforceable but {dependent} is not, which would leave {dependent} "
+                "modifying a keyword that has been stripped out from under it"
+            )
 
     assert _UNENFORCEABLE_KEYWORDS == {key for key, backends in _KEYWORD_BACKENDS.items() if not backends}
 
 
-@pytest.mark.parametrize("keyword", sorted(_UNENFORCEABLE_KEYWORDS))
-def test_best_effort_covers_every_unenforceable_keyword(best_effort, keyword):
+@pytest.mark.parametrize("keyword", SCREENED_OUT)
+def test_best_effort_covers_every_screened_out_keyword(best_effort, keyword):
     """Whatever the screen would refuse, the flag has to be able to remove.
     A keyword the strip missed would be a 400 the flag promised to prevent,
     surfacing later as an unroutable request rather than a clear message."""
     schema = {
-        "type": "object",
-        "properties": {"a": {"type": "string"}},
-        "if": {"required": ["a"]},
-        "then": {"required": ["a"]},
-        "else": {"required": ["a"]},
-        "contains": {"type": "string"},
+        "type": "array",
+        "items": {"type": "string"},
+        "if": {"minItems": 1},
+        "then": {"maxItems": 3},
+        "else": {"maxItems": 9},
+        "contains": {"const": "x"},
         "minContains": 1,
         "maxContains": 2,
-        "not": {"required": ["z"]},
+        "not": {"minItems": 2},
         "uniqueItems": True,
         "dependentRequired": {"a": ["b"]},
         "dependentSchemas": {"a": {"required": ["b"]}},
     }
     only_this_one = {key: value for key, value in schema.items() if key not in _UNENFORCEABLE_KEYWORDS}
-    # Companions come along; the keyword under test means nothing without them.
-    for group in ({"if", "then", "else"}, {"contains", "minContains", "maxContains"}):
+    # Whatever the keyword under test needs to mean anything comes with it.
+    for group in (*SYMMETRIC_GROUPS, {keyword, DEPENDENTS.get(keyword, keyword)}):
         if keyword in group:
             only_this_one.update({key: schema[key] for key in group})
     only_this_one[keyword] = schema[keyword]
@@ -319,3 +340,16 @@ def test_best_effort_covers_every_unenforceable_keyword(best_effort, keyword):
     structured_outputs = FakeStructuredOutputs(json=only_this_one)
     assert get_structured_outputs_schema_error(structured_outputs) is None
     assert get_unenforceable_json_schema_keys(structured_outputs.json) == []
+
+
+@pytest.mark.parametrize("keyword", sorted(LAYER_ENFORCED_KEYWORDS))
+def test_best_effort_leaves_the_enforced_keywords_alone(best_effort, keyword):
+    """Best-effort drops what cannot be enforced and nothing else; stripping an
+    enforced keyword would quietly widen the caller's schema."""
+    schema = {"type": "array", "items": {"type": "string"}, "contains": {"const": "x"}}
+    if keyword == "minContains":
+        schema["minContains"] = 2
+
+    structured_outputs = FakeStructuredOutputs(json=dict(schema))
+    assert get_structured_outputs_schema_error(structured_outputs) is None
+    assert structured_outputs.json == schema

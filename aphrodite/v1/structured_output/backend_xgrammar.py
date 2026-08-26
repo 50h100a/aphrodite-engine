@@ -340,10 +340,11 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
         if obj.get("type") in ("integer", "number") and ("multipleOf" in obj):
             return True
 
-        # Check for array unsupported keywords
-        if obj.get("type") == "array" and any(
-            key in obj for key in ("uniqueItems", "contains", "minContains", "maxContains")
-        ):
+        # Check for array unsupported keywords. xgrammar ignores `contains` and
+        # `minContains` while still enforcing the rest of the schema, and the
+        # postcondition layer adds the count back on top; declining them here
+        # would divert those requests to guidance, which cannot compile them.
+        if obj.get("type") == "array" and any(key in obj for key in ("uniqueItems", "maxContains")):
             return True
 
         # Unsupported keywords for strings

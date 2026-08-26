@@ -18,6 +18,7 @@ from aphrodite.v1.structured_output.backend_types import (
     StructuredOutputGrammar,
 )
 from aphrodite.v1.structured_output.backend_xgrammar import XgrammarBackend
+from aphrodite.v1.structured_output.postconditions import maybe_wrap
 
 if TYPE_CHECKING:
     import numpy as np
@@ -183,7 +184,18 @@ class StructuredOutputManager:
         # finish_reason=error for this request alone by the scheduler.
         request_type, grammar_spec = key
 
-        return backend.compile_grammar(request_type, grammar_spec)
+        grammar = backend.compile_grammar(request_type, grammar_spec)
+        # Wrapped here, on the compile thread, so the per-vocabulary tables the
+        # wrapper derives stay off the scheduler's path. A schema asking for
+        # none of those keywords gets `grammar` handed straight back.
+        return maybe_wrap(
+            grammar,
+            request_type,
+            grammar_spec,
+            tokenizer=backend.tokenizer,
+            vocab_size=backend.vocab_size,
+            num_speculative_tokens=self.aphrodite_config.num_speculative_tokens,
+        )
 
     def _fill_bitmasks(self, batch: Iterable[tuple[StructuredOutputGrammar, int, bool]]) -> None:
         assert self._grammar_bitmask is not None
