@@ -581,6 +581,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
     _grammar_from_tool_parser: bool = PrivateAttr(default=False)
     """CAUTION: Should only be set by ``ToolParser.adjust_request``."""
 
+    _reply_schema_in_tool_grammar: bool = PrivateAttr(default=False)
+    """Whether the tool grammar carries the caller's reply schema.
+
+    Installing the tag clears `response_format`, so this is the only thing left
+    downstream to tell a reply the caller wants shaped from one they do not.
+
+    CAUTION: Should only be set by ``DelegatingParser._apply_structural_tag``.
+    """
+
     def build_chat_params(
         self,
         default_template: str | None,

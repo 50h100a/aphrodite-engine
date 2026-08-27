@@ -566,6 +566,9 @@ class DelegatingParser(Parser):
             if merged is None:
                 reject_unmergeable_reply_schema(request)
             structure_tag = merged
+            # Recorded before `response_format` is cleared below: a parser that
+            # has other free-text segments needs to know the reply is formatted.
+            request._reply_schema_in_tool_grammar = True
 
         structural_tag = json.dumps(structure_tag.model_dump())
         request.structured_outputs = StructuredOutputsParams(  # type: ignore[call-arg]

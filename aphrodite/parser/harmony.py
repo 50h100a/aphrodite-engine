@@ -44,12 +44,28 @@ class _SegmentType(Enum):
     IGNORE = auto()
 
     @staticmethod
-    def from_channel_and_recipient(channel: str | None, recipient: str | None) -> _SegmentType:
+    def from_channel_and_recipient(
+        channel: str | None,
+        recipient: str | None,
+        *,
+        preamble_is_content: bool = True,
+    ) -> _SegmentType:
+        """Which of the reply's parts this segment belongs to.
+
+        ``preamble_is_content`` is False once a reply schema has been folded
+        into the tool grammar. gpt-oss narrates on recipient-less `commentary`
+        before it calls a tool, and that narration is free text: reading it back
+        as content would put prose in a field the caller asked to be a document
+        of their own shape. It is closer to reasoning than to the reply, so that
+        is where it goes.
+        """
         if recipient and is_function_recipient(recipient):
             return _SegmentType.TOOL
         if channel == "analysis":
             return _SegmentType.REASONING
-        if channel == "final" or (channel == "commentary" and recipient is None):
+        if channel == "commentary" and recipient is None:
+            return _SegmentType.CONTENT if preamble_is_content else _SegmentType.REASONING
+        if channel == "final":
             return _SegmentType.CONTENT
         return _SegmentType.IGNORE
 
@@ -91,6 +107,17 @@ class HarmonyParser(DelegatingParser):
         that segment; it does not stop the model from emitting it.
         """
         return True
+
+    @staticmethod
+    def _preamble_is_content(request: ChatCompletionRequest | ResponsesRequest) -> bool:
+        """Whether a recipient-less `commentary` segment is part of the reply.
+
+        It stops being part of it once the caller's reply schema is riding in
+        the tool grammar: `content` then has a shape to keep, and a preamble is
+        free text. The flag is the only trace left by then -- installing the tag
+        clears `response_format` off the request.
+        """
+        return not getattr(request, "_reply_schema_in_tool_grammar", False)
 
     @property
     def _harmony_parser(self) -> StreamableParser:
@@ -163,6 +190,7 @@ class HarmonyParser(DelegatingParser):
         if flushed_segments:
             result.segments.extend(flushed_segments)
 
+        preamble_is_content = self._preamble_is_content(request)
         reasoning_parts: list[str] = []
         content_parts: list[str] = []
         tool_calls: list[FunctionCall] = []
@@ -174,7 +202,11 @@ class HarmonyParser(DelegatingParser):
             if msg.author.role != "assistant" or not msg.content:
                 continue
             text = msg.content[0].text
-            segment_type = _SegmentType.from_channel_and_recipient(msg.channel, msg.recipient)
+            segment_type = _SegmentType.from_channel_and_recipient(
+                msg.channel,
+                msg.recipient,
+                preamble_is_content=preamble_is_content,
+            )
             match segment_type:
                 case _SegmentType.REASONING if self.reasoning_parser and text:
                     reasoning_parts.append(text)
@@ -211,6 +243,7 @@ class HarmonyParser(DelegatingParser):
         *,
         finished: bool,
     ) -> DeltaMessage | None:
+        preamble_is_content = self._preamble_is_content(request)
         prev_recipient = self._normalize_recipient(self._harmony_parser.current_recipient)
         result = self.process_chunk(delta_token_ids)
         if finished:
@@ -226,7 +259,11 @@ class HarmonyParser(DelegatingParser):
                 prev_recipient = None
                 continue
 
-            segment_type = _SegmentType.from_channel_and_recipient(segment.channel, segment.recipient)
+            segment_type = _SegmentType.from_channel_and_recipient(
+                segment.channel,
+                segment.recipient,
+                preamble_is_content=preamble_is_content,
+            )
             match segment_type:
                 case _SegmentType.REASONING if self.reasoning_parser:
                     combined_reasoning += segment.delta

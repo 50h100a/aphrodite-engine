@@ -202,6 +202,105 @@ def test_harmony_constrains_the_final_channel_and_leaves_analysis_alone():
     )
 
 
+def test_a_constrained_reply_channel_can_only_be_said_once():
+    """The tag is a repeatable alternation and `<|end|>` closes a message
+    without ending the turn, so an unconstrained `final` may be followed by
+    another. Two documents that each satisfy the schema do not satisfy it once
+    HarmonyParser joins them, so the constrained reply keeps only `<|return|>`."""
+    accepts = _accepts("harmony", REPLY_SCHEMA, reasoning=True)
+
+    assert not accepts(
+        '<|channel|>final<|message|>{"answer": "a"}<|end|>'
+        '<|start|>assistant<|channel|>final<|message|>{"answer": "b"}<|return|>'
+    )
+    assert not accepts('<|channel|>final<|message|>{"answer": "a"}<|end|>')
+    assert accepts('<|channel|>final<|message|>{"answer": "a"}<|return|>')
+
+
+def _harmony_installed_tag(monkeypatch, *, response_format=None, tool_choice="auto"):
+    """The tag the server actually installs, decoded back to a StructuralTag.
+
+    Going through `HarmonyParser.adjust_request` rather than
+    `get_model_structural_tag` is the point: `GptOssToolParser` adds the
+    commentary preamble on the way past, and a test that skips it is testing a
+    tag no request ever gets.
+    """
+    from aphrodite.parser.harmony import HarmonyParser
+    from aphrodite.tool_parsers.gptoss_tool_parser import GptOssToolParser
+
+    monkeypatch.setattr(HarmonyParser, "tool_parser_cls", GptOssToolParser)
+    monkeypatch.setattr(HarmonyParser, "reasoning_parser_cls", None)
+
+    request = _request(tools=TOOLS, tool_choice=tool_choice, response_format=response_format)
+    # Adjusted in place; the return is the same object, kept typed for the caller.
+    assert HarmonyParser(MagicMock(), tools=TOOLS).adjust_request(request) is request
+
+    assert request.structured_outputs is not None
+    assert request.structured_outputs.structural_tag is not None
+    return request, request.structured_outputs.structural_tag
+
+
+def _accepts_tag(raw_tag):
+    grammar = xgr.Grammar.from_structural_tag(raw_tag)
+    return lambda text: _is_grammar_accept_string(grammar, text)
+
+
+HARMONY_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {"name": "reply", "strict": True, "schema": REPLY_SCHEMA},
+}
+
+
+def test_the_installed_harmony_tag_leaves_no_unconstrained_content(monkeypatch):
+    """The preamble stays admitted -- gpt-oss narrates before it calls a tool,
+    and the tag is a closed alternation, so forbidding it forbids the call it
+    leads to. HarmonyParser reads that segment back as reasoning instead."""
+    _, raw_tag = _harmony_installed_tag(monkeypatch, response_format=HARMONY_RESPONSE_FORMAT)
+    accepts = _accepts_tag(raw_tag)
+
+    assert accepts('<|channel|>final<|message|>{"answer": "sunny"}<|return|>')
+    assert not accepts("<|channel|>final<|message|>It is sunny.<|return|>")
+    assert accepts(
+        "<|channel|>commentary<|message|>Let me look that up.<|end|>"
+        "<|start|>assistant<|channel|>commentary to=functions.get_weather"
+        '<|constrain|>json<|message|>{"city": "Paris"}<|call|>'
+    )
+    assert not accepts(
+        '<|channel|>final<|message|>{"answer": "a"}<|end|>'
+        '<|start|>assistant<|channel|>final<|message|>{"answer": "b"}<|return|>'
+    )
+
+
+def test_the_installed_harmony_tag_marks_the_request(monkeypatch):
+    """Installing the tag clears `response_format`, so the flag is the only
+    thing left to tell HarmonyParser the reply has a shape to keep."""
+    out, _ = _harmony_installed_tag(monkeypatch, response_format=HARMONY_RESPONSE_FORMAT)
+
+    assert out.response_format is None
+    assert out._reply_schema_in_tool_grammar is True
+
+
+def test_a_forced_tool_call_does_not_mark_the_request(monkeypatch):
+    """`required` drops the schema without complaint rather than merging it, so
+    nothing constrains the reply and the flag must not claim otherwise."""
+    out, _ = _harmony_installed_tag(
+        monkeypatch,
+        response_format=HARMONY_RESPONSE_FORMAT,
+        tool_choice="required",
+    )
+
+    assert out._reply_schema_in_tool_grammar is False
+
+
+def test_tools_without_a_reply_schema_leave_the_preamble_as_content(monkeypatch):
+    """Nothing changes for a plain tool-calling request: the narration is still
+    the reply, and the tag still admits free text on `final`."""
+    out, raw_tag = _harmony_installed_tag(monkeypatch)
+
+    assert out._reply_schema_in_tool_grammar is False
+    assert _accepts_tag(raw_tag)("<|channel|>final<|message|>It is sunny.<|return|>")
+
+
 def test_llama_does_not_merge():
     """Its tool calls are bare JSON objects, so a JSON reply is the same branch
     and no parser downstream could say which was meant."""
@@ -266,7 +365,10 @@ def test_a_parser_with_no_tool_grammar_refuses_a_reply_schema():
     with pytest.raises(AphroditeValidationError) as excinfo:
         _composed_parser("granite").adjust_request(_auto_request(response_format=JSON_SCHEMA_FORMAT))
 
-    assert "no grammar for its tool calls" in str(excinfo.value)
+    # Why the two refusals differ is ours to know; what the caller is told is
+    # the same either way, because there is nothing they can do differently.
+    assert "`response_format` cannot be combined with tool calling for this model." in str(excinfo.value)
+    assert excinfo.value.parameter == "response_format"
 
 
 def test_a_parser_with_no_tool_grammar_is_untouched_without_a_reply_schema():

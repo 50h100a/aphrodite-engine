@@ -51,6 +51,31 @@ def chat_request():
 
 
 @pytest.fixture
+def schema_request():
+    """A request whose reply schema is riding in the tool structural tag.
+
+    `_apply_structural_tag` sets this flag and clears `response_format`, so this
+    is what the parser sees for a `response_format` + `tools` request.
+    """
+    request = ChatCompletionRequest(
+        model="openai/gpt-oss-20b",
+        messages=[{"role": "user", "content": "Hello"}],
+    )
+    request._reply_schema_in_tool_grammar = True
+    return request
+
+
+# The narration gpt-oss emits before it calls a tool, and the call itself.
+PREAMBLE_THEN_CALL = (
+    "<|channel|>commentary"
+    "<|message|>Let me check the weather.<|end|>"
+    "<|start|>assistant to=functions.get_weather"
+    "<|channel|>commentary"
+    '<|message|>{"location": "SF"}<|end|>'
+)
+
+
+@pytest.fixture
 def malformed_msgs_str() -> list[str]:
     return [
         "<|channel|>analysis<|message|>thinking<|end|>",
@@ -444,17 +469,54 @@ class TestParse:
         reasoning, content, tool_calls = harmony_parser.parse(
             "",
             chat_request,
-            model_output_token_ids=encode_output(
-                "<|channel|>commentary"
-                "<|message|>Let me check the weather.<|end|>"
-                "<|start|>assistant to=functions.get_weather"
-                "<|channel|>commentary"
-                '<|message|>{"location": "SF"}<|end|>'
-            ),
+            model_output_token_ids=encode_output(PREAMBLE_THEN_CALL),
         )
 
         assert reasoning is None
         assert content == "Let me check the weather."
+        assert tool_call_tuples(tool_calls) == [("get_weather", json.dumps({"location": "SF"}))]
+
+    def test_a_reply_schema_moves_the_preamble_out_of_content(self, harmony_parser, schema_request):
+        """`content` is the caller's document once a reply schema is in the tool
+        grammar, and narration is not part of it."""
+        reasoning, content, tool_calls = harmony_parser.parse(
+            "",
+            schema_request,
+            model_output_token_ids=encode_output(PREAMBLE_THEN_CALL),
+        )
+
+        assert content is None
+        assert reasoning == "Let me check the weather."
+        assert tool_call_tuples(tool_calls) == [("get_weather", json.dumps({"location": "SF"}))]
+
+    def test_a_reply_schema_leaves_the_final_channel_as_content(self, harmony_parser, schema_request):
+        """Only the preamble moves. The reply itself is what the schema shaped."""
+        reasoning, content, tool_calls = harmony_parser.parse(
+            "",
+            schema_request,
+            model_output_token_ids=encode_output(
+                "<|channel|>analysis<|message|>thinking<|end|>"
+                '<|start|>assistant<|channel|>final<|message|>{"answer": "sunny"}<|return|>'
+            ),
+        )
+
+        assert reasoning == "thinking"
+        assert content == '{"answer": "sunny"}'
+        assert tool_calls is None
+
+    def test_a_dropped_preamble_does_not_fall_back_to_content(self, harmony_parser, schema_request):
+        """Without a reasoning parser the narration has nowhere to go, and going
+        nowhere is the point -- it must not land back in `content`."""
+        harmony_parser.reasoning_parser = None
+
+        reasoning, content, tool_calls = harmony_parser.parse(
+            "",
+            schema_request,
+            model_output_token_ids=encode_output(PREAMBLE_THEN_CALL),
+        )
+
+        assert reasoning is None
+        assert content is None
         assert tool_call_tuples(tool_calls) == [("get_weather", json.dumps({"location": "SF"}))]
 
 
@@ -571,6 +633,50 @@ class TestParseDelta:
         assert delta.content == "I'll search for that"
         assert delta.reasoning is None
         assert not delta.tool_calls
+
+    def test_a_reply_schema_streams_the_preamble_as_reasoning(self, gpt_oss_tokenizer, schema_request):
+        """The same routing has to hold delta by delta, or the content stream
+        carries prose the non-streaming reply would have withheld."""
+        parser = HarmonyParser(gpt_oss_tokenizer)
+
+        preamble = parser.parse_delta(
+            delta_text="",
+            delta_token_ids=encode_output("<|channel|>commentary<|message|>Let me check the weather."),
+            request=schema_request,
+            finished=False,
+        )
+        call = parser.parse_delta(
+            delta_text="",
+            delta_token_ids=encode_output(
+                "<|end|><|start|>assistant to=functions.get_weather"
+                '<|channel|>commentary<|message|>{"location": "SF"}'
+            ),
+            request=schema_request,
+            finished=False,
+        )
+
+        assert preamble is not None
+        assert preamble.content is None
+        assert preamble.reasoning == "Let me check the weather."
+        assert not preamble.tool_calls
+
+        assert call is not None
+        assert call.content is None
+        assert tool_call_entries(call) == [(0, "get_weather", '{"location": "SF"}')]
+
+    def test_a_streamed_preamble_is_dropped_when_reasoning_is_not_wanted(self, gpt_oss_tokenizer, schema_request):
+        """Rerouted to reasoning and then suppressed is still not content."""
+        schema_request.include_reasoning = False
+        parser = HarmonyParser(gpt_oss_tokenizer)
+
+        delta = parser.parse_delta(
+            delta_text="",
+            delta_token_ids=encode_output("<|channel|>commentary<|message|>Let me check the weather."),
+            request=schema_request,
+            finished=False,
+        )
+
+        assert delta is None
 
     def test_multiple_choices(self, gpt_oss_tokenizer, chat_request):
         parser_a = HarmonyParser(gpt_oss_tokenizer)

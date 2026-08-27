@@ -132,6 +132,13 @@ _JSON_OPENERS = frozenset('{["-0123456789tfn')
 # inside that tag rather than beside it.
 _HARMONY_REPLY_CHANNEL = "<|channel|>final"
 
+# The reply channel ends on either `<|end|>` or `<|return|>`, and the tag is a
+# repeatable alternation: `<|end|>` closes the message and lets another follow.
+# Free text can be said twice harmlessly, but two documents that each satisfy a
+# schema do not satisfy it once joined, so a constrained reply keeps only the
+# terminator that ends the turn.
+_HARMONY_REPLY_TERMINATOR = "<|return|>"
+
 
 def merge_reply_schema(tag: StructuralTag, schema: dict[str, Any] | bool) -> StructuralTag | None:
     """Constrain the reply text of ``tag`` to ``schema``, leaving its tool calls
@@ -159,6 +166,8 @@ def _constrain_reply(fmt: Any, reply: JSONSchemaFormat) -> Any | None:
                 and isinstance(tag.content, AnyTextFormat)
             ):
                 tag.content = reply
+                if isinstance(tag.end, list) and _HARMONY_REPLY_TERMINATOR in tag.end:
+                    tag.end = [_HARMONY_REPLY_TERMINATOR]
                 replaced = True
         return fmt if replaced else None
 

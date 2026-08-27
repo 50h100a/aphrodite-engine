@@ -50,6 +50,7 @@ from openai.types.shared import Metadata, Reasoning
 from openai_harmony import Message as OpenAIHarmonyMessage
 from pydantic import (
     Field,
+    PrivateAttr,
     ValidationError,
     field_serializer,
     model_validator,
@@ -345,6 +346,14 @@ class ResponsesRequest(OpenAIBaseModel):
         "top_p": 1.0,
         "top_k": 0,
     }
+
+    # Both are set on this request by the parsers; see the matching pair on
+    # ChatCompletionRequest for what they mean.
+    _grammar_from_tool_parser: bool = PrivateAttr(default=False)
+    """CAUTION: Should only be set by ``ToolParser.adjust_request``."""
+
+    _reply_schema_in_tool_grammar: bool = PrivateAttr(default=False)
+    """CAUTION: Should only be set by ``DelegatingParser._apply_structural_tag``."""
 
     def extract_structured_outputs(self) -> StructuredOutputsParams | None:
         """Normalize request constraints into ``StructuredOutputsParams``."""
