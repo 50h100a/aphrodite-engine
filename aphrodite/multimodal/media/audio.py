@@ -214,6 +214,10 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray, float]]):
     error handling.
     """
 
+    # video/* is accepted as well as audio/*: `use_audio_in_video` pulls the
+    # audio track out of a video URL through this loader.
+    accepted_media_types = frozenset({"audio", "video"})
+
     def __init__(self, **kwargs) -> None:
         super().__init__()
 

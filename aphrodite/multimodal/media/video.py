@@ -25,6 +25,10 @@ class VideoMediaIO(MediaIO[tuple[npt.NDArray, dict[str, Any]]]):
     error handling.
     """
 
+    # "video/jpeg" (a sequence of JPEG frames) is handled by `load_base64`,
+    # so the whole video/* tree is in scope here.
+    accepted_media_types = frozenset({"video"})
+
     @classmethod
     def merge_kwargs(
         cls,

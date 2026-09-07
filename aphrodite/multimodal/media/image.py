@@ -27,6 +27,8 @@ class ImageMediaIO(MediaIO[Image.Image]):
     error handling.
     """
 
+    accepted_media_types = frozenset({"image"})
+
     def __init__(self, image_mode: str | None = "RGB", **kwargs) -> None:
         super().__init__()
 

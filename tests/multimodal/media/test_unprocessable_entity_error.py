@@ -295,7 +295,7 @@ class TestMessageHygiene:
             assert leak not in body, f"leaked {leak!r} in: {body}"
 
         # At most a statement plus a remedy, e.g.
-        # "Local file URLs are not accepted. Provide an http(s) or data: URL."
+        # "Local file URLs are not accepted."
         assert sentence.count(".") <= 2, f"too many sentences: {sentence!r}"
         assert len(sentence) < 120, f"too long for an API error: {sentence!r}"
 

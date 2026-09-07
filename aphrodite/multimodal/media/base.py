@@ -49,6 +49,12 @@ class MediaIO(ABC, Generic[_T]):
     error handling.
     """
 
+    # Top-level media types (the part before the "/") this loader accepts from
+    # a `data:` URL's declared type, e.g. {"image"} for a loader reached via
+    # `image_url`. `None` means "accept anything", for loaders reached only by
+    # paths that carry no declared type at all.
+    accepted_media_types: frozenset[str] | None = None
+
     @classmethod
     def merge_kwargs(
         cls,

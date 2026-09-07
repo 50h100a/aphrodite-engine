@@ -161,6 +161,45 @@ def _reject_url(reason: str, url: str, parameter: str) -> APHRODITEUnprocessable
     return APHRODITEUnprocessableEntityError(reason, parameter=parameter, value=url)
 
 
+# Declared types that say nothing about the payload. A caller that claims only
+# "some bytes" is not contradicting the field it used, and generic encoders
+# emit these routinely, so they are passed through to the decoder -- which
+# validates the bytes themselves regardless of what the URL claimed.
+_UNSPECIFIC_MEDIA_TYPES = frozenset({"", "application/octet-stream", "binary/octet-stream"})
+
+
+def _assert_media_type_matches(
+    media_type: str,
+    media_io: "MediaIO[Any]",
+    parameter: str,
+) -> None:
+    """Reject a `data:` URL whose declared type contradicts the field it came in on.
+
+    The decoders sniff the payload, so bad bytes are already caught downstream;
+    what is not caught is the label. Without this check `image_url` happily
+    accepts `data:audio/wav;...`, `data:text/html;...` or an outright
+    non-media-type string, as long as the bytes behind it decode as an image --
+    so the declared type never has to be true, and callers that route or audit
+    on it are reading a value the server never verified.
+    """
+    accepted = media_io.accepted_media_types
+    if accepted is None:
+        return
+
+    declared = media_type.split(";", 1)[0].strip().lower()
+    if declared in _UNSPECIFIC_MEDIA_TYPES:
+        return
+    if declared.split("/", 1)[0] in accepted:
+        return
+
+    expected = "/*, ".join(sorted(accepted)) + "/*"
+    raise APHRODITEUnprocessableEntityError(
+        f"Media URL declares media type {declared!r}, which is not valid for {parameter}; expected {expected}.",
+        parameter=parameter,
+        value=f"data:{declared[:64]};...",
+    )
+
+
 def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_unspecified or ip.is_multicast
 
@@ -443,6 +482,7 @@ class MediaConnector:
         self,
         url: str,
         media_io: MediaIO[_M],
+        parameter: str = "media_url",
     ) -> _M:  # type: ignore[type-var]
         # Format per RFC 2397:
         # data:[<mediatype>][;base64],<data>
@@ -453,12 +493,14 @@ class MediaConnector:
             media_type, data_type = data_spec.split(";", 1)
         except ValueError as exc:
             raise APHRODITEUnprocessableEntityError(
-                "Malformed data: URL.", parameter="media_url", value="data:..."
+                "Malformed data: URL.", parameter=parameter, value="data:..."
             ) from exc
 
         if data_type != "base64":
             msg = "Only base64 data URLs are supported for now."
             raise NotImplementedError(msg)
+
+        _assert_media_type_matches(media_type, media_io, parameter)
 
         return media_io.load_base64(media_type, data)
 
@@ -477,7 +519,7 @@ class MediaConnector:
                 url_spec.url,
             )
             raise APHRODITEUnprocessableEntityError(
-                "Local file URLs are not accepted. Provide an http(s) or data: URL.",
+                "Local file URLs are not accepted.",
                 parameter=parameter,
                 value=url_spec.url,
             )
@@ -551,7 +593,7 @@ class MediaConnector:
         _validate_media_url(url, parameter)
 
         if url[:5].lower() == "data:":
-            return self._load_data_url(url, media_io)
+            return self._load_data_url(url, media_io, parameter)
 
         url_spec = parse_url(url)
         scheme = (url_spec.scheme or "").lower()
@@ -612,7 +654,9 @@ class MediaConnector:
         await loop.run_in_executor(global_thread_pool, _validate_media_url, url, parameter)
 
         if url[:5].lower() == "data:":
-            future: asyncio.Future[_M] = loop.run_in_executor(global_thread_pool, self._load_data_url, url, media_io)
+            future: asyncio.Future[_M] = loop.run_in_executor(
+                global_thread_pool, self._load_data_url, url, media_io, parameter
+            )
             return await future
 
         url_spec = parse_url(url)
