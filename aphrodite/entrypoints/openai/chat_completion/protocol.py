@@ -581,6 +581,21 @@ class ChatCompletionRequest(OpenAIBaseModel):
     _grammar_from_tool_parser: bool = PrivateAttr(default=False)
     """CAUTION: Should only be set by ``ToolParser.adjust_request``."""
 
+    _tool_exclusion_grammar: bool = PrivateAttr(default=False)
+    """Whether the grammar is the one that forbids tool calls under `"none"`.
+
+    It spans the whole reply, reasoning included, so like the structural tag it
+    must not wait for a reasoning end marker -- a model that skips reasoning
+    emits none, and the constraint would never take effect.
+
+    Kept apart from `_grammar_from_tool_parser` because that flag also tells
+    the Mistral parser to stop using its named/required paths, which has
+    nothing to do with this one.
+
+    CAUTION: Should only be set by
+    ``DelegatingParser._suppress_tool_calls_when_none``.
+    """
+
     _reply_schema_in_tool_grammar: bool = PrivateAttr(default=False)
     """Whether the tool grammar carries the caller's reply schema.
 

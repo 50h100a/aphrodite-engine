@@ -335,11 +335,14 @@ class OpenAIServingChat(GenerateBaseServing):
             else:
                 if not request.include_reasoning:
                     reasoning_ended = True
-                elif request._grammar_from_tool_parser:
+                elif request._grammar_from_tool_parser or request._tool_exclusion_grammar:
                     # A grammar the tool parser built already covers the
                     # reasoning segment -- Mistral with its optional `think?`
                     # rule, Harmony with its analysis channel -- so there is
-                    # nothing to hold the bitmask back for.
+                    # nothing to hold the bitmask back for. The same goes for
+                    # the `tool_choice="none"` exclusion grammar, which permits
+                    # everything but a tool call and so constrains reasoning
+                    # only in the one way it must.
                     reasoning_ended = True
                 elif parser is not None and parser.reasoning_parser is not None:
                     reasoning_ended = parser.is_reasoning_end(prompt_token_ids or [])

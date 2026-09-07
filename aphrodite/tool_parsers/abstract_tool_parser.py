@@ -241,7 +241,19 @@ class ToolParser:
 
     @property
     def tool_call_entry_markers(self) -> tuple[str, ...]:
-        """Literal strings whose appearance begins a tool call."""
+        """Literal strings whose appearance begins a tool call.
+
+        Read under `tool_choice="none"` to build the grammar that makes a call
+        undecodable, so this is the parser's own account of its syntax being
+        turned against it: a parser that calls a broad string its start token
+        will refuse that broad string in prose too. The default takes
+        `tool_call_start_token` where a subclass defines one; parsers with no
+        single entry string, or none they can name, leave generation
+        unconstrained and fall back to discarding the call after the fact.
+        """
+        start = getattr(self, "tool_call_start_token", None)
+        if isinstance(start, str) and start:
+            return (start,)
         return ()
 
     def get_structural_tag(

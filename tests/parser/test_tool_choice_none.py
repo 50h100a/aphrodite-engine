@@ -4,10 +4,10 @@
 """`tool_choice="none"` must yield a normal text reply.
 
 "none" forbids *calling* a tool; it does not hide the tools, which stay in
-the prompt exactly as OpenAI renders them. Two things follow:
-
-1. The model must be unable to emit tool-call syntax at all.
-2. If it emits one anyway, the reply must not come back empty.
+the prompt exactly as OpenAI renders them. So the model is told the call
+syntax and told nothing against using it, and the constraint has to come from
+decoding: a tool call must be unrepresentable, not merely discarded after the
+fact.
 
 Regression: with engine-backed parsers (qwen3, qwen3_coder, ...) a model
 that answered with only a tool call produced whitespace-only content and no
@@ -23,6 +23,23 @@ from aphrodite.parser.engine.registered_adapters import (
     Qwen3ParserToolAdapter,
 )
 from aphrodite.parser.qwen3 import qwen3_config
+from aphrodite.parser.tool_call_exclusion import exclusion_grammar
+from aphrodite.reasoning.basic_parsers import BaseThinkingReasoningParser
+from aphrodite.sampling_params import StructuredOutputsParams
+from aphrodite.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
+
+
+class ThinkReasoningParser(BaseThinkingReasoningParser):
+    """As `test_streaming.py` builds it: the non-engine reasoning path."""
+
+    @property
+    def start_token(self) -> str:
+        return "<think>"
+
+    @property
+    def end_token(self) -> str:
+        return "</think>"
+
 
 TOOLS = [
     {
@@ -68,12 +85,13 @@ def make_engine_parser(tokenizer):
     return parser
 
 
-def make_request(tool_choice):
+def make_request(tool_choice, **kwargs):
     return ChatCompletionRequest(
         model="test-model",
         messages=[{"role": "user", "content": "how many?"}],
         tools=TOOLS,
         tool_choice=tool_choice,
+        **kwargs,
     )
 
 
@@ -99,21 +117,59 @@ class TestEntryMarkerDerivation:
         assert "<tool_call>" in parser._tool_parser.tool_call_entry_markers
 
 
-class TestSuppression:
-    """Layer 1: a tool call is made unrepresentable, not merely unwanted."""
+class TestExclusionGrammar:
+    """The constraint is a grammar over decoded text, so it binds whatever
+    token sequence the model reaches for."""
 
-    def test_none_suppresses_entry_markers(self, tokenizer):
+    def test_none_installs_the_grammar(self, tokenizer):
+        parser = make_engine_parser(tokenizer)
+
+        request = parser.adjust_request(make_request("none"))
+
+        assert request._tool_exclusion_grammar is True
+        assert request.structured_outputs.grammar is not None
+
+    def test_grammar_excludes_every_entry_marker(self, tokenizer):
+        parser = make_engine_parser(tokenizer)
+
+        request = parser.adjust_request(make_request("none"))
+
+        assert request.structured_outputs.grammar == exclusion_grammar(["<tool_call>", "<function="])
+
+    def test_grammar_preferred_over_token_ban(self, tokenizer):
+        """`bad_words` is the fallback, and a fallback that also fires would
+        ban token ids the grammar allows in prose."""
+        parser = make_engine_parser(tokenizer)
+
+        request = parser.adjust_request(make_request("none"))
+
+        assert request.bad_words == []
+
+    def test_reasoning_is_not_waited_for(self, tokenizer):
+        """The grammar spans the whole reply. A model that skips reasoning
+        emits no end marker, and a constraint withheld until one arrives never
+        applies to the requests it was built for."""
+        parser = make_engine_parser(tokenizer)
+
+        request = parser.adjust_request(make_request("none"))
+
+        assert request._tool_exclusion_grammar is True
+
+    def test_grammar_reaches_sampling_params(self, tokenizer):
         parser = make_engine_parser(tokenizer)
         request = parser.adjust_request(make_request("none"))
 
-        assert "<tool_call>" in request.bad_words
-        assert "<function=" in request.bad_words
+        params = request.to_sampling_params(max_tokens=64, default_sampling_params={})
+
+        assert params.structured_outputs.grammar is not None
 
     @pytest.mark.parametrize("tool_choice", ["auto", "required"])
     def test_other_choices_unconstrained(self, tokenizer, tool_choice):
         parser = make_engine_parser(tokenizer)
+
         request = parser.adjust_request(make_request(tool_choice))
 
+        assert request._tool_exclusion_grammar is False
         assert request.bad_words == []
 
     def test_no_tools_unconstrained(self, tokenizer):
@@ -124,34 +180,177 @@ class TestSuppression:
             messages=[{"role": "user", "content": "hi"}],
         )
 
-        assert parser.adjust_request(request).bad_words == []
+        adjusted = parser.adjust_request(request)
 
-    def test_caller_bad_words_preserved(self, tokenizer):
+        assert adjusted._tool_exclusion_grammar is False
+        assert adjusted.structured_outputs is None
+
+    def test_idempotent(self, tokenizer):
         parser = make_engine_parser(tokenizer)
-        request = make_request("none")
-        request.bad_words = ["banana"]
+
+        request = parser.adjust_request(parser.adjust_request(make_request("none")))
+
+        assert request.structured_outputs.grammar == exclusion_grammar(["<tool_call>", "<function="])
+        assert request.bad_words == []
+
+
+class TestDecodingIsActuallyConstrained:
+    """The grammar is only worth anything if the decoder masks on it. Compile
+    it as the xgrammar backend does and read the masks."""
+
+    @pytest.fixture(scope="class")
+    def masks(self, tokenizer):
+        xgr = pytest.importorskip("xgrammar")
+
+        class P(DelegatingParser):
+            reasoning_parser_cls = Qwen3ParserReasoningAdapter
+            tool_parser_cls = Qwen3ParserToolAdapter
+
+        request = P(tokenizer, tools=TOOLS).adjust_request(make_request("none"))
+        size = tokenizer.max_token_id + 1
+        info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=size)
+        ctx = xgr.GrammarCompiler(info).compile_grammar(request.structured_outputs.grammar)
+        bitmask = xgr.allocate_token_bitmask(1, size)
+
+        def blocked_at(text):
+            """Index of the first token the grammar refuses, or None."""
+            matcher = xgr.GrammarMatcher(ctx)
+            for position, token in enumerate(tokenizer.encode(text, add_special_tokens=False)):
+                matcher.fill_next_token_bitmask(bitmask, 0)
+                word = bitmask[0].tolist()[token >> 5]
+                if not (word >> (token & 31)) & 1:
+                    return position
+                matcher.accept_token(token)
+            return None
+
+        return blocked_at
+
+    @pytest.mark.parametrize("marker", ["<tool_call>", "<function="])
+    def test_markers_are_blocked(self, masks, marker):
+        assert masks(marker) is not None
+
+    def test_blocked_even_though_the_marker_is_one_token(self, masks, tokenizer):
+        """`<tool_call>` is a single id here, so the ban and the grammar agree.
+        The point of the test is the other case, below."""
+        assert len(tokenizer.encode("<tool_call>", add_special_tokens=False)) == 1
+        assert masks("<tool_call>") == 0
+
+    def test_multi_token_marker_blocked_at_its_last_character(self, masks):
+        """`<function=` spells out over several tokens and has more than one
+        spelling. The grammar denies the character that completes it, whichever
+        tokens got there -- which is what a token-id ban cannot promise."""
+        assert masks("<function=") == 2
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "</think>",
+            "<|im_end|>",
+            "There are 3 orange circles.",
+            "<div>",
+            "<tool_",
+            "Call it with <function and see",
+        ],
+    )
+    def test_everything_else_is_allowed(self, masks, text):
+        """Only the completing character is denied. Reasoning still closes,
+        generation still stops, and prose that merely resembles a call is
+        untouched."""
+        assert masks(text) is None
+
+
+class TestNonEngineParsersToo:
+    """The constraint is not a property of the engine-backed path.
+
+    Hermes goes the other way when a call slips through -- it hands the raw
+    `<tool_call>` text back as content, which
+    `test_streaming.py::test_parse_delta_tool_choice_none` asserts. That is a
+    description of a violation, not of correct behaviour, and the grammar is
+    what stops the violation happening.
+    """
+
+    def make_hermes_parser(self, tokenizer):
+        class TestParser(DelegatingParser):
+            reasoning_parser_cls = ThinkReasoningParser
+            tool_parser_cls = Hermes2ProToolParser
+
+        parser = TestParser(tokenizer, tools=TOOLS)
+        assert not parser._engine_based, "fixture must exercise the non-engine path"
+        return parser
+
+    def test_marker_taken_from_the_parsers_start_token(self, tokenizer):
+        parser = self.make_hermes_parser(tokenizer)
+
+        assert parser._tool_parser.tool_call_entry_markers == ("<tool_call>",)
+
+    def test_none_installs_the_grammar(self, tokenizer):
+        parser = self.make_hermes_parser(tokenizer)
+
+        request = parser.adjust_request(make_request("none"))
+
+        assert request.structured_outputs.grammar == exclusion_grammar(["<tool_call>"])
+
+
+class TestFallbackToTokenBan:
+    """A request decodes under one structured-output constraint. When the
+    caller has spent it, the weaker ban stands in rather than nothing."""
+
+    def test_response_format_keeps_its_slot(self, tokenizer):
+        parser = make_engine_parser(tokenizer)
+        request = make_request(
+            "none",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "reply",
+                    "schema": {"type": "object", "properties": {"n": {"type": "integer"}}},
+                },
+            },
+        )
 
         adjusted = parser.adjust_request(request)
 
-        assert "banana" in adjusted.bad_words
+        assert adjusted.structured_outputs is None
+        assert adjusted.response_format is not None
         assert "<tool_call>" in adjusted.bad_words
 
-    def test_suppression_is_idempotent(self, tokenizer):
+    def test_caller_structured_outputs_kept(self, tokenizer):
         parser = make_engine_parser(tokenizer)
-        request = parser.adjust_request(make_request("none"))
-        request = parser.adjust_request(request)
+        request = make_request("none")
+        request.structured_outputs = StructuredOutputsParams(regex=r"\d+")
 
-        assert request.bad_words.count("<tool_call>") == 1
+        adjusted = parser.adjust_request(request)
+
+        assert adjusted.structured_outputs.regex == r"\d+"
+        assert adjusted.structured_outputs.grammar is None
+        assert "<tool_call>" in adjusted.bad_words
+
+    def test_plain_text_response_format_does_not_take_the_slot(self, tokenizer):
+        """`"text"` is the absence of a constraint, not a constraint."""
+        parser = make_engine_parser(tokenizer)
+        request = make_request("none", response_format={"type": "text"})
+
+        adjusted = parser.adjust_request(request)
+
+        assert adjusted.structured_outputs.grammar is not None
+
+    def test_caller_bad_words_preserved(self, tokenizer):
+        parser = make_engine_parser(tokenizer)
+        request = make_request("none", bad_words=["banana"], response_format={"type": "json_object"})
+
+        adjusted = parser.adjust_request(request)
+
+        assert adjusted.bad_words == ["banana", "<tool_call>", "<function="]
 
 
 class TestReplyNeverEmpty:
-    """Emptiness is prevented upstream, by suppression, not by re-surfacing
+    """Emptiness is prevented upstream, by the grammar, not by re-surfacing
     the discarded call.
 
     Handing the raw text back would leak tool-call terminals into content,
     which `test_delegating_replay.py::test_delegating_parse_tool_choice_none`
     forbids -- for several parsers those terminals are real special tokens.
-    So the guarantee is: with suppression in force the model cannot produce a
+    So the guarantee is: with the grammar in force the model cannot produce a
     tool-call-only reply in the first place.
     """
 
@@ -166,15 +365,15 @@ class TestReplyNeverEmpty:
         assert tool_calls == []
         assert final is None or "<tool_call>" not in final
 
-    def test_suppression_prevents_the_empty_reply(self, tokenizer):
-        """The end-to-end guarantee: the tokens that would produce a
-        tool-call-only reply are blocked before generation."""
+    def test_the_empty_reply_is_prevented_not_repaired(self, tokenizer):
+        """The end-to-end guarantee: the reply that came back as whitespace is
+        one the decoder can no longer produce."""
         parser = make_engine_parser(tokenizer)
         request = parser.adjust_request(make_request("none"))
 
-        sampling_params = request.to_sampling_params(max_tokens=64, default_sampling_params={})
+        params = request.to_sampling_params(max_tokens=64, default_sampling_params={})
 
-        assert "<tool_call>" in sampling_params.bad_words
+        assert params.structured_outputs.grammar == exclusion_grammar(["<tool_call>", "<function="])
 
     def test_plain_text_reply_unaffected(self, tokenizer):
         parser = make_engine_parser(tokenizer)

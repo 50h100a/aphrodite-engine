@@ -28,6 +28,7 @@ from aphrodite.entrypoints.openai.engine.protocol import (
 from aphrodite.entrypoints.openai.responses.protocol import ResponsesRequest
 from aphrodite.logger import init_logger
 from aphrodite.parser.metrics import record_tool_parser_invocation
+from aphrodite.parser.tool_call_exclusion import exclusion_grammar
 from aphrodite.parser.utils import count_history_tool_calls
 from aphrodite.reasoning.abs_reasoning_parsers import ReasoningParser
 from aphrodite.sampling_params import StructuredOutputsParams
@@ -46,6 +47,25 @@ from aphrodite.tool_parsers.streaming import (
 )
 
 logger = init_logger(__name__)
+
+
+def _has_reply_constraint(request: "ChatCompletionRequest | ResponsesRequest") -> bool:
+    """Whether the caller already asked for the reply to take a given shape.
+
+    A request decodes under one structured-output constraint, so this is the
+    question of whether the slot is free. `"text"` is the absence of a request,
+    not a request for free text, and does not occupy it.
+    """
+    structured_outputs = getattr(request, "structured_outputs", None)
+    if structured_outputs is not None and not structured_outputs.all_constraints_none():
+        return True
+
+    if isinstance(request, ResponsesRequest):
+        # `text.format` occupies the slot even when it says `"text"`:
+        # `extract_structured_outputs` refuses the pair outright rather than
+        # reading the format to see whether it constrains anything.
+        return getattr(request.text, "format", None) is not None
+    return getattr(request.response_format, "type", None) not in (None, "text")
 
 
 @dataclass
@@ -419,6 +439,18 @@ class DelegatingParser(Parser):
             return [], content
 
         if request.tool_choice == "none":
+            # Recovery, not the mechanism. `_suppress_tool_calls_when_none`
+            # has already made the entry markers undecodable, so for any
+            # parser that can name them this branch sees no tool call to drop.
+            # It still has to be right for the ones that cannot: engine-backed
+            # parsers produce content only by running the pipeline, so the
+            # syntax is consumed on the way through and the parsed calls are
+            # then discarded. Handing the raw text back instead is not an
+            # option -- for several parsers the markers are real special
+            # tokens (DeepSeek's `<|DSML|...`) and leaking those into content
+            # is forbidden by
+            # tests/parser/engine/test_delegating_replay.py
+            # ::test_delegating_parse_tool_choice_none.
             if self._engine_based:
                 result = self.extract_tool_calls(content or "", request=request)
                 return [], result.content
@@ -522,6 +554,12 @@ class DelegatingParser(Parser):
 
         Suppressing the entry markers makes the call unrepresentable rather
         than merely unwanted, so the model spends its turn answering.
+
+        A grammar does that properly: it constrains the decoded *text*, so it
+        holds for every tokenisation of a marker and denies only the character
+        that would complete one. Where the caller has already spent the
+        request's one structured-output slot on a shape of their own, there is
+        no grammar to be had and a token-level ban stands in.
         """
         if request.tool_choice != "none" or not request.tools:
             return request
@@ -530,12 +568,58 @@ class DelegatingParser(Parser):
         if tool_parser is None:
             return request
 
+        # Parsers that cannot describe their entry syntax go unconstrained.
         markers = tool_parser.tool_call_entry_markers
-        # Parsers that cannot describe their entry syntax, and request types
-        # with no bad_words support, simply go unconstrained.
-        if not markers or not hasattr(request, "bad_words"):
+        if not markers:
             return request
 
+        if self._exclude_tool_calls_grammatically(request, markers):
+            return request
+        return self._ban_tool_call_markers(request, markers)
+
+    def _exclude_tool_calls_grammatically(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+        markers: Sequence[str],
+    ) -> bool:
+        """Constrain decoding to replies that contain no tool call.
+
+        Returns False when the request already carries a constraint. A request
+        decodes under exactly one, and the caller's own is the one that has to
+        be honoured -- so the ban is the fallback, not a second grammar.
+        """
+        if request._tool_exclusion_grammar:
+            # Already ours from an earlier pass; re-reading it as a caller
+            # constraint would fall through to the ban and add a second,
+            # weaker constraint on top of a sufficient one.
+            return True
+        if _has_reply_constraint(request):
+            return False
+
+        grammar = exclusion_grammar(markers)
+        if grammar is None:
+            return False
+
+        request.structured_outputs = StructuredOutputsParams(  # type: ignore[call-arg]
+            grammar=grammar,
+        )
+        request._tool_exclusion_grammar = True
+        return True
+
+    def _ban_tool_call_markers(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+        markers: Sequence[str],
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        """Ban the markers by token id, for requests a grammar cannot cover.
+
+        Weaker than the grammar and known to be: `bad_words` resolves each
+        marker to the token sequences that spell it, so a spelling it did not
+        anticipate is not banned. It is still worth doing -- a marker that is
+        one token, which is the common case, has only one spelling.
+        """
+        if not hasattr(request, "bad_words"):
+            return request
         bad_words = list(request.bad_words or [])
         bad_words.extend(m for m in markers if m not in bad_words)
         request.bad_words = bad_words
@@ -724,7 +808,9 @@ class DelegatingParser(Parser):
             if self._engine_based:
                 # Engine-backed parsers route content extraction through
                 # extract_tool_calls_streaming, so run the full pipeline
-                # and strip tool_calls after.
+                # and strip tool_calls after. Same standing as the
+                # non-streaming twin above: recovery for a generation the
+                # exclusion grammar should already have made impossible.
                 delta_message = self.extract_tool_calls_streaming(
                     previous_text,
                     current_text,

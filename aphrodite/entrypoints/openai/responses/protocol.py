@@ -347,10 +347,14 @@ class ResponsesRequest(OpenAIBaseModel):
         "top_k": 0,
     }
 
-    # Both are set on this request by the parsers; see the matching pair on
-    # ChatCompletionRequest for what they mean.
+    # All three are set on this request by the parsers; see the matching group
+    # on ChatCompletionRequest for what they mean.
     _grammar_from_tool_parser: bool = PrivateAttr(default=False)
     """CAUTION: Should only be set by ``ToolParser.adjust_request``."""
+
+    _tool_exclusion_grammar: bool = PrivateAttr(default=False)
+    """CAUTION: Should only be set by
+    ``DelegatingParser._suppress_tool_calls_when_none``."""
 
     _reply_schema_in_tool_grammar: bool = PrivateAttr(default=False)
     """CAUTION: Should only be set by ``DelegatingParser._apply_structural_tag``."""
