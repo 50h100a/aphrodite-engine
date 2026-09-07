@@ -422,11 +422,6 @@ class OpenAIServingChat(GenerateBaseServing):
         num_cache_creation_tokens = None
         tools_streamed = [False] * num_choices
 
-        if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam):
-            tool_choice_function_name = request.tool_choice.function.name
-        else:
-            tool_choice_function_name = None
-
         previous_texts = [""] * num_choices
         # Logprobs awaiting release, as (entry, decoded char length), paired
         # with the number of chars of raw output text already accounted for by
@@ -724,11 +719,10 @@ class OpenAIServingChat(GenerateBaseServing):
                         self._raise_if_error(output.finish_reason, request_id)
 
                         # Send the finish response for each request.n only once
-                        # In OpenAI's API, when a tool is called, the
-                        # finish_reason is "tool_calls" for "auto" or "required"
-                        # tool calls, and "stop" for named tool calls.
-                        # But "length" outranks both.
-                        if tools_streamed[i] and not tool_choice_function_name and output.finish_reason != "length":
+                        # A reply that streamed tool calls finishes with
+                        # "tool_calls", whichever tool_choice produced it -- a
+                        # named choice included. But "length" outranks it.
+                        if tools_streamed[i] and output.finish_reason != "length":
                             finish_reason_ = "tool_calls"
                         else:
                             finish_reason_ = output.finish_reason if output.finish_reason else "stop"
@@ -998,11 +992,13 @@ class OpenAIServingChat(GenerateBaseServing):
                     "completion."
                 )
                 message = ChatMessage(role=role, reasoning=reasoning, content=content)
-            # In OpenAI's API, when a tool is called, the finish_reason is:
-            # "tool_calls" for "auto" or "required" tool calls,
-            # and "stop" for named tool calls. "length" outranks both.
+            # A reply that carries tool calls finishes with "tool_calls",
+            # whichever tool_choice produced it -- a named choice included,
+            # since the caller still has to run the call and come back.
+            # "length" outranks it: a truncated reply is truncated first.
             is_finish_reason_tool_calls = output.finish_reason != "length" and (
                 auto_tools_called
+                or bool(message.tool_calls)
                 or (request.tool_choice and request.tool_choice == "required" and output.finish_reason == "stop")
             )
 
