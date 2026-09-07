@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import errno
 import functools
+import socket
 import time
 from collections.abc import Callable, Coroutine, Mapping, MutableMapping
 from pathlib import Path
@@ -21,10 +23,66 @@ logger = init_logger(__name__)
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
 
-# Multiplier applied to timeout and sleep on each retry attempt.
-# Attempt N uses: base_timeout * (_RETRY_BACKOFF_FACTOR ** N) for the
-# per-attempt timeout and sleeps _RETRY_BACKOFF_FACTOR ** N seconds.
+# Multiplier applied to the sleep between retry attempts: attempt N sleeps
+# _RETRY_BACKOFF_FACTOR ** N seconds. The per-attempt timeout does NOT grow --
+# it is bounded by whatever remains of the caller's total deadline.
 _RETRY_BACKOFF_FACTOR = 4
+
+# Don't start another attempt if less than this much budget remains; the
+# attempt would time out almost immediately and only add noise.
+_MIN_ATTEMPT_BUDGET = 0.5
+
+# OS-level errors that mean "this address will not answer" rather than
+# "something transient went wrong".
+_FATAL_CONNECT_ERRNOS = frozenset(
+    {
+        errno.ECONNREFUSED,
+        errno.EHOSTUNREACH,
+        errno.ENETUNREACH,
+        errno.EADDRNOTAVAIL,
+    }
+)
+
+
+def _is_permanent_connect_failure(exc: BaseException) -> bool:
+    """Return True for connection failures that retrying cannot fix.
+
+    A refused connection, an unroutable host or an unresolvable name will
+    fail identically on the next attempt, so retrying only burns the
+    caller's deadline.
+    """
+    # Name resolution failed.
+    if isinstance(exc, socket.gaierror):
+        return True
+    if isinstance(exc, aiohttp.ClientConnectorDNSError):
+        return True
+
+    if isinstance(exc, aiohttp.ClientConnectorError):
+        os_error = getattr(exc, "os_error", None)
+        if isinstance(os_error, ConnectionRefusedError):
+            return True
+        for candidate in (os_error, exc):
+            candidate_errno = getattr(candidate, "errno", None)
+            if candidate_errno in _FATAL_CONNECT_ERRNOS:
+                return True
+        return False
+
+    if isinstance(exc, ConnectionRefusedError):
+        return True
+
+    # requests wraps the underlying urllib3/socket error; walk the cause chain.
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        cause: BaseException | None = exc
+        seen = 0
+        while cause is not None and seen < 10:
+            if isinstance(cause, (socket.gaierror, ConnectionRefusedError)):
+                return True
+            if getattr(cause, "errno", None) in _FATAL_CONNECT_ERRNOS:
+                return True
+            cause = cause.__cause__ or cause.__context__
+            seen += 1
+
+    return False
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -32,12 +90,16 @@ def _is_retryable(exc: Exception) -> bool:
 
     Retryable:
       - Timeouts (aiohttp, requests, stdlib)
-      - Connection-level failures (refused, reset, DNS)
+      - Transient connection-level failures (reset, server disconnect)
       - Server errors (5xx) -- includes S3 503 SlowDown
     Not retryable:
       - Client errors (4xx) -- bad URL, auth, not-found
+      - Permanent connection failures -- refused, unroutable, DNS NXDOMAIN
       - Programming errors (ValueError, TypeError, ...)
     """
+    # Deterministic connection failures: retrying cannot change the outcome.
+    if _is_permanent_connect_failure(exc):
+        return False
     # Timeouts
     if isinstance(
         exc,
@@ -69,6 +131,24 @@ def _is_retryable(exc: Exception) -> bool:
     return isinstance(exc, aiohttp.ClientResponseError) and exc.status >= 500
 
 
+def _attempt_timeout(base_timeout: float | None, remaining: float | None) -> float | None:
+    """Per-attempt timeout: the base timeout, clamped to the budget left.
+
+    Unlike the previous behaviour, this never grows across attempts -- a
+    host that was too slow at N seconds does not get 4N on the next try.
+    """
+    if remaining is None:
+        return base_timeout
+    if base_timeout is None:
+        return max(remaining, 0.0)
+    return max(min(base_timeout, remaining), 0.0)
+
+
+def _request_url(args: tuple, kwargs: dict) -> Any:
+    # args[0] is `self` (bound method), args[1] is the URL
+    return args[1] if len(args) > 1 else kwargs.get("url")
+
+
 def _log_retry(
     args: tuple,
     kwargs: dict,
@@ -77,63 +157,88 @@ def _log_retry(
     attempt_timeout: float | None,
     exc: Exception,
     backoff: float,
-    base_timeout: float | None,
+    remaining: float | None,
 ) -> None:
-    # args[0] is `self` (bound method), args[1] is the URL
-    url = args[1] if len(args) > 1 else kwargs.get("url")
-    timeout_info = f"timeout={attempt_timeout:.3f}s" if base_timeout is not None else "no timeout"
-    next_timeout = (
-        f" with timeout={base_timeout * (_RETRY_BACKOFF_FACTOR ** (attempt + 1)):.3f}s"
-        if base_timeout is not None
-        else ""
-    )
-    logger.warning(
+    """Per-attempt retry detail.
+
+    Logged at DEBUG: a caller-supplied bad URL should not put one WARN line
+    per attempt in the server log. The single WARN comes from
+    :func:`_log_give_up` once the fetch has actually failed.
+    """
+    timeout_info = f"timeout={attempt_timeout:.3f}s" if attempt_timeout is not None else "no timeout"
+    budget_info = f", {remaining:.3f}s budget left" if remaining is not None else ""
+    logger.debug(
         "HTTP fetch failed for %s (attempt %d/%d, %s): %s -- retrying in %.3fs%s",
-        url,
+        _request_url(args, kwargs),
         attempt + 1,
         max_retries,
         timeout_info,
         exc,
         backoff,
-        next_timeout,
+        budget_info,
+    )
+
+
+def _log_give_up(
+    args: tuple,
+    kwargs: dict,
+    attempts: int,
+    exc: Exception,
+    elapsed: float,
+) -> None:
+    """One WARN line per failed fetch, with the detail an operator needs."""
+    logger.warning(
+        "HTTP fetch failed for %s after %d attempt(s) in %.3fs: %s: %s",
+        _request_url(args, kwargs),
+        attempts,
+        elapsed,
+        type(exc).__name__,
+        exc,
     )
 
 
 def _sync_retry(
     fn: Callable[_P, _T],
 ) -> Callable[_P, _T]:
-    """Add retry logic with exponential backoff to a sync method.
+    """Add bounded retry logic to a sync method.
 
-    The decorated method must accept ``timeout`` as a keyword argument.
-    The decorator replaces it with a per-attempt timeout that grows by
-    ``_RETRY_BACKOFF_FACTOR`` on each retry so transient slowness on busy
-    hosts is absorbed.
+    The decorated method must accept ``timeout`` as a keyword argument, and
+    may be given a ``deadline`` keyword: a total wall-clock budget covering
+    every attempt and the sleeps between them. The per-attempt timeout never
+    exceeds ``timeout`` or whatever remains of that budget, whichever is
+    smaller, so a slow or hanging host cannot stall a request indefinitely.
     """
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> _T:
         base_timeout: float | None = kwargs.get("timeout")
+        deadline: float | None = kwargs.pop("deadline", None)
         max_retries = max(envs.APHRODITE_MEDIA_FETCH_MAX_RETRIES, 1)
+        started = time.monotonic()
+
+        def remaining() -> float | None:
+            if deadline is None:
+                return None
+            return deadline - (time.monotonic() - started)
 
         for attempt in range(max_retries):
-            attempt_timeout = base_timeout * (_RETRY_BACKOFF_FACTOR**attempt) if base_timeout is not None else None
-            kwargs["timeout"] = attempt_timeout
+            kwargs["timeout"] = _attempt_timeout(base_timeout, remaining())
             try:
                 return fn(*args, **kwargs)
             except Exception as e:
-                if not _is_retryable(e) or attempt + 1 >= max_retries:
+                attempts = attempt + 1
+                left = remaining()
+                if (
+                    not _is_retryable(e)
+                    or attempts >= max_retries
+                    or (left is not None and left <= _MIN_ATTEMPT_BUDGET)
+                ):
+                    _log_give_up(args, kwargs, attempts, e, time.monotonic() - started)
                     raise
                 backoff = _RETRY_BACKOFF_FACTOR**attempt
-                _log_retry(
-                    args,
-                    kwargs,
-                    attempt,
-                    max_retries,
-                    attempt_timeout,
-                    e,
-                    backoff,
-                    base_timeout,
-                )
+                if left is not None:
+                    backoff = min(backoff, max(0.0, left - _MIN_ATTEMPT_BUDGET))
+                _log_retry(args, kwargs, attempt, max_retries, kwargs["timeout"], e, backoff, left)
                 time.sleep(backoff)
 
         raise AssertionError("unreachable")
@@ -144,38 +249,45 @@ def _sync_retry(
 def _async_retry(
     fn: Callable[_P, Coroutine[Any, Any, _T]],
 ) -> Callable[_P, Coroutine[Any, Any, _T]]:
-    """Add retry logic with exponential backoff to an async method.
+    """Add bounded retry logic to an async method.
 
-    The decorated method must accept ``timeout`` as a keyword argument.
-    The decorator replaces it with a per-attempt timeout that grows by
-    ``_RETRY_BACKOFF_FACTOR`` on each retry so transient slowness on busy
-    hosts is absorbed.
+    The decorated method must accept ``timeout`` as a keyword argument, and
+    may be given a ``deadline`` keyword: a total wall-clock budget covering
+    every attempt and the sleeps between them. The per-attempt timeout never
+    exceeds ``timeout`` or whatever remains of that budget, whichever is
+    smaller, so a slow or hanging host cannot stall a request indefinitely.
     """
 
     @functools.wraps(fn)
     async def wrapper(*args: Any, **kwargs: Any) -> _T:
         base_timeout: float | None = kwargs.get("timeout")
+        deadline: float | None = kwargs.pop("deadline", None)
         max_retries = max(envs.APHRODITE_MEDIA_FETCH_MAX_RETRIES, 1)
+        started = time.monotonic()
+
+        def remaining() -> float | None:
+            if deadline is None:
+                return None
+            return deadline - (time.monotonic() - started)
 
         for attempt in range(max_retries):
-            attempt_timeout = base_timeout * (_RETRY_BACKOFF_FACTOR**attempt) if base_timeout is not None else None
-            kwargs["timeout"] = attempt_timeout
+            kwargs["timeout"] = _attempt_timeout(base_timeout, remaining())
             try:
                 return await fn(*args, **kwargs)
             except Exception as e:
-                if not _is_retryable(e) or attempt + 1 >= max_retries:
+                attempts = attempt + 1
+                left = remaining()
+                if (
+                    not _is_retryable(e)
+                    or attempts >= max_retries
+                    or (left is not None and left <= _MIN_ATTEMPT_BUDGET)
+                ):
+                    _log_give_up(args, kwargs, attempts, e, time.monotonic() - started)
                     raise
                 backoff = _RETRY_BACKOFF_FACTOR**attempt
-                _log_retry(
-                    args,
-                    kwargs,
-                    attempt,
-                    max_retries,
-                    attempt_timeout,
-                    e,
-                    backoff,
-                    base_timeout,
-                )
+                if left is not None:
+                    backoff = min(backoff, max(0.0, left - _MIN_ATTEMPT_BUDGET))
+                _log_retry(args, kwargs, attempt, max_retries, kwargs["timeout"], e, backoff, left)
                 await asyncio.sleep(backoff)
 
         raise AssertionError("unreachable")
@@ -259,10 +371,25 @@ class HTTPConnection:
             allow_redirects=allow_redirects,
         )
 
+    # NOTE: `deadline` on the two methods below is consumed by the retry
+    # decorator, which uses it to bound the total time across all attempts;
+    # the method bodies never see it. `validate_final_url`, when given, is
+    # called with the URL actually served -- after any redirects -- so the
+    # caller can re-apply host policy that the initial URL check performed.
     @_sync_retry
-    def get_bytes(self, url: str, *, timeout: float | None = None, allow_redirects: bool = True) -> bytes:
+    def get_bytes(
+        self,
+        url: str,
+        *,
+        timeout: float | None = None,
+        deadline: float | None = None,
+        allow_redirects: bool = True,
+        validate_final_url: Callable[[str], None] | None = None,
+    ) -> bytes:
         with self.get_response(url, timeout=timeout, allow_redirects=allow_redirects) as r:
             r.raise_for_status()
+            if validate_final_url is not None:
+                validate_final_url(str(r.url))
 
             return r.content
 
@@ -272,10 +399,14 @@ class HTTPConnection:
         url: str,
         *,
         timeout: float | None = None,
+        deadline: float | None = None,
         allow_redirects: bool = True,
+        validate_final_url: Callable[[str], None] | None = None,
     ) -> bytes:
         async with await self.get_async_response(url, timeout=timeout, allow_redirects=allow_redirects) as r:
             r.raise_for_status()
+            if validate_final_url is not None:
+                validate_final_url(str(r.real_url))
 
             return await r.read()
 

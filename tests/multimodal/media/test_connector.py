@@ -153,14 +153,14 @@ async def test_fetch_image_local_files(image_url: str):
         # Check that the images are equal
         assert not ImageChops.difference(image_sync, image_async).getbbox()
 
-        with pytest.raises(ValueError, match="must be a subpath"):
+        with pytest.raises(ValueError, match="outside the permitted directory"):
             await local_connector.fetch_image_async(f"file://{temp_dir}/../{os.path.basename(image_url)}")
-        with pytest.raises(RuntimeError, match="Cannot load local files"):
+        with pytest.raises(ValueError, match="Local file URLs are not accepted"):
             await connector.fetch_image_async(f"file://{temp_dir}/../{os.path.basename(image_url)}")
 
-        with pytest.raises(ValueError, match="must be a subpath"):
+        with pytest.raises(ValueError, match="outside the permitted directory"):
             local_connector.fetch_image(f"file://{temp_dir}/../{os.path.basename(image_url)}")
-        with pytest.raises(RuntimeError, match="Cannot load local files"):
+        with pytest.raises(ValueError, match="Local file URLs are not accepted"):
             connector.fetch_image(f"file://{temp_dir}/../{os.path.basename(image_url)}")
 
 
@@ -397,10 +397,10 @@ async def test_ssrf_bypass_backslash_disallowed_domain():
         allowed_media_domains=["safe.example.org"],
     )
 
-    with pytest.raises(ValueError, match="allowed domains"):
+    with pytest.raises(ValueError, match="host is not permitted"):
         connector.fetch_image(bypass_url)
 
-    with pytest.raises(ValueError, match="allowed domains"):
+    with pytest.raises(ValueError, match="host is not permitted"):
         await connector.fetch_image_async(bypass_url)
 
 

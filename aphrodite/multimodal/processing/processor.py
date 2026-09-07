@@ -1296,7 +1296,9 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             for idx in idxs:
                 data = mm_data_items[modality][idx]
                 if data is None:
-                    raise ValueError(f"Cache miss for {modality} at index {idx} but data is not provided.")
+                    # "Cache miss" is server-internal; what the caller did
+                    # was reference media by UUID without supplying its data.
+                    raise ValueError(f"No data provided for {modality} at index {idx}.")
                 else:
                     missing_modality_data.append(data)
             mm_missing_data[modality] = missing_modality_data

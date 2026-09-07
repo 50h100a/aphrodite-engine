@@ -5,7 +5,9 @@ import asyncio
 import atexit
 import contextlib
 import hashlib
+import ipaddress
 import os
+import socket
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -49,18 +51,37 @@ MODALITY_IO_MAP: dict[str, type[MediaIO]] = {
 }
 
 
+# Maximum accepted length of a media URL. `data:` URLs carry their payload
+# inline and are exempt.
+_MAX_MEDIA_URL_LENGTH = 8192
+
+_ALLOWED_MEDIA_URL_SCHEMES = frozenset({"http", "https", "data", "file"})
+
+
 def _wrap_media_fetch_error(
     url: str,
     exc: Exception,
+    parameter: str = "media_url",
 ) -> APHRODITEUnprocessableEntityError | Exception:
-    """Convert permanent media fetch failures into 422 request errors."""
+    """Convert permanent media fetch failures into 422 request errors.
+
+    Messages produced here are returned to the API caller, so they state only
+    what the caller can act on -- their URL, their field. Server-side detail
+    (the underlying exception, errno, configuration) is logged instead of
+    being echoed back in the response body.
+    """
+    # Already shaped for the caller (e.g. raised by _validate_media_url or
+    # _load_file_url); don't flatten its message.
+    if isinstance(exc, APHRODITEUnprocessableEntityError):
+        return exc
+
     if isinstance(exc, aiohttp.ClientResponseError):
         if exc.status in (408, 429):
             return exc
         if exc.status < 500:
             return APHRODITEUnprocessableEntityError(
-                f"Failed to fetch media from URL: HTTP {exc.status} error",
-                parameter="image_url",
+                f"Could not fetch media from URL: HTTP {exc.status}.",
+                parameter=parameter,
                 value=url,
             )
         return exc
@@ -72,26 +93,166 @@ def _wrap_media_fetch_error(
                 return exc
             if status_code < 500:
                 return APHRODITEUnprocessableEntityError(
-                    f"Failed to fetch media from URL: HTTP {status_code} error",
-                    parameter="image_url",
+                    f"Could not fetch media from URL: HTTP {status_code}.",
+                    parameter=parameter,
                     value=url,
                 )
         return exc
 
+    # NOTE: must precede the connection-error branch below --
+    # aiohttp.ServerTimeoutError subclasses ClientConnectionError.
+    if isinstance(
+        exc,
+        (
+            TimeoutError,
+            asyncio.TimeoutError,
+            requests.exceptions.Timeout,
+            aiohttp.ServerTimeoutError,
+        ),
+    ):
+        # The single operator-facing WARN is emitted by the retry wrapper in
+        # connections.py when it gives up; don't log the same failure twice.
+        logger.debug("Media fetch timed out for %s", url)
+        return APHRODITEUnprocessableEntityError(
+            "Could not fetch media from URL: timed out.",
+            parameter=parameter,
+            value=url,
+        )
+
+    # By the time this runs the retry ladder has already given up, so from the
+    # caller's point of view the URL is simply not fetchable.
+    if isinstance(
+        exc,
+        (
+            aiohttp.ClientConnectionError,
+            socket.gaierror,
+            requests.exceptions.ConnectionError,
+        ),
+    ):
+        logger.debug(
+            "Media fetch failed for %s: %s: %s",
+            url,
+            type(exc).__name__,
+            exc,
+        )
+        return APHRODITEUnprocessableEntityError(
+            "Could not fetch media from URL: host unreachable.",
+            parameter=parameter,
+            value=url,
+        )
+
     if isinstance(exc, requests.exceptions.InvalidURL):
         return APHRODITEUnprocessableEntityError(
-            "Failed to fetch media from URL: Invalid URL format",
-            parameter="image_url",
+            "Invalid media URL.",
+            parameter=parameter,
             value=url,
         )
 
     if isinstance(exc, ValueError):
         return APHRODITEUnprocessableEntityError(
-            "Failed to fetch media from URL: Invalid URL",
-            parameter="image_url",
+            "Invalid media URL.",
+            parameter=parameter,
             value=url,
         )
     return exc
+
+
+def _reject_url(reason: str, url: str, parameter: str) -> APHRODITEUnprocessableEntityError:
+    return APHRODITEUnprocessableEntityError(reason, parameter=parameter, value=url)
+
+
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_unspecified or ip.is_multicast
+
+
+def _assert_host_allowed(host: str, url: str, parameter: str) -> None:
+    """Reject loopback/private/link-local hosts when hardening is enabled.
+
+    Off by default (APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS) so that serving media
+    from localhost or the LAN keeps working.
+    """
+    if not envs.APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS:
+        return
+
+    bare = host.strip("[]").lower()
+    if bare == "localhost" or bare.endswith(".local") or bare.endswith(".localhost"):
+        logger.warning("Blocked media URL %s: host %r is local", url, host)
+        raise _reject_url("Media URL host is not permitted.", url, parameter)
+
+    try:
+        literal = ipaddress.ip_address(bare)
+    except ValueError:
+        literal = None
+
+    if literal is not None:
+        if _is_blocked_ip(literal):
+            logger.warning("Blocked media URL %s: address %s is not routable", url, literal)
+            raise _reject_url("Media URL host is not permitted.", url, parameter)
+        return
+
+    try:
+        infos = socket.getaddrinfo(bare, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        logger.warning("Blocked media URL %s: name resolution failed: %s", url, exc)
+        raise _reject_url("Could not fetch media from URL: host unreachable.", url, parameter) from exc
+
+    for info in infos:
+        try:
+            resolved = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if _is_blocked_ip(resolved):
+            logger.warning("Blocked media URL %s: %s resolves to non-routable %s", url, host, resolved)
+            raise _reject_url("Media URL host is not permitted.", url, parameter)
+
+
+def _validate_media_url(url: str, parameter: str = "media_url") -> None:
+    """Reject clearly broken URLs before any socket is opened.
+
+    Raises APHRODITEUnprocessableEntityError (-> HTTP 422) so the caller gets
+    a one-line reason at zero network cost.
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise _reject_url("Media URL is empty.", str(url), parameter)
+
+    is_data_url = url[:5].lower() == "data:"
+
+    if not is_data_url and len(url) > _MAX_MEDIA_URL_LENGTH:
+        raise _reject_url("Media URL is too long.", url[:128] + "...", parameter)
+
+    if is_data_url:
+        # `_load_data_url` splits on "," then ";"; without them it would raise
+        # a bare unpack ValueError with no useful message.
+        spec, _, remainder = url[5:].partition(",")
+        if not remainder and "," not in url[5:]:
+            raise _reject_url("Malformed data: URL.", "data:...", parameter)
+        if ";" not in spec:
+            raise _reject_url("Malformed data: URL.", "data:...", parameter)
+        return
+
+    try:
+        url_spec = parse_url(url)
+    except Exception as exc:
+        raise _reject_url("Invalid media URL.", url, parameter) from exc
+
+    scheme = (url_spec.scheme or "").lower()
+    if scheme not in _ALLOWED_MEDIA_URL_SCHEMES:
+        raise _reject_url(
+            "Unsupported media URL scheme; expected http, https, data or file.",
+            url,
+            parameter,
+        )
+
+    if scheme in ("http", "https"):
+        if not url_spec.host:
+            raise _reject_url("Media URL has no host.", url, parameter)
+        try:
+            port = url_spec.port
+        except ValueError as exc:
+            raise _reject_url("Media URL has an invalid port.", url, parameter) from exc
+        if port is not None and not (1 <= port <= 65535):
+            raise _reject_url("Media URL has an invalid port.", url, parameter)
+        _assert_host_allowed(url_spec.host, url, parameter)
 
 
 def merge_media_io_kwargs(
@@ -279,8 +440,15 @@ class MediaConnector:
     ) -> _M:  # type: ignore[type-var]
         # Format per RFC 2397:
         # data:[<mediatype>][;base64],<data>
-        data_spec, data = url[5:].split(",", 1)
-        media_type, data_type = data_spec.split(";", 1)
+        # `_validate_media_url` has already checked the shape; re-check here
+        # so direct callers get a clean message instead of an unpack error.
+        try:
+            data_spec, data = url[5:].split(",", 1)
+            media_type, data_type = data_spec.split(";", 1)
+        except ValueError as exc:
+            raise APHRODITEUnprocessableEntityError(
+                "Malformed data: URL.", parameter="media_url", value="data:..."
+            ) from exc
 
         if data_type != "base64":
             msg = "Only base64 data URLs are supported for now."
@@ -292,29 +460,77 @@ class MediaConnector:
         self,
         url_spec: Url,
         media_io: MediaIO[_M],
+        parameter: str = "media_url",
     ) -> _M:  # type: ignore[type-var]
         allowed_local_media_path = self.allowed_local_media_path
         if allowed_local_media_path is None:
-            raise RuntimeError("Cannot load local files without `--allowed-local-media-path`.")
+            # The caller cannot set a server CLI flag, so the flag name goes
+            # to the log for whoever runs the server, not into the response.
+            logger.warning(
+                "Rejected file:// media URL %s; set --allowed-local-media-path to enable local files",
+                url_spec.url,
+            )
+            raise APHRODITEUnprocessableEntityError(
+                "Local file URLs are not accepted. Provide an http(s) or data: URL.",
+                parameter=parameter,
+                value=url_spec.url,
+            )
 
         url_spec_path = url_spec.path or ""
         url_spec_netloc = url_spec.netloc or ""
         filepath = Path(url2pathname(url_spec_netloc + url_spec_path))
         if allowed_local_media_path not in filepath.resolve().parents:
-            raise ValueError(
-                f"The file path {filepath} must be a subpath "
-                f"of `--allowed-local-media-path {allowed_local_media_path}`."
+            logger.warning(
+                "Rejected file:// media URL %s: %s is outside --allowed-local-media-path %s",
+                url_spec.url,
+                filepath,
+                allowed_local_media_path,
+            )
+            raise APHRODITEUnprocessableEntityError(
+                "Local file URL is outside the permitted directory.",
+                parameter=parameter,
+                value=url_spec.url,
             )
 
         return media_io.load_file(filepath)
 
-    def _assert_url_in_allowed_media_domains(self, url_spec: Url) -> None:
+    def _assert_url_in_allowed_media_domains(self, url_spec: Url, parameter: str = "media_url") -> None:
         if self.allowed_media_domains and url_spec.hostname not in self.allowed_media_domains:
-            raise ValueError(
-                f"The URL must be from one of the allowed domains: "
-                f"{self.allowed_media_domains}. Input URL domain: "
-                f"{url_spec.hostname}"
+            logger.warning(
+                "Rejected media URL %s: host %s is not in --allowed-media-domains %s",
+                url_spec.url,
+                url_spec.hostname,
+                self.allowed_media_domains,
             )
+            raise APHRODITEUnprocessableEntityError(
+                "Media URL host is not permitted.",
+                parameter=parameter,
+                value=url_spec.url,
+            )
+
+    def _final_url_validator(self, parameter: str):
+        """Re-apply the private-host block to the URL actually fetched.
+
+        Redirects are followed by default, so without this an allowed origin
+        could redirect the server to a loopback or link-local address (e.g. a
+        cloud metadata endpoint) after the initial check has passed.
+
+        NOTE: `allowed_media_domains` is deliberately NOT re-applied here.
+        That list says which sites a caller may reference, and legitimate
+        origins routinely redirect to a separate CDN host (github.com ->
+        raw.githubusercontent.com); re-checking it would break them. The
+        private-host block is the check that constrains what the server may
+        actually connect to, so that is the one that must survive a redirect.
+        """
+        if not envs.APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS:
+            return None
+
+        def _validate(final_url: str) -> None:
+            spec = parse_url(final_url)
+            if spec.host:
+                _assert_host_allowed(spec.host, final_url, parameter)
+
+        return _validate
 
     def load_from_url(
         self,
@@ -322,14 +538,20 @@ class MediaConnector:
         media_io: MediaIO[_M],
         *,
         fetch_timeout: int | None = None,
+        fetch_deadline: int | None = None,
+        parameter: str = "media_url",
     ) -> _M:  # type: ignore[type-var]
+        # Reject clearly broken URLs before opening any socket.
+        _validate_media_url(url, parameter)
+
         if url[:5].lower() == "data:":
             return self._load_data_url(url, media_io)
 
         url_spec = parse_url(url)
+        scheme = (url_spec.scheme or "").lower()
 
-        if url_spec.scheme and url_spec.scheme.startswith("http"):
-            self._assert_url_in_allowed_media_domains(url_spec)
+        if scheme in ("http", "https"):
+            self._assert_url_in_allowed_media_domains(url_spec, parameter)
 
             cached = self._get_cached_bytes(url)
             if cached is not None:
@@ -340,10 +562,12 @@ class MediaConnector:
                 data = connection.get_bytes(
                     url_spec.url,
                     timeout=fetch_timeout,
+                    deadline=fetch_deadline,
                     allow_redirects=envs.APHRODITE_MEDIA_URL_ALLOW_REDIRECTS,
+                    validate_final_url=self._final_url_validator(parameter),
                 )
             except Exception as e:
-                wrapped = _wrap_media_fetch_error(url, e)
+                wrapped = _wrap_media_fetch_error(url, e, parameter)
                 if isinstance(wrapped, APHRODITEUnprocessableEntityError):
                     raise wrapped from e
                 raise
@@ -351,11 +575,20 @@ class MediaConnector:
             self._put_cached_bytes(url, data)
             return media_io.load_bytes(data)
 
-        if url_spec.scheme == "file":
-            return self._load_file_url(url_spec, media_io)
+        if scheme == "file":
+            try:
+                return self._load_file_url(url_spec, media_io, parameter)
+            except Exception as e:
+                wrapped = _wrap_media_fetch_error(url, e, parameter)
+                if isinstance(wrapped, APHRODITEUnprocessableEntityError):
+                    raise wrapped from e
+                raise
 
-        msg = "The URL must be either a HTTP, data or file URL."
-        raise ValueError(msg)
+        raise _reject_url(
+            "Unsupported media URL scheme; expected http, https, data or file.",
+            url,
+            parameter,
+        )
 
     async def load_from_url_async(
         self,
@@ -363,17 +596,24 @@ class MediaConnector:
         media_io: MediaIO[_M],
         *,
         fetch_timeout: int | None = None,
+        fetch_deadline: int | None = None,
+        parameter: str = "media_url",
     ) -> _M:
         loop = asyncio.get_running_loop()
+
+        # Reject clearly broken URLs before opening any socket. Host policy
+        # may need DNS, so run the whole check off the event loop.
+        await loop.run_in_executor(global_thread_pool, _validate_media_url, url, parameter)
 
         if url[:5].lower() == "data:":
             future: asyncio.Future[_M] = loop.run_in_executor(global_thread_pool, self._load_data_url, url, media_io)
             return await future
 
         url_spec = parse_url(url)
+        scheme = (url_spec.scheme or "").lower()
 
-        if url_spec.scheme and url_spec.scheme.startswith("http"):
-            self._assert_url_in_allowed_media_domains(url_spec)
+        if scheme in ("http", "https"):
+            self._assert_url_in_allowed_media_domains(url_spec, parameter)
 
             cached = await loop.run_in_executor(global_thread_pool, self._get_cached_bytes, url)
             if cached is not None:
@@ -385,10 +625,12 @@ class MediaConnector:
                 data = await connection.async_get_bytes(
                     url_spec.url,
                     timeout=fetch_timeout,
+                    deadline=fetch_deadline,
                     allow_redirects=envs.APHRODITE_MEDIA_URL_ALLOW_REDIRECTS,
+                    validate_final_url=self._final_url_validator(parameter),
                 )
             except Exception as e:
-                wrapped = _wrap_media_fetch_error(url, e)
+                wrapped = _wrap_media_fetch_error(url, e, parameter)
                 if isinstance(wrapped, APHRODITEUnprocessableEntityError):
                     raise wrapped from e
                 raise
@@ -397,11 +639,21 @@ class MediaConnector:
             future = loop.run_in_executor(global_thread_pool, media_io.load_bytes, data)
             return await future
 
-        if url_spec.scheme == "file":
-            future = loop.run_in_executor(global_thread_pool, self._load_file_url, url_spec, media_io)
-            return await future
-        msg = "The URL must be either a HTTP, data or file URL."
-        raise ValueError(msg)
+        if scheme == "file":
+            try:
+                future = loop.run_in_executor(global_thread_pool, self._load_file_url, url_spec, media_io, parameter)
+                return await future
+            except Exception as e:
+                wrapped = _wrap_media_fetch_error(url, e, parameter)
+                if isinstance(wrapped, APHRODITEUnprocessableEntityError):
+                    raise wrapped from e
+                raise
+
+        raise _reject_url(
+            "Unsupported media URL scheme; expected http, https, data or file.",
+            url,
+            parameter,
+        )
 
     def fetch_audio(
         self,
@@ -416,6 +668,8 @@ class MediaConnector:
             audio_url,
             audio_io,
             fetch_timeout=envs.APHRODITE_AUDIO_FETCH_TIMEOUT,
+            fetch_deadline=envs.APHRODITE_AUDIO_FETCH_DEADLINE,
+            parameter="audio_url",
         )
 
     async def fetch_audio_async(
@@ -431,6 +685,8 @@ class MediaConnector:
             audio_url,
             audio_io,
             fetch_timeout=envs.APHRODITE_AUDIO_FETCH_TIMEOUT,
+            fetch_deadline=envs.APHRODITE_AUDIO_FETCH_DEADLINE,
+            parameter="audio_url",
         )
 
     def fetch_image(
@@ -453,6 +709,8 @@ class MediaConnector:
                 image_url,
                 image_io,
                 fetch_timeout=envs.APHRODITE_IMAGE_FETCH_TIMEOUT,
+                fetch_deadline=envs.APHRODITE_IMAGE_FETCH_DEADLINE,
+                parameter="image_url",
             )
         except UnidentifiedImageError as e:
             # convert to ValueError to be properly caught upstream
@@ -478,6 +736,8 @@ class MediaConnector:
                 image_url,
                 image_io,
                 fetch_timeout=envs.APHRODITE_IMAGE_FETCH_TIMEOUT,
+                fetch_deadline=envs.APHRODITE_IMAGE_FETCH_DEADLINE,
+                parameter="image_url",
             )
         except UnidentifiedImageError as e:
             # convert to ValueError to be properly caught upstream
@@ -505,6 +765,8 @@ class MediaConnector:
             video_url,
             video_io,
             fetch_timeout=envs.APHRODITE_VIDEO_FETCH_TIMEOUT,
+            fetch_deadline=envs.APHRODITE_VIDEO_FETCH_DEADLINE,
+            parameter="video_url",
         )
 
     async def fetch_video_async(
@@ -533,6 +795,8 @@ class MediaConnector:
             video_url,
             video_io,
             fetch_timeout=envs.APHRODITE_VIDEO_FETCH_TIMEOUT,
+            fetch_deadline=envs.APHRODITE_VIDEO_FETCH_DEADLINE,
+            parameter="video_url",
         )
 
     def fetch_image_embedding(

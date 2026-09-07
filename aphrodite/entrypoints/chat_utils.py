@@ -52,7 +52,7 @@ from typing_extensions import Required, TypedDict, override
 
 from aphrodite import envs
 from aphrodite.config import ModelConfig
-from aphrodite.exceptions import APHRODITEValidationError
+from aphrodite.exceptions import APHRODITEUnprocessableEntityError, APHRODITEValidationError
 from aphrodite.inputs import MultiModalDataDict, MultiModalUUIDDict
 from aphrodite.logger import init_logger
 from aphrodite.model_executor.models import SupportsMultiModal
@@ -504,6 +504,21 @@ def _get_embeds_data(
     raise NotImplementedError(type(data_items))
 
 
+def _require_url_or_uuid(url: str | None, uuid: str | None, parameter: str) -> None:
+    """Reject a media part that carries neither a URL nor a UUID.
+
+    A missing URL is legitimate when the item is referenced by UUID and its
+    data arrives out of band. With neither, the request is simply broken --
+    without this the `None` would flow into the multimodal parser and surface
+    as an `assert_never` AssertionError (HTTP 500) instead of a 4xx.
+    """
+    if not (url and url.strip()) and not uuid:
+        raise APHRODITEUnprocessableEntityError(
+            f"{parameter}.url is empty.",
+            parameter=parameter,
+        )
+
+
 class BaseMultiModalItemTracker(ABC, Generic[_T]):
     """
     Tracks multi-modal items in a given request and ensures that the number
@@ -917,6 +932,7 @@ class MultiModalContentParser(BaseMultiModalContentParser):
         self._add_placeholder("prompt_embeds", PROMPT_EMBEDS_PLACEHOLDER_TOKEN)
 
     def parse_image(self, image_url: str | None, uuid: str | None = None) -> None:
+        _require_url_or_uuid(image_url, uuid, "image_url")
         image = self._connector.fetch_image(image_url) if image_url else None
 
         placeholder = self._tracker.add("image", (image, uuid))
@@ -969,6 +985,7 @@ class MultiModalContentParser(BaseMultiModalContentParser):
         self._add_placeholder("image", placeholder)
 
     def parse_audio(self, audio_url: str | None, uuid: str | None = None) -> None:
+        _require_url_or_uuid(audio_url, uuid, "audio_url")
         audio = self._connector.fetch_audio(audio_url) if audio_url else None
 
         placeholder = self._tracker.add("audio", (audio, uuid))
@@ -989,6 +1006,7 @@ class MultiModalContentParser(BaseMultiModalContentParser):
         return self.parse_audio(audio_url, uuid)
 
     def parse_video(self, video_url: str | None, uuid: str | None = None) -> None:
+        _require_url_or_uuid(video_url, uuid, "video_url")
         video = (
             self._connector.fetch_video(
                 video_url=video_url,
@@ -1053,6 +1071,7 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
         return tensor, None
 
     async def _image_with_uuid_async(self, image_url: str | None, uuid: str | None):
+        _require_url_or_uuid(image_url, uuid, "image_url")
         image = await self._connector.fetch_image_async(image_url) if image_url else None
         return image, uuid
 
@@ -1109,6 +1128,7 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
         self._add_placeholder("image", placeholder)
 
     async def _audio_with_uuid_async(self, audio_url: str | None, uuid: str | None):
+        _require_url_or_uuid(audio_url, uuid, "audio_url")
         audio = await self._connector.fetch_audio_async(audio_url) if audio_url else None
         return audio, uuid
 
@@ -1131,6 +1151,7 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
         return self.parse_audio(audio_url, uuid)
 
     async def _video_with_uuid_async(self, video_url: str | None, uuid: str | None):
+        _require_url_or_uuid(video_url, uuid, "video_url")
         video = (
             await self._connector.fetch_video_async(
                 video_url,

@@ -72,6 +72,10 @@ if TYPE_CHECKING:
     APHRODITE_IMAGE_FETCH_TIMEOUT: int = 5
     APHRODITE_VIDEO_FETCH_TIMEOUT: int = 30
     APHRODITE_AUDIO_FETCH_TIMEOUT: int = 10
+    APHRODITE_IMAGE_FETCH_DEADLINE: int = 10
+    APHRODITE_VIDEO_FETCH_DEADLINE: int = 45
+    APHRODITE_AUDIO_FETCH_DEADLINE: int = 20
+    APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS: bool = False
     APHRODITE_MEDIA_CACHE: str = ""
     APHRODITE_MEDIA_CACHE_MAX_SIZE_MB: int = 5120
     APHRODITE_MEDIA_CACHE_TTL_HOURS: float = 24
@@ -867,6 +871,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Timeout for fetching audio when serving multimodal models
     # Default is 10 seconds
     "APHRODITE_AUDIO_FETCH_TIMEOUT": lambda: int(os.getenv("APHRODITE_AUDIO_FETCH_TIMEOUT", "10")),
+    # Total wall-clock budget for fetching one image, covering every retry
+    # attempt and the sleeps between them. Default is 10 seconds.
+    "APHRODITE_IMAGE_FETCH_DEADLINE": lambda: int(os.getenv("APHRODITE_IMAGE_FETCH_DEADLINE", "10")),
+    # Total wall-clock budget for fetching one video. Default is 45 seconds.
+    "APHRODITE_VIDEO_FETCH_DEADLINE": lambda: int(os.getenv("APHRODITE_VIDEO_FETCH_DEADLINE", "45")),
+    # Total wall-clock budget for fetching one audio clip. Default is 20 seconds.
+    "APHRODITE_AUDIO_FETCH_DEADLINE": lambda: int(os.getenv("APHRODITE_AUDIO_FETCH_DEADLINE", "20")),
+    # Reject media URLs whose host is loopback, private, link-local, reserved
+    # or unspecified. Off by default so serving media from localhost or the
+    # LAN keeps working; enable to harden against SSRF.
+    "APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS": lambda: bool(int(os.getenv("APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS", "0"))),
     # Directory for caching media downloads (images, video, audio fetched
     # from URLs during inference). Empty string disables caching.
     "APHRODITE_MEDIA_CACHE": lambda: os.getenv("APHRODITE_MEDIA_CACHE", ""),
@@ -876,8 +891,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Time-to-live in hours for cached media files. Entries older than this
     # are evicted regardless of cache size. Default is 24 hours.
     "APHRODITE_MEDIA_CACHE_TTL_HOURS": lambda: float(os.getenv("APHRODITE_MEDIA_CACHE_TTL_HOURS", "24")),
-    # Maximum number of retries for fetching media (images, audio, video)
-    # from URLs. Each retry quadruples the timeout. Default is 3.
+    # Maximum number of attempts for fetching media (images, audio, video)
+    # from URLs. Attempts stop early once the modality's fetch deadline is
+    # spent, and deterministic failures are not retried at all. Default is 3.
     "APHRODITE_MEDIA_FETCH_MAX_RETRIES": lambda: int(os.getenv("APHRODITE_MEDIA_FETCH_MAX_RETRIES", "3")),
     # Whether to allow HTTP redirects when fetching from media URLs.
     # Default to True
@@ -1922,6 +1938,10 @@ def compile_factors() -> dict[str, object]:
         "APHRODITE_IMAGE_FETCH_TIMEOUT",
         "APHRODITE_VIDEO_FETCH_TIMEOUT",
         "APHRODITE_AUDIO_FETCH_TIMEOUT",
+        "APHRODITE_IMAGE_FETCH_DEADLINE",
+        "APHRODITE_VIDEO_FETCH_DEADLINE",
+        "APHRODITE_AUDIO_FETCH_DEADLINE",
+        "APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS",
         "APHRODITE_MEDIA_CACHE",
         "APHRODITE_MEDIA_CACHE_MAX_SIZE_MB",
         "APHRODITE_MEDIA_CACHE_TTL_HOURS",

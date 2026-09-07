@@ -565,8 +565,13 @@ class MultiModalDataParser:
         else:
             data_items = data  # type: ignore[assignment]
 
-        new_audios = list[np.ndarray]()
+        new_audios = list[np.ndarray | None]()
         for data_item in data_items:
+            if data_item is None:
+                # See the note in `_parse_video_data`.
+                new_audios.append(None)
+                continue
+
             audio, orig_sr = self._get_audio_with_sr(data_item)
             if orig_sr is None:
                 new_audio = audio
@@ -630,9 +635,18 @@ class MultiModalDataParser:
         else:
             data_items = data  # type: ignore[assignment]
 
-        new_videos = list[tuple[np.ndarray, dict[str, Any] | None]]()
+        new_videos = list[tuple[np.ndarray, dict[str, Any] | None] | None]()
         metadata_lst: list[dict[str, Any] | None] = []
         for data_item in data_items:
+            if data_item is None:
+                # Placeholder for an item referenced by UUID whose data is
+                # supplied out of band. VideoProcessorItems accepts None; the
+                # cache layer raises a proper request error if it never
+                # materializes. Dereferencing here would hit assert_never.
+                new_videos.append(None)
+                metadata_lst.append(None)
+                continue
+
             video, metadata = self._get_video_with_metadata(data_item)
             if self.video_needs_metadata:
                 if metadata is None:
