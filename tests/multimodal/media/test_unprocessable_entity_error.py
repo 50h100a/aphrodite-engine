@@ -201,7 +201,7 @@ class TestMediaUrlValidation:
 
     def test_private_host_allowed_by_default(self, monkeypatch):
         """Default-off: serving media from localhost must keep working."""
-        monkeypatch.setattr(envs, "APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS", False)
+        monkeypatch.setattr(envs, "APHRODITE_MEDIA_ALLOWED_SOURCES", {"remote", "private", "file", "data"})
         connector = MediaConnector()
 
         with patch.object(connector.connection, "get_bytes", new_callable=MagicMock) as mock_get:
@@ -224,7 +224,7 @@ class TestMediaUrlValidation:
         ],
     )
     def test_private_host_blocked_when_enabled(self, monkeypatch, url):
-        monkeypatch.setattr(envs, "APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS", True)
+        monkeypatch.setattr(envs, "APHRODITE_MEDIA_ALLOWED_SOURCES", {"remote", "file", "data"})
         connector = MediaConnector()
 
         with (

@@ -169,4 +169,4 @@ def test_media_fetch_env_defaults():
     assert envs.APHRODITE_IMAGE_FETCH_DEADLINE >= envs.APHRODITE_IMAGE_FETCH_TIMEOUT
     assert envs.APHRODITE_VIDEO_FETCH_DEADLINE >= envs.APHRODITE_VIDEO_FETCH_TIMEOUT
     assert envs.APHRODITE_AUDIO_FETCH_DEADLINE >= envs.APHRODITE_AUDIO_FETCH_TIMEOUT
-    assert envs.APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS is False
+    assert {"remote", "private", "file", "data"} == envs.APHRODITE_MEDIA_ALLOWED_SOURCES

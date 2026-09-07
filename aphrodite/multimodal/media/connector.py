@@ -204,36 +204,58 @@ def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_unspecified or ip.is_multicast
 
 
-def _assert_host_allowed(host: str, url: str, parameter: str) -> None:
-    """Reject loopback/private/link-local hosts when hardening is enabled.
+def _allowed_sources() -> set[str]:
+    """The configured media policy, logged once so it is visible in the log.
 
-    Off by default (APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS) so that serving media
-    from localhost or the LAN keeps working.
+    Otherwise a mis-set policy is indistinguishable from a working one: both
+    ends of the question look the same from outside, a 422.
     """
-    if not envs.APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS:
-        # Logged once per process so the effective policy is visible in the
-        # server log -- otherwise a mis-set flag is indistinguishable from a
-        # working one, since both end in a 422.
-        logger.debug_once("Media URL private-host blocking is OFF (APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS=0)")
-        return
+    sources = envs.APHRODITE_MEDIA_ALLOWED_SOURCES
+    logger.info_once("Media sources permitted: %s", ", ".join(sorted(sources)) or "(none)")
+    return sources
 
-    logger.info_once("Media URL private-host blocking is ON (APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS=1)")
 
+def _accepted_forms(sources: set[str]) -> str:
+    """What a caller may send, phrased for the caller.
+
+    Built from the policy rather than hardcoded so the remedy in an error is
+    the one that will actually work on this server. It names URL forms, which
+    is what the caller controls -- never the setting behind them.
+    """
+    forms = []
+    if "remote" in sources or "private" in sources:
+        forms.append("http(s)")
+    if "data" in sources:
+        forms.append("data:")
+    if "file" in sources:
+        forms.append("file:")
+    if not forms:
+        return ""
+    if len(forms) == 1:
+        return forms[0]
+    return ", ".join(forms[:-1]) + " or " + forms[-1]
+
+
+def _reject_source(url: str, parameter: str, sources: set[str]) -> APHRODITEUnprocessableEntityError:
+    accepted = _accepted_forms(sources)
+    detail = f" Provide {accepted} media instead." if accepted else ""
+    return _reject_url(f"This media source is not accepted.{detail}", url, parameter)
+
+
+def _host_is_private(host: str, url: str, parameter: str) -> bool:
+    """Whether `host` names a non-routable address.
+
+    Resolves names, because a public name pointing at 169.254.169.254 is the
+    whole reason the distinction exists.
+    """
     bare = host.strip("[]").lower()
     if bare == "localhost" or bare.endswith(".local") or bare.endswith(".localhost"):
-        logger.warning("Blocked media URL %s: host %r is local", url, host)
-        raise _reject_url("Media URL host is not permitted.", url, parameter)
+        return True
 
     try:
-        literal = ipaddress.ip_address(bare)
+        return _is_blocked_ip(ipaddress.ip_address(bare))
     except ValueError:
-        literal = None
-
-    if literal is not None:
-        if _is_blocked_ip(literal):
-            logger.warning("Blocked media URL %s: address %s is not routable", url, literal)
-            raise _reject_url("Media URL host is not permitted.", url, parameter)
-        return
+        pass
 
     try:
         infos = socket.getaddrinfo(bare, None, proto=socket.IPPROTO_TCP)
@@ -247,8 +269,47 @@ def _assert_host_allowed(host: str, url: str, parameter: str) -> None:
         except ValueError:
             continue
         if _is_blocked_ip(resolved):
-            logger.warning("Blocked media URL %s: %s resolves to non-routable %s", url, host, resolved)
+            logger.warning("Media URL %s: %s resolves to non-routable %s", url, host, resolved)
+            return True
+    return False
+
+
+def _assert_host_allowed(host: str, url: str, parameter: str) -> None:
+    """Check an http(s) host against the `remote`/`private` split.
+
+    Skipped entirely when the two are permitted alike, which is the default:
+    the classification would change no outcome, and it costs a DNS lookup on
+    the request path to reach it.
+    """
+    sources = _allowed_sources()
+    remote_ok = "remote" in sources
+    private_ok = "private" in sources
+    if remote_ok and private_ok:
+        return
+
+    if _host_is_private(host, url, parameter):
+        if not private_ok:
+            logger.warning("Blocked media URL %s: host %r is not publicly routable", url, host)
             raise _reject_url("Media URL host is not permitted.", url, parameter)
+    elif not remote_ok:
+        logger.warning("Blocked media URL %s: host %r is not local", url, host)
+        raise _reject_url("Media URL host is not permitted.", url, parameter)
+
+
+def _permitted_schemes(sources: set[str]) -> frozenset[str]:
+    """URL schemes the configured sources leave open.
+
+    `remote` and `private` both speak http(s) -- they differ on which hosts,
+    which `_assert_host_allowed` decides once the scheme has passed.
+    """
+    schemes = set()
+    if "remote" in sources or "private" in sources:
+        schemes |= {"http", "https"}
+    if "file" in sources:
+        schemes.add("file")
+    if "data" in sources:
+        schemes.add("data")
+    return frozenset(schemes)
 
 
 def _validate_media_url(url: str, parameter: str = "media_url") -> None:
@@ -260,12 +321,18 @@ def _validate_media_url(url: str, parameter: str = "media_url") -> None:
     if not isinstance(url, str) or not url.strip():
         raise _reject_url("Media URL is empty.", str(url), parameter)
 
+    sources = _allowed_sources()
     is_data_url = url[:5].lower() == "data:"
 
     if not is_data_url and len(url) > _MAX_MEDIA_URL_LENGTH:
         raise _reject_url("Media URL is too long.", url[:128] + "...", parameter)
 
     if is_data_url:
+        # Checked before the shape, so that a form the policy refuses is
+        # refused whether or not it is also malformed.
+        if "data" not in sources:
+            logger.warning("Blocked media URL: data: source is not permitted")
+            raise _reject_source("data:...", parameter, sources)
         # `_load_data_url` splits on "," then ";"; without them it would raise
         # a bare unpack ValueError with no useful message.
         spec, _, remainder = url[5:].partition(",")
@@ -287,6 +354,12 @@ def _validate_media_url(url: str, parameter: str = "media_url") -> None:
             url,
             parameter,
         )
+    # A scheme this build understands but this server does not accept. Kept
+    # apart from the check above: one says the URL is not a media URL, the
+    # other says the operator does not serve media that way.
+    if scheme not in _permitted_schemes(sources):
+        logger.warning("Blocked media URL %s: %s: source is not permitted", url, scheme)
+        raise _reject_source(url, parameter, sources)
 
     if scheme in ("http", "https"):
         if not url_spec.host:
@@ -557,24 +630,34 @@ class MediaConnector:
             )
 
     def _final_url_validator(self, parameter: str):
-        """Re-apply the private-host block to the URL actually fetched.
+        """Re-apply the source policy to the URL actually fetched.
 
         Redirects are followed by default, so without this an allowed origin
         could redirect the server to a loopback or link-local address (e.g. a
-        cloud metadata endpoint) after the initial check has passed.
+        cloud metadata endpoint), or from https down to http, after the initial
+        check has passed.
 
         NOTE: `allowed_media_domains` is deliberately NOT re-applied here.
         That list says which sites a caller may reference, and legitimate
         origins routinely redirect to a separate CDN host (github.com ->
-        raw.githubusercontent.com); re-checking it would break them. The
-        private-host block is the check that constrains what the server may
-        actually connect to, so that is the one that must survive a redirect.
+        raw.githubusercontent.com); re-checking it would break them. The source
+        policy is the check that constrains what the server may actually
+        connect to, so that is the one that must survive a redirect.
         """
-        if not envs.APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS:
+        sources = envs.APHRODITE_MEDIA_ALLOWED_SOURCES
+        permitted = _permitted_schemes(sources)
+        # Nothing to re-check when every http(s) destination is acceptable:
+        # the redirect cannot reach anything the first check would have
+        # refused. Keeps the default path free of a second DNS lookup.
+        if {"http", "https"} <= permitted and "remote" in sources and "private" in sources:
             return None
 
         def _validate(final_url: str) -> None:
             spec = parse_url(final_url)
+            scheme = (spec.scheme or "").lower()
+            if scheme not in permitted:
+                logger.warning("Blocked media redirect to %s: %s: source is not permitted", final_url, scheme)
+                raise _reject_source(final_url, parameter, sources)
             if spec.host:
                 _assert_host_allowed(spec.host, final_url, parameter)
 

@@ -75,7 +75,7 @@ if TYPE_CHECKING:
     APHRODITE_IMAGE_FETCH_DEADLINE: int = 10
     APHRODITE_VIDEO_FETCH_DEADLINE: int = 45
     APHRODITE_AUDIO_FETCH_DEADLINE: int = 20
-    APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS: bool = False
+    APHRODITE_MEDIA_ALLOWED_SOURCES: set[str] = {"remote", "private", "file", "data"}
     APHRODITE_MEDIA_CACHE: str = ""
     APHRODITE_MEDIA_CACHE_MAX_SIZE_MB: int = 5120
     APHRODITE_MEDIA_CACHE_TTL_HOURS: float = 24
@@ -469,6 +469,25 @@ def env_set_with_choices(
         return set(env_list_with_choices(env_name, default, choices, case_sensitive)())
 
     return _get_validated_env_set
+
+
+_MEDIA_SOURCES = ["remote", "private", "file", "data"]
+
+
+def _media_allowed_sources() -> set[str]:
+    """Resolve `APHRODITE_MEDIA_ALLOWED_SOURCES`.
+
+    Names are matched case-insensitively but compared lowercase downstream, so
+    normalise here rather than leaving the caller's spelling to be tested
+    against `"remote"`.
+    """
+    chosen = env_set_with_choices(
+        "APHRODITE_MEDIA_ALLOWED_SOURCES",
+        _MEDIA_SOURCES,
+        _MEDIA_SOURCES,
+        case_sensitive=False,
+    )()
+    return {source.lower() for source in chosen}
 
 
 def get_aphrodite_port() -> int | None:
@@ -878,10 +897,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "APHRODITE_VIDEO_FETCH_DEADLINE": lambda: int(os.getenv("APHRODITE_VIDEO_FETCH_DEADLINE", "45")),
     # Total wall-clock budget for fetching one audio clip. Default is 20 seconds.
     "APHRODITE_AUDIO_FETCH_DEADLINE": lambda: int(os.getenv("APHRODITE_AUDIO_FETCH_DEADLINE", "20")),
-    # Reject media URLs whose host is loopback, private, link-local, reserved
-    # or unspecified. Off by default so serving media from localhost or the
-    # LAN keeps working; enable to harden against SSRF.
-    "APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS": lambda: bool(int(os.getenv("APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS", "0"))),
+    # Where the server will accept media from. Comma-separated, any of:
+    #   remote  -- http(s) URLs on publicly routable hosts
+    #   private -- http(s) URLs on loopback, private, link-local, reserved,
+    #              unspecified or multicast hosts, and the names `localhost`,
+    #              `*.local` and `*.localhost`
+    #   file    -- file:// URLs (still additionally gated by
+    #              --allowed-local-media-path, which is off by default)
+    #   data    -- data: URLs carrying the payload inline
+    # All four by default, which is no policy at all. Drop `private` to harden
+    # against SSRF; leave only `data` to refuse retrieval entirely and require
+    # callers to inline their media.
+    "APHRODITE_MEDIA_ALLOWED_SOURCES": _media_allowed_sources,
     # Directory for caching media downloads (images, video, audio fetched
     # from URLs during inference). Empty string disables caching.
     "APHRODITE_MEDIA_CACHE": lambda: os.getenv("APHRODITE_MEDIA_CACHE", ""),
@@ -1941,7 +1968,7 @@ def compile_factors() -> dict[str, object]:
         "APHRODITE_IMAGE_FETCH_DEADLINE",
         "APHRODITE_VIDEO_FETCH_DEADLINE",
         "APHRODITE_AUDIO_FETCH_DEADLINE",
-        "APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS",
+        "APHRODITE_MEDIA_ALLOWED_SOURCES",
         "APHRODITE_MEDIA_CACHE",
         "APHRODITE_MEDIA_CACHE_MAX_SIZE_MB",
         "APHRODITE_MEDIA_CACHE_TTL_HOURS",
