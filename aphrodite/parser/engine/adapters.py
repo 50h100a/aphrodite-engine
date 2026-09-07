@@ -152,6 +152,10 @@ class ParserEngineToolAdapter(ToolParser):
         super().__init__(tokenizer, tools)
         self._parser_engine = self._parser_engine_cls(tokenizer, tools, **kwargs)  # type: ignore[call-arg]
 
+    @property
+    def tool_call_entry_markers(self) -> tuple[str, ...]:
+        return self._parser_engine.tool_call_entry_markers
+
     def adjust_request(
         self,
         request: ChatCompletionRequest | ResponsesRequest,

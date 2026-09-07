@@ -239,6 +239,11 @@ class ToolParser:
 
         return request
 
+    @property
+    def tool_call_entry_markers(self) -> tuple[str, ...]:
+        """Literal strings whose appearance begins a tool call."""
+        return ()
+
     def get_structural_tag(
         self,
         request: ChatCompletionRequest | ResponsesRequest,

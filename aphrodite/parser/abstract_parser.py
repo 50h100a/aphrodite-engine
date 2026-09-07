@@ -505,6 +505,40 @@ class DelegatingParser(Parser):
             request = self._apply_structural_tag(request)
         if self._tool_parser is not None:
             request = self._tool_parser.adjust_request(request)
+        request = self._suppress_tool_calls_when_none(request)
+        return request
+
+    def _suppress_tool_calls_when_none(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        """Stop the model emitting a tool call when the caller forbade one.
+
+        ``tool_choice="none"`` means the model may not *call* a tool, not that
+        the tools are hidden: they stay in the prompt, as OpenAI renders them,
+        so the model still knows what exists. Nothing in that prompt tells it
+        not to call, though -- the tool section actively describes the call
+        syntax -- so left unconstrained the model routinely calls anyway, and
+        the reply is then empty once the call is dropped.
+
+        Suppressing the entry markers makes the call unrepresentable rather
+        than merely unwanted, so the model spends its turn answering.
+        """
+        if request.tool_choice != "none" or not request.tools:
+            return request
+
+        tool_parser = self._tool_parser
+        if tool_parser is None:
+            return request
+
+        markers = tool_parser.tool_call_entry_markers
+        # Parsers that cannot describe their entry syntax, and request types
+        # with no bad_words support, simply go unconstrained.
+        if not markers or not hasattr(request, "bad_words"):
+            return request
+
+        bad_words = list(request.bad_words or [])
+        bad_words.extend(m for m in markers if m not in bad_words)
+        request.bad_words = bad_words
         return request
 
     def _grammar_needs_reasoning(self) -> bool:

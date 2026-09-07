@@ -193,6 +193,11 @@ class ParserEngine(Parser):
         self._content_has_nonws = False
         self._prompt_streaming_prepared = False
 
+    @property
+    def tool_call_entry_markers(self) -> tuple[str, ...]:
+        """Literal strings whose appearance begins a tool call."""
+        return self.parser_engine_config.tool_call_entry_markers
+
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:

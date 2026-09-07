@@ -172,7 +172,13 @@ def _assert_host_allowed(host: str, url: str, parameter: str) -> None:
     from localhost or the LAN keeps working.
     """
     if not envs.APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS:
+        # Logged once per process so the effective policy is visible in the
+        # server log -- otherwise a mis-set flag is indistinguishable from a
+        # working one, since both end in a 422.
+        logger.debug_once("Media URL private-host blocking is OFF (APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS=0)")
         return
+
+    logger.info_once("Media URL private-host blocking is ON (APHRODITE_MEDIA_BLOCK_PRIVATE_HOSTS=1)")
 
     bare = host.strip("[]").lower()
     if bare == "localhost" or bare.endswith(".local") or bare.endswith(".localhost"):

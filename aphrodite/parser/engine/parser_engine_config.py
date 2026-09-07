@@ -97,6 +97,20 @@ class ParserEngineConfig:
     validate_tool_names: bool = False
 
     @cached_property
+    def tool_call_entry_markers(self) -> tuple[str, ...]:
+        """Literal strings whose appearance begins a tool call."""
+        from aphrodite.parser.engine.events import EventType
+
+        markers: list[str] = []
+        for (_state, terminal), transition in self.transitions.items():
+            if EventType.TOOL_CALL_START not in transition.events:
+                continue
+            literal = self.terminals.get(terminal)
+            if literal and literal not in markers:
+                markers.append(literal)
+        return tuple(markers)
+
+    @cached_property
     def terminal_defs(self):
         from aphrodite.parser.engine.incremental_lexer import terminals_from_literals
 
