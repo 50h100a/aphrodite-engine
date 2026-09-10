@@ -92,13 +92,18 @@ class ParserManager:
         Returns:
             A Parser class, or None if neither parser is specified.
         """
-        if not tool_parser_name and not reasoning_parser_name:
-            return None
-
         reasoning_parser_cls = cls.get_reasoning_parser(reasoning_parser_name)
         tool_parser_cls = cls.get_tool_parser(tool_parser_name, enable_auto_tools, model_name)
 
-        if reasoning_parser_cls is None and tool_parser_cls is None:
+        if reasoning_parser_cls is None and tool_parser_cls is None and not is_harmony:
+            # Every other model speaks plain text when it is not asked to do
+            # otherwise, so with nothing configured there is nothing to parse.
+            # Harmony is not like that: the channel structure is the format the
+            # model writes in, so leaving it unparsed does not yield a plain
+            # reply, it yields the transcript -- reasoning, channel names and
+            # all -- in `content`. HarmonyParser with neither parser configured
+            # reads that structure and surfaces only the reply, which is what
+            # "no reasoning parser" should mean rather than "raw output".
             return None
 
         from aphrodite.utils.mistral import is_mistral_tool_parser

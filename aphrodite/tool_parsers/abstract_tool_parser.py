@@ -41,15 +41,28 @@ __all__ = ["Tool"]
 logger = init_logger(__name__)
 
 
+# What `json_object` asks for, spelled as a schema. `True` would admit any JSON
+# value, and `json_object` is narrower than that: it is the object that the
+# `JSON_OBJECT` grammar compiles for a request with no tools, so a reply riding
+# in a tag has to mean the same thing. `additionalProperties` is stated because
+# a bare object node reads as the empty object to the guidance backend.
+FREEFORM_JSON_OBJECT: dict[str, Any] = {"type": "object", "additionalProperties": True}
+
+
 def reply_schema_for_tool_grammar(
     request: ChatCompletionRequest | ResponsesRequest,
+    *,
+    refuse_unmergeable: bool = True,
 ) -> dict[str, Any] | bool | None:
-    """The reply constraint the caller asked for, as a schema the tool grammar
+    """The reply constraint the caller asked for, as a schema a structural tag
     can carry alongside its tool calls. None when the caller asked for none.
 
-    Only a JSON schema is carried. The tool tag holds the reply in a slot shaped
-    like a schema, and a regex, a choice list or a caller's own structural tag
-    has nothing to sit in it.
+    Only a JSON schema is carried. The tag holds the reply in a slot shaped like
+    a schema, and a regex, a choice list or a caller's own structural tag has
+    nothing to sit in it. Those are refused, because the caller asked for
+    something the grammar about to be built cannot honour -- unless
+    ``refuse_unmergeable`` is False, which says the caller is looking for a
+    schema to scope and will leave anything else on the request untouched.
     """
     if isinstance(request, ResponsesRequest):
         reply_format = getattr(request.text, "format", None)
@@ -62,21 +75,28 @@ def reply_schema_for_tool_grammar(
     kind = getattr(reply_format, "type", None)
     if kind == "json_schema":
         # `strict: false` waives the schema, so behave as `json_object`
-        schema = True if json_schema_enforcement_waived(reply_format) else _reply_json_schema(reply_format)
+        if json_schema_enforcement_waived(reply_format):
+            schema = dict(FREEFORM_JSON_OBJECT)
+        else:
+            schema = _reply_json_schema(reply_format)
     elif kind == "json_object":
-        schema = True
+        schema = dict(FREEFORM_JSON_OBJECT)
     elif kind == "structural_tag":
-        raise _reply_schema_refused(parameter, "a structural tag of its own")
+        if refuse_unmergeable:
+            raise _reply_schema_refused(parameter, "a structural tag of its own")
+        return None
 
     structured_outputs = getattr(request, "structured_outputs", None)
     if structured_outputs is not None:
         for name in ("regex", "choice", "grammar", "structural_tag"):
             if getattr(structured_outputs, name, None) is not None:
-                raise _reply_schema_refused("structured_outputs", f"`{name}`")
+                if refuse_unmergeable:
+                    raise _reply_schema_refused("structured_outputs", f"`{name}`")
+                return None
         if structured_outputs.json is not None:
             schema = structured_outputs.json
         elif structured_outputs.json_object:
-            schema = True
+            schema = dict(FREEFORM_JSON_OBJECT)
 
     return schema
 

@@ -34,7 +34,10 @@ from aphrodite.entrypoints.openai.chat_completion.protocol import (
 )
 from aphrodite.entrypoints.openai.responses.protocol import ResponsesRequest
 from aphrodite.sampling_params import StructuredOutputsParams
-from aphrodite.tool_parsers.abstract_tool_parser import reply_schema_for_tool_grammar
+from aphrodite.tool_parsers.abstract_tool_parser import (
+    FREEFORM_JSON_OBJECT,
+    reply_schema_for_tool_grammar,
+)
 from aphrodite.tool_parsers.structural_tag_registry import (
     get_model_structural_tag,
     merge_reply_schema,
@@ -150,9 +153,10 @@ class TestReplySlotInToolGrammar:
 
     def test_non_strict_reply_schema_is_carried_as_free_json(self):
         request = _chat_request(strict=False, tools=[_chat_tool(True)], tool_choice="auto")
-        # True is how this function spells "any JSON document", the same thing
-        # a `json_object` response format resolves to.
-        assert reply_schema_for_tool_grammar(request) is True
+        # The waived schema resolves to the same thing a `json_object` response
+        # format does, which is an object of any shape rather than any JSON
+        # document at all -- `json_object` is narrower than `True`.
+        assert reply_schema_for_tool_grammar(request) == FREEFORM_JSON_OBJECT
 
     @pytest.mark.parametrize("strict", [True, None])
     def test_otherwise_the_schema_is_carried(self, strict):

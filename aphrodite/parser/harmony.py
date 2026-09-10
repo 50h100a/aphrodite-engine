@@ -28,7 +28,12 @@ from aphrodite.entrypoints.openai.responses.protocol import ResponsesRequest
 from aphrodite.logger import init_logger
 from aphrodite.parser.abstract_parser import DelegatingParser
 from aphrodite.reasoning.gptoss_reasoning_parser import GptOssReasoningParser
+from aphrodite.tool_parsers.abstract_tool_parser import reply_schema_for_tool_grammar
 from aphrodite.tool_parsers.gptoss_tool_parser import GptOssToolParser
+from aphrodite.tool_parsers.structural_tag_registry import (
+    get_xgrammar_model_structural_tag,
+    merge_reply_schema,
+)
 
 if TYPE_CHECKING:
     from openai_harmony import StreamableParser
@@ -97,6 +102,13 @@ class HarmonyParser(DelegatingParser):
         self._next_tool_call_index = 0
         self._num_processed_messages = 0
         self._current_message_tokens: list[int] = []
+        # Content the parser has decoded for the message still in progress, so
+        # a recovery can hand back what it read rather than the header it read
+        # it through.
+        self._current_message_text = ""
+        # Index into `_current_message_tokens` of the token the harmony parser
+        # refused, or None while the parse is still following the format.
+        self._derailed_at: int | None = None
 
     def _grammar_needs_reasoning(self) -> bool:
         """Harmony always opens on the analysis channel.
@@ -107,6 +119,42 @@ class HarmonyParser(DelegatingParser):
         that segment; it does not stop the model from emitting it.
         """
         return True
+
+    def _scope_reply_schema(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        """Constrain the `final` channel rather than the whole generation."""
+        if not self._reply_schema_needs_its_own_grammar(request):
+            return request
+
+        structured_outputs = getattr(request, "structured_outputs", None)
+        if structured_outputs is not None and structured_outputs.structural_tag is not None:
+            return request
+
+        # Anything but a JSON schema is left where it is. A regex or a choice
+        # list has no slot in the tag, and refusing it here would take away a
+        # constraint that callers can use today.
+        reply_schema = reply_schema_for_tool_grammar(request, refuse_unmergeable=False)
+        if reply_schema is None:
+            return request
+
+        tag = get_xgrammar_model_structural_tag(
+            model=GptOssToolParser.structural_tag_model,
+            tools=[],
+            tool_choice="none",
+            reasoning=True,
+        )
+        merged = merge_reply_schema(tag, reply_schema)
+        if merged is None:
+            return request
+
+        # `content` now has a shape to keep, which is what decides where a
+        # recipient-less `commentary` preamble goes. Set before the tag is
+        # installed, because installing it clears the format off the request.
+        request._reply_schema_in_tool_grammar = True
+        self._install_structural_tag(request, merged)
+        return request
 
     @staticmethod
     def _preamble_is_content(request: ChatCompletionRequest | ResponsesRequest) -> bool:
@@ -135,30 +183,44 @@ class HarmonyParser(DelegatingParser):
         self._num_processed_messages += 1
         return msg
 
+    def _recover_raw_output(self) -> tuple[list[Segment], Message]:
+        """The message being parsed when the format broke, as `final` content."""
+        final_channel = "final"
+        if self._derailed_at is None:
+            text = unsent = self.model_tokenizer.decode(self._current_message_tokens)
+        else:
+            unsent = self.model_tokenizer.decode(self._current_message_tokens[self._derailed_at :])
+            text = self._current_message_text + unsent
+        segments = [
+            Segment(
+                channel=final_channel,
+                recipient=None,
+                delta=unsent,
+                completed_message=None,
+            )
+        ]
+        return segments, Message.from_role_and_content(Role.ASSISTANT, text).with_channel(final_channel)
+
     def flush(self) -> list[Segment]:
         segments: list[Segment] = []
-        try:
-            self._harmony_parser.process_eos()
-            msg = self._poll_completed_message()
-        except HarmonyError:
-            logger.warning("Harmony parser ended in a non-terminal state; returning the recovered raw output.")
-
-            final_channel = "final"
-            text = self.model_tokenizer.decode(self._current_message_tokens)
-            segments.append(
-                Segment(
-                    channel=final_channel,
-                    recipient=None,
-                    delta=text,
-                    completed_message=None,
-                )
-            )
-            msg = Message.from_role_and_content(Role.ASSISTANT, text).with_channel(final_channel)
+        msg: Message | None
+        if self._derailed_at is not None:
+            # Already reported where the parse broke; do not warn again.
+            segments, msg = self._recover_raw_output()
+        else:
+            try:
+                self._harmony_parser.process_eos()
+                msg = self._poll_completed_message()
+            except HarmonyError:
+                logger.warning("Harmony parser ended in a non-terminal state; returning the recovered raw output.")
+                segments, msg = self._recover_raw_output()
 
         # Reset to the initial assistant-parser state for the next turn.
         self._parser = None
         self._num_processed_messages = 0
         self._current_message_tokens.clear()
+        self._current_message_text = ""
+        self._derailed_at = None
 
         if msg is None:
             return segments
@@ -336,7 +398,19 @@ class HarmonyParser(DelegatingParser):
         segments: list[Segment] = []
         reasoning_token_count = 0
         for token_id in token_ids:
-            self._harmony_parser.process(token_id)
+            if self._derailed_at is not None:
+                self._current_message_tokens.append(token_id)
+                continue
+            try:
+                self._harmony_parser.process(token_id)
+            except HarmonyError:
+                logger.warning(
+                    "Harmony parser rejected token %d; returning the recovered raw output for the rest of the reply.",
+                    token_id,
+                )
+                self._derailed_at = len(self._current_message_tokens)
+                self._current_message_tokens.append(token_id)
+                continue
             channel = self._harmony_parser.current_channel
             recipient = self._normalize_recipient(self._harmony_parser.current_recipient)
             delta = self._harmony_parser.last_content_delta or ""
@@ -344,8 +418,10 @@ class HarmonyParser(DelegatingParser):
 
             if completed_message is not None:
                 self._current_message_tokens.clear()
+                self._current_message_text = ""
             else:
                 self._current_message_tokens.append(token_id)
+                self._current_message_text += delta
 
             if channel == "analysis" or (channel == "commentary" and recipient is not None):
                 reasoning_token_count += 1

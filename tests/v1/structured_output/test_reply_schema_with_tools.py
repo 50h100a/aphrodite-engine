@@ -38,6 +38,7 @@ from aphrodite.exceptions import AphroditeValidationError
 from aphrodite.parser.parser_manager import ParserManager
 from aphrodite.sampling_params import StructuredOutputsParams
 from aphrodite.tool_parsers.abstract_tool_parser import (
+    FREEFORM_JSON_OBJECT,
     ToolParser,
     reject_reply_schema_without_tool_grammar,
     reject_unmergeable_reply_schema,
@@ -104,8 +105,10 @@ def test_json_schema_reply_format_is_carried():
     assert reply_schema_for_tool_grammar(request) == ENUM_SCHEMA["schema"]
 
 
-def test_json_object_reply_format_is_any_json():
-    assert reply_schema_for_tool_grammar(_request(response_format={"type": "json_object"})) is True
+def test_json_object_reply_format_is_an_object_of_any_shape():
+    """Not `True`: `json_object` asks for an object, and a reply riding in a tag
+    has to mean what the same request means without one."""
+    assert reply_schema_for_tool_grammar(_request(response_format={"type": "json_object"})) == FREEFORM_JSON_OBJECT
 
 
 def test_structured_outputs_json_is_carried():
@@ -126,7 +129,7 @@ def test_unconstraining_reply_formats_ask_for_nothing(response_format):
 def test_non_schema_constraints_are_refused(constraint):
     """The tag holds the reply in a slot shaped like a schema; a regex or a
     choice list has nothing to sit in it."""
-    values = {"regex": r"\d+", "choice": ["a", "b"], "grammar": "root ::= \"a\""}
+    values = {"regex": r"\d+", "choice": ["a", "b"], "grammar": 'root ::= "a"'}
     request = _request(structured_outputs=StructuredOutputsParams(**{constraint: values[constraint]}))
 
     with pytest.raises(AphroditeValidationError) as excinfo:
@@ -197,8 +200,7 @@ def test_harmony_constrains_the_final_channel_and_leaves_analysis_alone():
         '<|start|>assistant<|channel|>final<|message|>{"answer": "sunny"}<|return|>'
     )
     assert accepts(
-        "<|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>"
-        '{"city": "Paris"}<|call|>'
+        '<|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"city": "Paris"}<|call|>'
     )
 
 

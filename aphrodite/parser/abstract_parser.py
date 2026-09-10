@@ -40,7 +40,7 @@ from aphrodite.tool_parsers.abstract_tool_parser import (
     reject_unmergeable_reply_schema,
     reply_schema_for_tool_grammar,
 )
-from aphrodite.tool_parsers.structural_tag_registry import merge_reply_schema
+from aphrodite.tool_parsers.structural_tag_registry import StructuralTag, merge_reply_schema
 from aphrodite.tool_parsers.streaming import (
     extract_named_tool_call_streaming,
     extract_required_tool_call_streaming,
@@ -537,6 +537,7 @@ class DelegatingParser(Parser):
             request = self._apply_structural_tag(request)
         if self._tool_parser is not None:
             request = self._tool_parser.adjust_request(request)
+        request = self._scope_reply_schema(request)
         request = self._suppress_tool_calls_when_none(request)
         return request
 
@@ -688,9 +689,17 @@ class DelegatingParser(Parser):
             # has other free-text segments needs to know the reply is formatted.
             request._reply_schema_in_tool_grammar = True
 
-        structural_tag = json.dumps(structure_tag.model_dump())
+        self._install_structural_tag(request, structure_tag)
+        return request
+
+    @staticmethod
+    def _install_structural_tag(
+        request: ChatCompletionRequest | ResponsesRequest,
+        tag: StructuralTag,
+    ) -> None:
+        """Make `tag` the request's structured-output constraint."""
         request.structured_outputs = StructuredOutputsParams(  # type: ignore[call-arg]
-            structural_tag=structural_tag,
+            structural_tag=json.dumps(tag.model_dump()),
         )
         # The tag spans the whole reply, reasoning segment included, so there is
         # no prelude to wait out. Without this the bitmask is withheld until the
@@ -702,7 +711,21 @@ class DelegatingParser(Parser):
             request.text = None
         else:
             request.response_format = None
+
+    def _scope_reply_schema(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        """Give a reply schema a grammar shaped like this model's reply."""
         return request
+
+    def _reply_schema_needs_its_own_grammar(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> bool:
+        """Whether a reply schema on this request is still looking for a home."""
+        if request._grammar_from_tool_parser:
+            return False
+        return not request.tools or request.tool_choice == "none"
 
     def extract_reasoning_streaming(
         self,
