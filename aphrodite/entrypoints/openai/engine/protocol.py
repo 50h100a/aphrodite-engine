@@ -172,6 +172,16 @@ class ResponseFormat(OpenAIBaseModel):
 AnyResponseFormat: TypeAlias = ResponseFormat | StructuralTagResponseFormat | LegacyStructuralTagResponseFormat
 
 
+def json_schema_enforcement_waived(response_format: Any) -> bool:
+    """Whether a ``json_schema`` format asked for its schema not to be enforced."""
+    if getattr(response_format, "type", None) != "json_schema":
+        return False
+    if (strict := getattr(response_format, "strict", None)) is not None:
+        return strict is False
+    nested = getattr(response_format, "json_schema", None)
+    return getattr(nested, "strict", None) is False
+
+
 def structured_outputs_from_response_format(
     structured_outputs: StructuredOutputsParams | None,
     response_format: AnyResponseFormat | None,
@@ -186,7 +196,10 @@ def structured_outputs_from_response_format(
     elif response_format.type == "json_schema":
         json_schema = response_format.json_schema
         assert json_schema is not None
-        overrides = {"json": json_schema.json_schema}
+        if json_schema_enforcement_waived(response_format):
+            overrides = {"json_object": True}
+        else:
+            overrides = {"json": json_schema.json_schema}
     else:
         assert isinstance(
             response_format,

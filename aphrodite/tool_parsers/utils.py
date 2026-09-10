@@ -18,6 +18,7 @@ from openai.types.responses import (
 from openai.types.responses.tool import Tool as ResponsesTool
 from partial_json_parser.core.options import Allow
 
+from aphrodite import envs
 from aphrodite.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionToolsParam,
@@ -181,11 +182,12 @@ def flat_namespace_tool_name(namespace: str, name: str) -> str:
     return f"{namespace}{_NAMESPACE_TOOL_SEPARATOR}{name}"
 
 
-def iter_response_function_tool_info(
+def iter_response_function_tool_specs(
     tool: ResponsesTool,
-) -> list[tuple[str, dict[str, Any] | None]]:
+) -> list[tuple[str, dict[str, Any] | None, bool | None]]:
+    """Each function this tool declares, as ``(name, parameters, strict)``."""
     if isinstance(tool, FunctionTool):
-        return [(tool.name, tool.parameters)]
+        return [(tool.name, tool.parameters, tool.strict)]
     if not isinstance(tool, NamespaceTool):
         return []
 
@@ -194,10 +196,17 @@ def iter_response_function_tool_info(
         (
             flat_namespace_tool_name(namespace, namespaced_tool.name),
             namespaced_tool.parameters,
+            getattr(namespaced_tool, "strict", None),
         )
         for namespaced_tool in tool.tools
         if namespaced_tool.type == "function"
     ]
+
+
+def iter_response_function_tool_info(
+    tool: ResponsesTool,
+) -> list[tuple[str, dict[str, Any] | None]]:
+    return [(name, params) for name, params, _ in iter_response_function_tool_specs(tool)]
 
 
 def iter_response_function_tool_dicts(
@@ -308,6 +317,23 @@ def find_tool_name(
     return False
 
 
+# A tool whose schema is not being enforced still has to spell its arguments as
+# a JSON object -- `strict: false` waives the shape, not the syntax.
+_FREEFORM_OBJECT_SCHEMA: dict[str, Any] = {"type": "object", "additionalProperties": True}
+
+
+def _tool_enforces_its_schema(strict: bool | None) -> bool:
+    """Whether this tool's parameter schema should constrain decoding."""
+    return envs.APHRODITE_ENFORCE_STRICT_TOOL_CALLING if strict is None else strict
+
+
+def _constrained_tool_parameters(params: dict[str, Any] | None, strict: bool | None) -> dict[str, Any] | None:
+    """The parameter schema to decode this tool's arguments against."""
+    if not _tool_enforces_its_schema(strict):
+        return dict(_FREEFORM_OBJECT_SCHEMA)
+    return params
+
+
 def _get_tool_schema_from_name_and_params(name: str, params: dict[str, Any] | None) -> dict:
     params = params if params else {"type": "object", "properties": {}}
     return {
@@ -321,7 +347,8 @@ def _get_tool_schema_from_name_and_params(name: str, params: dict[str, Any] | No
 
 def _get_tool_schema_from_tool(tool: Tool) -> dict:
     name, params = _extract_tool_info(tool)
-    return _get_tool_schema_from_name_and_params(name, params)
+    strict = getattr(tool, "strict", None) if isinstance(tool, FunctionTool) else tool.function.strict
+    return _get_tool_schema_from_name_and_params(name, _constrained_tool_parameters(params, strict))
 
 
 def _get_tool_schema_defs(
@@ -348,8 +375,8 @@ def _get_json_schema_from_tools(
     for tool in tools:
         if isinstance(tool, (FunctionTool, NamespaceTool)):
             fn_tool_schemas.extend(
-                _get_tool_schema_from_name_and_params(name, params)
-                for name, params in iter_response_function_tool_info(tool)
+                _get_tool_schema_from_name_and_params(name, _constrained_tool_parameters(params, strict))
+                for name, params, strict in iter_response_function_tool_specs(tool)
             )
             if isinstance(tool, FunctionTool):
                 fn_tools.append(tool)
@@ -384,7 +411,8 @@ def get_json_schema_from_tools(
         for tool in tools:
             if not isinstance(tool, (FunctionTool, NamespaceTool)):
                 continue
-            for name, params in iter_response_function_tool_info(tool):
+            for name, params, strict in iter_response_function_tool_specs(tool):
+                params = _constrained_tool_parameters(params, strict)
                 responses_tool_map[name] = params
                 if _NAMESPACE_TOOL_SEPARATOR in name:
                     responses_tool_map.setdefault(name.rsplit(_NAMESPACE_TOOL_SEPARATOR, 1)[1], params)
@@ -397,7 +425,8 @@ def get_json_schema_from_tools(
         tool_map = {tool.function.name: tool for tool in tools if isinstance(tool, ChatCompletionToolsParam)}
         if tool_name not in tool_map:
             raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`.")
-        return tool_map[tool_name].function.parameters
+        function = tool_map[tool_name].function
+        return _constrained_tool_parameters(function.parameters, function.strict)
     # tool_choice: "required"
     if tool_choice == "required":
         return _get_json_schema_from_tools(tools)

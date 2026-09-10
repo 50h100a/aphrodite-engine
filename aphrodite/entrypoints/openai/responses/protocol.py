@@ -61,7 +61,10 @@ from aphrodite.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
 )
-from aphrodite.entrypoints.openai.engine.protocol import OpenAIBaseModel
+from aphrodite.entrypoints.openai.engine.protocol import (
+    OpenAIBaseModel,
+    json_schema_enforcement_waived,
+)
 from aphrodite.exceptions import APHRODITEValidationError
 from aphrodite.logger import init_logger
 from aphrodite.renderers import ChatParams, TokenizeParams, merge_kwargs
@@ -372,6 +375,9 @@ class ResponsesRequest(OpenAIBaseModel):
 
         response_format = self.text.format
         if response_format.type == "json_object":
+            return StructuredOutputsParams(json_object=True)  # type: ignore[call-arg]
+        if json_schema_enforcement_waived(response_format):
+            # `strict: false` waives the schema; what is left is `json_object`.
             return StructuredOutputsParams(json_object=True)  # type: ignore[call-arg]
         if response_format.type == "json_schema" and response_format.schema_ is not None:
             return StructuredOutputsParams(

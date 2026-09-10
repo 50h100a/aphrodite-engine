@@ -21,6 +21,7 @@ from aphrodite.entrypoints.openai.chat_completion.protocol import (
 from aphrodite.entrypoints.openai.engine.protocol import (
     DeltaMessage,
     ExtractedToolCallInformation,
+    json_schema_enforcement_waived,
 )
 from aphrodite.entrypoints.openai.responses.protocol import (
     ResponsesRequest,
@@ -60,7 +61,8 @@ def reply_schema_for_tool_grammar(
     schema: dict[str, Any] | bool | None = None
     kind = getattr(reply_format, "type", None)
     if kind == "json_schema":
-        schema = _reply_json_schema(reply_format)
+        # `strict: false` waives the schema, so behave as `json_object`
+        schema = True if json_schema_enforcement_waived(reply_format) else _reply_json_schema(reply_format)
     elif kind == "json_object":
         schema = True
     elif kind == "structural_tag":
