@@ -73,6 +73,26 @@ _SUBSCHEMA_MAP_KEYS = frozenset(
     }
 )
 
+# The two of those that are storage rather than application: what they hold
+# constrains nothing until a `$ref` points at it.
+_DEFINITION_KEYS = frozenset({"$defs", "definitions"})
+
+# Keywords that move where a pointer resolves from. Placing a reference in
+# their company needs the whole document's identifier map, which one schema
+# fragment does not carry, so a schema using any of them has its references
+# left to the backend rather than guessed at here.
+_REF_RELOCATING_KEYWORDS = frozenset(
+    {
+        "$anchor",
+        "$dynamicAnchor",
+        "$dynamicRef",
+        "$id",
+        "$recursiveAnchor",
+        "$recursiveRef",
+        "id",
+    }
+)
+
 JSON_SCHEMA_BACKENDS = frozenset({"xgrammar", "guidance", "outlines", "lm-format-enforcer"})
 
 # Which backends actually *enforce* each constraining keyword.
@@ -177,18 +197,25 @@ def _constrains(node: dict[str, Any], key: str) -> bool:
     return True
 
 
-def iter_schema_nodes(schema: Any) -> Iterator[dict[str, Any]]:
+def iter_schema_nodes(schema: Any, *, skip_definitions: bool = False) -> Iterator[dict[str, Any]]:
     """Yield every node of ``schema`` sitting in JSON Schema keyword position.
 
     Subschemas under an inert keyword are skipped -- an `if` with no `then` or
     `else` applies to nothing, so a keyword inside it can never constrain the
     output and must not be held against the caller.
+
+    ``skip_definitions`` leaves `$defs` and `definitions` out. They hold
+    subschemas that apply only where something points at them, so a walk that
+    is asking what the schema *reaches* has to arrive by the `$ref` or not at
+    all; a walk asking what it *contains* wants them.
     """
     if not isinstance(schema, dict):
         return
     yield schema
 
     for key, value in schema.items():
+        if skip_definitions and key in _DEFINITION_KEYS:
+            continue
         if key in _SUBSCHEMA_KEYS:
             if key in _KEYWORD_BACKENDS and not _constrains(schema, key):
                 continue
@@ -413,11 +440,81 @@ def structural_tag_conflict_message(keys: list[str], tag_backends: frozenset[str
     )
 
 
+_MISSING = object()
+
+
+def _resolve_local_pointer(root: Any, ref: str) -> Any:
+    """Follow a local JSON pointer from ``root``, or ``_MISSING``.
+
+    A sentinel rather than None because None is a place a pointer can land.
+    `tool_parsers.utils.resolve_local_pointer` is the same walk one layer up,
+    where a schema is being moved rather than screened, and
+    `postconditions._resolve_pointer` is the same walk at decode time.
+    """
+    fragment = ref[1:]
+    if fragment == "":
+        return root
+    node = root
+    for raw in fragment[1:].split("/"):
+        part = raw.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict):
+            if part not in node:
+                return _MISSING
+            node = node[part]
+        elif isinstance(node, list):
+            try:
+                node = node[int(part)]
+            except (ValueError, IndexError):
+                return _MISSING
+        else:
+            return _MISSING
+    return node
+
+
+def _unresolvable_reference(schema: dict[str, Any]) -> str | None:
+    """The first reachable pointer in ``schema`` that lands nowhere.
+
+    `check_schema` does not follow references at all -- `{"$ref": "#/$defs/Y"}`
+    is well-formed whether or not there is a `Y` -- so without this the schema
+    passes the screen and dies later in the backend's own compile, which reaches
+    the caller as a 500 instead of the 400 it is.
+
+    Only what a decode can actually reach is reported. A backend compiles a
+    definition when something points at it and not before, so a dangling
+    pointer inside a `$def` nothing references costs a real request nothing and
+    is none of this screen's business.
+    """
+    nodes = list(iter_schema_nodes(schema))
+    if any(key in node for node in nodes for key in _REF_RELOCATING_KEYWORDS):
+        return None
+
+    visited: set[int] = {id(schema)}
+
+    def visit(node: dict[str, Any]) -> str | None:
+        for sub in iter_schema_nodes(node, skip_definitions=True):
+            ref = sub.get("$ref")
+            # An `$anchor` (`#name`) or an external URI is not this walk's to
+            # place; only a pointer into the document itself.
+            if not isinstance(ref, str) or not (ref == "#" or ref.startswith("#/")):
+                continue
+            target = _resolve_local_pointer(schema, ref)
+            if target is _MISSING:
+                return ref
+            if isinstance(target, dict) and id(target) not in visited:
+                visited.add(id(target))
+                if (unresolvable := visit(target)) is not None:
+                    return unresolvable
+        return None
+
+    return visit(schema)
+
+
 def get_schema_validation_error(schema: Any) -> str | None:
     """Return why ``schema`` is not a valid JSON Schema, or None if it is.
 
     The dialect comes from the schema's own ``$schema``, falling back to the
-    newest jsonschema knows.
+    newest jsonschema knows. A reference that leads nowhere counts: it is not
+    something a backend can be asked to compile around.
 
     ``schema`` may be a dict or JSON text. Unparseable text yields None;
     malformed JSON is reported by whoever parses it for real.
@@ -434,6 +531,8 @@ def get_schema_validation_error(schema: Any) -> str | None:
         # Unrecognised `$schema`, unresolvable metaschema, etc. Not evidence
         # the caller's schema is bad, so let the backend decide.
         return None
+    if isinstance(schema, dict) and (ref := _unresolvable_reference(schema)) is not None:
+        return f"reference {ref!r} does not resolve within the schema"
     return None
 
 

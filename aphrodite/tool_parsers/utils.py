@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import ast
+import copy
 import json
 import math
 import warnings
+from collections.abc import Iterator
 from dataclasses import dataclass
 from json import JSONDecodeError, JSONDecoder
 from typing import Any, TypeAlias
@@ -275,24 +277,186 @@ def _extract_tool_info(
         raise TypeError(f"Unsupported tool type: {type(tool)}")
 
 
+# ---------------------------------------------------------------------------
+# Local `$ref`
+#
+# A tool's parameter schema arrives as a document of its own, so every pointer
+# in it reads from *that* document's root: `#/$defs/Foo`, `#/definitions/Foo`
+# from draft-07, `#/properties/bar`, or a bare `#` for the whole thing. Anything
+# that moves such a schema somewhere else has to carry its pointers with it, or
+# they resolve against the wrong root -- a compile error raised on the backend's
+# own thread for most of them, and for a bare `#` no error at all, just a
+# grammar built from the wrong schema.
+#
+# `postconditions._resolve_pointer` is the decode-time twin of the resolver
+# below. They are kept apart on purpose: this layer answers "is it there?" and
+# that one raises to abandon an analysis, and neither wants the other's
+# semantics or the other's imports.
+# ---------------------------------------------------------------------------
+
+# Keywords whose value is caller data rather than more schema. A `$ref` string
+# inside one of these is a literal for the model to emit, not a pointer.
+_SCHEMA_DATA_KEYS = frozenset({"const", "default", "enum", "examples"})
+
+# Ceiling on `$ref` inlining. Definitions can fan out, and inlining exists only
+# so the parsers can read a parameter's type; past the cap the remaining refs
+# stay where they are, which reads downstream as "nothing declared" -- exactly
+# what every one of them read as before any were followed.
+_MAX_INLINED_NODES = 4096
+
+
+def _is_local_ref(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith("#")
+
+
+def has_local_ref(schema: Any) -> bool:
+    """Whether ``schema`` points into its own document anywhere."""
+    if isinstance(schema, list):
+        return any(has_local_ref(item) for item in schema)
+    if not isinstance(schema, dict):
+        return False
+    for key, value in schema.items():
+        if key in _SCHEMA_DATA_KEYS:
+            continue
+        if key == "$ref" and _is_local_ref(value):
+            return True
+        if has_local_ref(value):
+            return True
+    return False
+
+
+def resolve_local_pointer(root: Any, ref: str) -> Any:
+    """Follow a local JSON pointer from ``root``, or ``None`` if it goes nowhere.
+
+    ``None`` is also a legitimate target (`{"$ref": "#/$defs/x"}` where `x` is
+    JSON null), which is not a schema either, so callers need not tell them
+    apart.
+    """
+    if not _is_local_ref(ref):
+        return None
+    fragment = ref[1:]
+    if fragment == "":
+        return root
+    if not fragment.startswith("/"):
+        # An `$anchor`. Placing one needs the document's `$id` map, which a
+        # single schema fragment does not carry.
+        return None
+    node = root
+    for raw in fragment[1:].split("/"):
+        part = raw.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict):
+            if part not in node:
+                return None
+            node = node[part]
+        elif isinstance(node, list):
+            try:
+                node = node[int(part)]
+            except (ValueError, IndexError):
+                return None
+        else:
+            return None
+    return node
+
+
+def rebase_local_refs(schema: Any, prefix: str) -> Any:
+    """Copy ``schema`` with every local pointer re-rooted under ``prefix``.
+
+    ``prefix`` is the pointer to where the schema is about to live, so a schema
+    moving to `#/$defs/tool_0` has its own `#/$defs/Bar` become
+    `#/$defs/tool_0/$defs/Bar` and its bare `#` become `#/$defs/tool_0`. The
+    caller's schema is left alone; what comes back is a copy.
+    """
+    if isinstance(schema, list):
+        return [rebase_local_refs(item, prefix) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    rebased: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key in _SCHEMA_DATA_KEYS:
+            rebased[key] = copy.deepcopy(value)
+        elif key == "$ref" and _is_local_ref(value):
+            rebased[key] = prefix + value[1:]
+        else:
+            rebased[key] = rebase_local_refs(value, prefix)
+    return rebased
+
+
+def _pointer_segment(name: str) -> str:
+    """``name`` escaped for one segment of a JSON pointer (RFC 6901)."""
+    return name.replace("~", "~0").replace("/", "~1")
+
+
+def inline_local_refs(schema: Any, root: Any) -> Any:
+    """``schema`` with its local ``$ref``s replaced by what they point at.
+
+    For reading a schema, not for compiling one: the parsers ask what type a
+    parameter holds, and a pointer answers nothing. A ref already open on the
+    path is left as a ref, so a recursive definition terminates rather than
+    unrolling forever, and so is one that resolves nowhere -- an unresolvable
+    pointer is the backend's to complain about, not something to guess past.
+
+    Siblings win over the target, which is what 2019-09 onwards says a `$ref`
+    with siblings means; draft-07 ignores them, and a schema relying on that
+    only loses annotations here.
+    """
+    budget = [_MAX_INLINED_NODES]
+
+    def walk(node: Any, open_refs: frozenset[str]) -> Any:
+        if budget[0] <= 0:
+            return node
+        budget[0] -= 1
+        if isinstance(node, list):
+            return [walk(item, open_refs) for item in node]
+        if not isinstance(node, dict):
+            return node
+
+        ref = node.get("$ref")
+        target: dict[str, Any] | None = None
+        if _is_local_ref(ref) and ref not in open_refs:
+            resolved = resolve_local_pointer(root, ref)
+            if isinstance(resolved, dict):
+                target = walk(resolved, open_refs | {ref})
+
+        inlined: dict[str, Any] = dict(target) if target is not None else {}
+        for key, value in node.items():
+            if key == "$ref" and target is not None:
+                continue
+            inlined[key] = value if key in _SCHEMA_DATA_KEYS else walk(value, open_refs)
+        return inlined
+
+    return walk(schema, frozenset())
+
+
+def _iter_tool_info(tools: list[Tool] | None) -> Iterator[tuple[str, dict[str, Any] | None]]:
+    """Every function this request declares, as ``(name, parameters)``."""
+    for tool in tools or ():
+        if isinstance(tool, (FunctionTool, NamespaceTool)):
+            yield from iter_response_function_tool_info(tool)
+        elif _is_function_tool(tool):
+            yield _extract_tool_info(tool)
+
+
 def find_tool_properties(
     tools: list[Tool] | None,
     tool_name: str,
 ) -> dict[str, Any]:
-    """Find a tool by name and return its properties dict, or {}."""
-    if not tools:
-        return {}
-    for tool in tools:
-        if isinstance(tool, (FunctionTool, NamespaceTool)):
-            for name, params in iter_response_function_tool_info(tool):
-                if name == tool_name:
-                    return (params or {}).get("properties", {})
+    """Find a tool by name and return its properties dict, or {}.
+
+    Pointers are followed on the way out. The callers read a parameter's
+    declared type off what comes back, and pydantic writes every enum and every
+    nested model as a bare ``{"$ref": "#/$defs/..."}``, which on its own
+    declares nothing -- so a parameter behind one used to read as untyped and
+    lose the type correction, the enum padding strip, and the streaming
+    decision that depend on it.
+    """
+    for name, params in _iter_tool_info(tools):
+        if name != tool_name:
             continue
-        if not _is_function_tool(tool):
-            continue
-        name, params = _extract_tool_info(tool)
-        if name == tool_name:
-            return (params or {}).get("properties", {})
+        if not params:
+            return {}
+        resolved = inline_local_refs(params, params) if has_local_ref(params) else params
+        properties = resolved.get("properties") if isinstance(resolved, dict) else None
+        return properties if isinstance(properties, dict) else {}
     return {}
 
 
@@ -301,20 +465,7 @@ def find_tool_name(
     tool_name: str,
 ) -> bool:
     """Return whether a function tool with *tool_name* exists."""
-    if not tools:
-        return False
-    for tool in tools:
-        if isinstance(tool, (FunctionTool, NamespaceTool)):
-            for name, _ in iter_response_function_tool_info(tool):
-                if name == tool_name:
-                    return True
-            continue
-        if not _is_function_tool(tool):
-            continue
-        name, _ = _extract_tool_info(tool)
-        if name == tool_name:
-            return True
-    return False
+    return any(name == tool_name for name, _ in _iter_tool_info(tools))
 
 
 # A tool whose schema is not being enforced still has to spell its arguments as
@@ -331,7 +482,11 @@ def _constrained_tool_parameters(params: dict[str, Any] | None, strict: bool | N
     """The parameter schema to decode this tool's arguments against."""
     if not _tool_enforces_its_schema(strict):
         return dict(_FREEFORM_OBJECT_SCHEMA)
-    return params
+    # Copied because what comes back is bound into the request's structured
+    # outputs, and layers below rewrite that in place -- best-effort mode strips
+    # unenforceable keywords straight out of it. The caller's tools are the
+    # caller's, and they still have a prompt to be rendered into.
+    return copy.deepcopy(params)
 
 
 def _get_tool_schema_from_name_and_params(name: str, params: dict[str, Any] | None) -> dict:
@@ -345,45 +500,58 @@ def _get_tool_schema_from_name_and_params(name: str, params: dict[str, Any] | No
     }
 
 
-def _get_tool_schema_from_tool(tool: Tool) -> dict:
-    name, params = _extract_tool_info(tool)
-    strict = getattr(tool, "strict", None) if isinstance(tool, FunctionTool) else tool.function.strict
-    return _get_tool_schema_from_name_and_params(name, _constrained_tool_parameters(params, strict))
+def _wrapped_tool_parameters(
+    name: str,
+    params: dict[str, Any] | None,
+    defs: dict[str, Any],
+) -> dict[str, Any] | None:
+    """``params`` as it should sit inside the combined tool schema.
+
+    A schema that points nowhere but outward is nested where it stands. One
+    that points at itself is moved whole into ``defs`` and referenced from
+    there, its own pointers rebased to follow it: nested in place, its
+    `#/$defs/Foo` would read from the *combined* schema's root, where that
+    tool's definitions are not -- and its bare `#` would read the array of tool
+    calls, which resolves, compiles, and constrains the wrong thing.
+
+    Each tool gets its own slot, so two tools may both define a `Node` without
+    either having to win.
+    """
+    if params is None or not has_local_ref(params):
+        return params
+
+    base = name or "tool"
+    key, suffix = base, 2
+    while key in defs:
+        key = f"{base}__{suffix}"
+        suffix += 1
+    pointer = f"#/$defs/{_pointer_segment(key)}"
+    defs[key] = rebase_local_refs(params, pointer)
+    return {"$ref": pointer}
 
 
-def _get_tool_schema_defs(
+def _iter_constrained_tool_params(
     tools: list[Tool],
-) -> dict:
-    all_defs: dict[str, dict[str, Any]] = {}
+) -> Iterator[tuple[str, dict[str, Any] | None]]:
+    """Each function tool's name and the schema its arguments decode against."""
     for tool in tools:
-        _, params = _extract_tool_info(tool)
-        if params is None:
-            continue
-        defs = params.pop("$defs", {})
-        for def_name, def_schema in defs.items():
-            if def_name in all_defs and all_defs[def_name] != def_schema:
-                raise ValueError(f"Tool definition '{def_name}' has multiple schemas, which is not supported.")
-            all_defs[def_name] = def_schema
-    return all_defs
+        if isinstance(tool, (FunctionTool, NamespaceTool)):
+            for name, params, strict in iter_response_function_tool_specs(tool):
+                yield name, _constrained_tool_parameters(params, strict)
+        elif _is_function_tool(tool):
+            name, params = _extract_tool_info(tool)
+            yield name, _constrained_tool_parameters(params, tool.function.strict)
 
 
 def _get_json_schema_from_tools(
     tools: list[Tool],
 ) -> dict:
-    fn_tool_schemas: list[dict[str, Any]] = []
-    fn_tools: list[Tool] = []
-    for tool in tools:
-        if isinstance(tool, (FunctionTool, NamespaceTool)):
-            fn_tool_schemas.extend(
-                _get_tool_schema_from_name_and_params(name, _constrained_tool_parameters(params, strict))
-                for name, params, strict in iter_response_function_tool_specs(tool)
-            )
-            if isinstance(tool, FunctionTool):
-                fn_tools.append(tool)
-        elif _is_function_tool(tool):
-            fn_tool_schemas.append(_get_tool_schema_from_tool(tool))
-            fn_tools.append(tool)
-    json_schema = {
+    defs: dict[str, Any] = {}
+    fn_tool_schemas = [
+        _get_tool_schema_from_name_and_params(name, _wrapped_tool_parameters(name, params, defs))
+        for name, params in _iter_constrained_tool_params(tools)
+    ]
+    json_schema: dict[str, Any] = {
         "type": "array",
         "minItems": 1,
         "items": {
@@ -391,9 +559,8 @@ def _get_json_schema_from_tools(
             "anyOf": fn_tool_schemas,
         },
     }
-    json_schema_defs = _get_tool_schema_defs(fn_tools)
-    if json_schema_defs:
-        json_schema["$defs"] = json_schema_defs
+    if defs:
+        json_schema["$defs"] = defs
     return json_schema
 
 

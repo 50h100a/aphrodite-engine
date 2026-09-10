@@ -623,7 +623,7 @@ def analyze(schema: Any) -> SchemaAnalysis:
         return _refuse_everything(
             analysis,
             f"the schema contains a reference this decoder cannot follow ({err.args[0]!r}), "
-            "so it cannot tell where the `contains` applies",
+            "so it cannot tell where the keyword applies",
         )
     except _TooManyAlternatives as err:
         return _refuse_everything(
@@ -1042,9 +1042,7 @@ class _VocabProfile:
             self._nothing_words = words
         return self._nothing_words[:num_words]
 
-    def landing_groups(
-        self, domain: _Domain, position: int, node: int
-    ) -> tuple[tuple[_Landing, frozenset[int]], ...]:
+    def landing_groups(self, domain: _Domain, position: int, node: int) -> tuple[tuple[_Landing, frozenset[int]], ...]:
         """The tokens that could continue an array sitting at `(position, node)`,
         grouped by where they leave it.
 
@@ -1448,9 +1446,7 @@ class _Document:
                     vetoed.append(tokens)
         return tuple(vetoed)
 
-    def _confined_to_domain(
-        self, profile: _VocabProfile
-    ) -> tuple[tuple[frozenset[int], ...], tuple[Any, ...]]:
+    def _confined_to_domain(self, profile: _VocabProfile) -> tuple[tuple[frozenset[int], ...], tuple[Any, ...]]:
         """The tokens that keep the innermost array's items distinct.
 
         Only the innermost frame, and only when it is the array under the
@@ -1480,9 +1476,7 @@ class _Document:
             allowed |= within or set()
         return (frozenset(allowed),), tuple(keys)
 
-    def _on_domain(
-        self, frame: _Frame, position: int, profile: _VocabProfile, keys: list[Any]
-    ) -> set[int] | None:
+    def _on_domain(self, frame: _Frame, position: int, profile: _VocabProfile, keys: list[Any]) -> set[int] | None:
         """The tokens that leave this array still able to finish, under one
         domain. None if the document has left that domain, where saying nothing
         beats guessing."""
