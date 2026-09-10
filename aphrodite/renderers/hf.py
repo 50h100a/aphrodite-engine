@@ -8,6 +8,7 @@ import itertools
 import weakref
 from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Final, Literal, cast, overload
 
@@ -443,22 +444,79 @@ def _convert_developer_to_system(
     return converted
 
 
+def _has_late_system_message(conversation: list[ConversationMessage]) -> bool:
+    """Whether any system message sits somewhere other than position 0."""
+    return any(msg["role"] == "system" for msg in conversation[1:])
+
+
+_SYSTEM_FIRST_PROBE: Final[list[ConversationMessage]] = [
+    {"role": "system", "content": "s0"},  # type: ignore[typeddict-item]
+    {"role": "user", "content": "u0"},  # type: ignore[typeddict-item]
+    {"role": "system", "content": "s1"},  # type: ignore[typeddict-item]
+    {"role": "user", "content": "u1"},  # type: ignore[typeddict-item]
+]
+
+
+def _renders_successfully(chat_template: str, conversation: list[ConversationMessage]) -> bool:
+    """Whether `chat_template` renders `conversation` without raising."""
+
+    def raise_exception(message: str) -> None:
+        raise jinja2.exceptions.TemplateError(message)
+
+    def strftime_now(format: str) -> str:
+        return datetime.now().strftime(format)
+
+    env = jinja2.sandbox.ImmutableSandboxedEnvironment(
+        trim_blocks=True,
+        lstrip_blocks=True,
+        extensions=[AssistantTracker, jinja2.ext.loopcontrols],
+    )
+    env.globals["raise_exception"] = raise_exception
+    env.globals["strftime_now"] = strftime_now
+    try:
+        env.from_string(chat_template).render(
+            messages=conversation,
+            add_generation_prompt=True,
+        )
+    except Exception:
+        return False
+    return True
+
+
+@lru_cache(maxsize=32)
+def _detect_requires_system_first(chat_template: str) -> bool:
+    """Whether the template rejects system messages after position 0.
+
+    Renders a ``[system, user, system, user]`` conversation against the
+    template; if that fails (e.g. Qwen's ``loop.first`` guard raising
+    "System message must be at the beginning.") but the consolidated form of
+    the same conversation renders, the template needs system-first ordering
+    and `_consolidate_system_messages` will fix it.  If neither form renders,
+    the template is unhappy for some unrelated reason and consolidating would
+    not help, so leave the conversation alone.
+    """
+    if _renders_successfully(chat_template, _SYSTEM_FIRST_PROBE):
+        return False
+    return _renders_successfully(chat_template, _consolidate_system_messages(_SYSTEM_FIRST_PROBE))
+
+
 def _consolidate_system_messages(
     conversation: list[ConversationMessage],
 ) -> list[ConversationMessage]:
     """Merge all system messages into one at position 0.
 
-    Some chat templates (e.g. Qwen 3.6) require the system message to be the
-    very first message.  After developer-to-system conversion, system messages
-    may appear at non-first positions; this merges them into a single message.
+    Some chat templates (e.g. Qwen 3.6, Qwen 3.8) require the system message
+    to be the very first message.  System messages may appear at non-first
+    positions either because the client sent them that way or after
+    developer-to-system conversion; this merges them into a single message.
     """
+    if not _has_late_system_message(conversation):
+        return conversation
+
     system_contents: list[str] = []
     non_system: list[ConversationMessage] = []
-    needs_consolidation = False
-    for i, msg in enumerate(conversation):
+    for msg in conversation:
         if msg["role"] == "system":
-            if i > 0 or system_contents:
-                needs_consolidation = True
             content = msg.get("content", "")
             if isinstance(content, list):
                 parts = []
@@ -472,9 +530,6 @@ def _consolidate_system_messages(
                 system_contents.append(content)
         else:
             non_system.append(msg)
-
-    if not needs_consolidation:
-        return conversation
 
     merged: ConversationMessage = {
         "role": "system",
@@ -688,10 +743,15 @@ def safe_apply_chat_template(
         )
     if any(msg["role"] == "developer" for msg in conversation) and not _detect_developer_role_support(chat_template):
         conversation = _convert_developer_to_system(conversation)
-        conversation = _consolidate_system_messages(conversation)
         logger.info_once(
             "Chat template does not support the 'developer' message role. "
             "Converting developer messages to 'system' role.",
+        )
+    if _has_late_system_message(conversation) and _detect_requires_system_first(chat_template):
+        conversation = _consolidate_system_messages(conversation)
+        logger.info_once(
+            "Chat template requires the system message to be first. "
+            "Merging system messages into a single leading message.",
         )
     resolved_kwargs = resolve_chat_template_kwargs(
         tokenizer=tokenizer,

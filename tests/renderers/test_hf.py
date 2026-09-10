@@ -10,7 +10,9 @@ from aphrodite.renderers.hf import (
     _consolidate_system_messages,
     _convert_developer_to_system,
     _detect_developer_role_support,
+    _detect_requires_system_first,
     _get_hf_base_chat_template_params,
+    _has_late_system_message,
     _try_extract_ast,
     resolve_chat_template,
     resolve_chat_template_content_format,
@@ -897,3 +899,119 @@ class TestConsolidateSystemMessages:
         assert len(conversation) == original_len
         assert conversation[0]["role"] == "user"
         assert conversation[1]["role"] == "system"
+
+
+# A template that never renders, whatever the message ordering.
+ALWAYS_RAISES_TEMPLATE = "{{ raise_exception('always unhappy') }}"
+
+
+class TestHasLateSystemMessage:
+    def test_empty_conversation(self):
+        assert _has_late_system_message([]) is False
+
+    def test_single_leading_system(self):
+        conversation = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"},
+        ]
+        assert _has_late_system_message(conversation) is False
+
+    def test_no_system_at_all(self):
+        assert _has_late_system_message([{"role": "user", "content": "Hello"}]) is False
+
+    def test_system_after_first(self):
+        conversation = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Be concise."},
+        ]
+        assert _has_late_system_message(conversation) is True
+
+
+class TestDetectRequiresSystemFirst:
+    def test_system_first_template_requires_it(self):
+        assert _detect_requires_system_first(SYSTEM_FIRST_TEMPLATE) is True
+
+    def test_chatml_accepts_late_system(self):
+        assert _detect_requires_system_first(CHATML_TEMPLATE) is False
+
+    def test_strict_role_template_accepts_late_system(self):
+        assert _detect_requires_system_first(STRICT_ROLE_TEMPLATE) is False
+
+    def test_template_broken_for_other_reasons_not_flagged(self):
+        # Consolidating would not help, so don't claim it would.
+        assert _detect_requires_system_first(ALWAYS_RAISES_TEMPLATE) is False
+
+
+class TestSafeApplyChatTemplateSystemFirst:
+    """Multiple system messages, with no developer role anywhere in sight."""
+
+    @pytest.fixture
+    def model_config(self):
+        return ModelConfig(
+            "facebook/opt-125m",
+            tokenizer="facebook/opt-125m",
+            tokenizer_mode="auto",
+            trust_remote_code=False,
+            dtype="float16",
+        )
+
+    @pytest.fixture
+    def tokenizer(self):
+        return get_tokenizer("facebook/opt-125m")
+
+    def test_multiple_system_messages_consolidated(self, model_config, tokenizer):
+        conversation = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "What is 2+2?"},
+        ]
+        result = safe_apply_chat_template(
+            model_config,
+            tokenizer,
+            conversation,
+            chat_template=SYSTEM_FIRST_TEMPLATE,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        assert "You are helpful." in result
+        assert "Be concise." in result
+        assert "What is 2+2?" in result
+        assert result.count("<|im_start|>system") == 1
+
+    def test_late_system_only_consolidated(self, model_config, tokenizer):
+        conversation = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "What is 2+2?"},
+        ]
+        result = safe_apply_chat_template(
+            model_config,
+            tokenizer,
+            conversation,
+            chat_template=SYSTEM_FIRST_TEMPLATE,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        assert result.startswith("<|im_start|>system\nBe concise.")
+        assert "What is 2+2?" in result
+
+    def test_permissive_template_preserves_ordering(self, model_config, tokenizer):
+        conversation = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Be concise."},
+        ]
+        result = safe_apply_chat_template(
+            model_config,
+            tokenizer,
+            conversation,
+            chat_template=STRICT_ROLE_TEMPLATE,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        # Not consolidated: the template is happy with system messages anywhere.
+        assert result.index("You are helpful.") < result.index("Hello") < result.index("Be concise.")
+        assert result.count("<|im_start|>system") == 2
