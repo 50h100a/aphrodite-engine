@@ -16,12 +16,24 @@ from urllib3.util import parse_url
 
 import aphrodite.envs as envs
 from aphrodite.logger import init_logger
+from aphrodite.net_policy import (
+    AddressNotAllowedError,
+    AddressPolicy,
+    guarded_tcp_connector,
+    mount_guarded_adapter,
+)
+from aphrodite.utils.mem_constants import KiB_bytes
 from aphrodite.version import __version__ as APHRODITE_VERSION
 
 logger = init_logger(__name__)
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
+
+# Read granularity for a size-capped download. Large enough that the counter
+# costs nothing per MiB, small enough that the overshoot past the cap before
+# we notice is bounded by one chunk.
+_DOWNLOAD_CHUNK_SIZE = 64 * KiB_bytes
 
 # Multiplier applied to the sleep between retry attempts: attempt N sleeps
 # _RETRY_BACKOFF_FACTOR ** N seconds. The per-attempt timeout does NOT grow --
@@ -42,6 +54,76 @@ _FATAL_CONNECT_ERRNOS = frozenset(
         errno.EADDRNOTAVAIL,
     }
 )
+
+
+class ResponseTooLargeError(Exception):
+    """A response body exceeded the byte budget the caller allowed for it.
+
+    Deliberately not an ``OSError``/``ConnectionError`` subclass: those read
+    as transient to the retry ladder, and re-downloading a body we already
+    refused is exactly the amplification the cap exists to prevent.
+    """
+
+    def __init__(self, url: str, limit: int, size: int | None = None, *, declared: bool = False) -> None:
+        where = "Content-Length" if declared else "body"
+        seen = f" ({size} bytes)" if size is not None else ""
+        super().__init__(f"Response {where}{seen} for {url} exceeds the {limit} byte limit.")
+        self.url = url
+        self.limit = limit
+        self.size = size
+        self.declared = declared
+
+
+def _declared_oversize(headers: Mapping[str, str], max_bytes: int) -> int | None:
+    """The declared body size, if it is already over budget.
+
+    Advisory only -- a hostile origin can lie or omit it, which is why the
+    streaming counter below runs regardless. It is worth consulting because
+    an honest oversized response can be refused without transferring it.
+    """
+    raw = headers.get("Content-Length")
+    if raw is None:
+        return None
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return size if size > max_bytes else None
+
+
+def _read_capped(response: requests.Response, url: str, max_bytes: int) -> bytes:
+    """Read a body, stopping as soon as it goes over budget.
+
+    Counts decoded bytes, so a gzip bomb is measured at the size it would
+    actually occupy rather than the size it arrived as.
+    """
+    declared = _declared_oversize(response.headers, max_bytes)
+    if declared is not None:
+        raise ResponseTooLargeError(url, max_bytes, declared, declared=True)
+
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_content(_DOWNLOAD_CHUNK_SIZE):
+        total += len(chunk)
+        if total > max_bytes:
+            raise ResponseTooLargeError(url, max_bytes)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _read_capped_async(response: aiohttp.ClientResponse, url: str, max_bytes: int) -> bytes:
+    declared = _declared_oversize(response.headers, max_bytes)
+    if declared is not None:
+        raise ResponseTooLargeError(url, max_bytes, declared, declared=True)
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.content.iter_chunked(_DOWNLOAD_CHUNK_SIZE):
+        total += len(chunk)
+        if total > max_bytes:
+            raise ResponseTooLargeError(url, max_bytes)
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _is_permanent_connect_failure(exc: BaseException) -> bool:
@@ -95,8 +177,14 @@ def _is_retryable(exc: Exception) -> bool:
     Not retryable:
       - Client errors (4xx) -- bad URL, auth, not-found
       - Permanent connection failures -- refused, unroutable, DNS NXDOMAIN
+      - Policy refusals -- oversized body, address the policy rejects
       - Programming errors (ValueError, TypeError, ...)
     """
+    # Refusals we issued ourselves. Retrying re-downloads a body we already
+    # decided was too big, or grants another DNS resolution to a name whose
+    # last answer we rejected -- both make the abuse cheaper, not harder.
+    if isinstance(exc, (ResponseTooLargeError, AddressNotAllowedError)):
+        return False
     # Deterministic connection failures: retrying cannot change the outcome.
     if _is_permanent_connect_failure(exc):
         return False
@@ -296,19 +384,38 @@ def _async_retry(
 
 
 class HTTPConnection:
-    """Helper class to send HTTP requests."""
+    """Helper class to send HTTP requests.
 
-    def __init__(self, *, reuse_client: bool = True) -> None:
+    Args:
+        reuse_client: Cache and reuse the underlying session.
+        address_policy: If given, consulted with each resolved IP address
+            before a socket is opened, and again for every redirect hop.
+            Connections carrying a policy get their own session: pooled
+            connections are keyed by host, so sharing one with unpolicied
+            traffic would let an already-open connection serve a request
+            that the policy would have refused.
+    """
+
+    def __init__(
+        self,
+        *,
+        reuse_client: bool = True,
+        address_policy: AddressPolicy | None = None,
+    ) -> None:
         super().__init__()
 
         self.reuse_client = reuse_client
+        self.address_policy = address_policy
 
         self._sync_client: requests.Session | None = None
         self._async_client: aiohttp.ClientSession | None = None
 
     def get_sync_client(self) -> requests.Session:
         if self._sync_client is None or not self.reuse_client:
-            self._sync_client = requests.Session()
+            client = requests.Session()
+            if self.address_policy is not None:
+                mount_guarded_adapter(client, self.address_policy)
+            self._sync_client = client
 
         return self._sync_client
 
@@ -316,7 +423,10 @@ class HTTPConnection:
     # required, so that the client is only accessible inside async event loop
     async def get_async_client(self) -> aiohttp.ClientSession:
         if self._async_client is None or not self.reuse_client:
-            self._async_client = aiohttp.ClientSession(trust_env=True)
+            connector = None
+            if self.address_policy is not None:
+                connector = guarded_tcp_connector(self.address_policy)
+            self._async_client = aiohttp.ClientSession(trust_env=True, connector=connector)
 
         return self._async_client
 
@@ -376,6 +486,8 @@ class HTTPConnection:
     # the method bodies never see it. `validate_final_url`, when given, is
     # called with the URL actually served -- after any redirects -- so the
     # caller can re-apply host policy that the initial URL check performed.
+    # `max_bytes`, when given, bounds the body: without it a fetch is bounded
+    # only by the deadline, which at any real link speed is a lot of memory.
     @_sync_retry
     def get_bytes(
         self,
@@ -385,13 +497,21 @@ class HTTPConnection:
         deadline: float | None = None,
         allow_redirects: bool = True,
         validate_final_url: Callable[[str], None] | None = None,
+        max_bytes: int | None = None,
     ) -> bytes:
-        with self.get_response(url, timeout=timeout, allow_redirects=allow_redirects) as r:
+        # Streaming defers the body, which is also what lets
+        # `validate_final_url` run before a byte of it is transferred rather
+        # than after the whole thing has already been pulled from a host the
+        # redirect check is about to reject.
+        capped = max_bytes is not None
+        with self.get_response(url, stream=capped, timeout=timeout, allow_redirects=allow_redirects) as r:
             r.raise_for_status()
             if validate_final_url is not None:
                 validate_final_url(str(r.url))
 
-            return r.content
+            if max_bytes is None:
+                return r.content
+            return _read_capped(r, url, max_bytes)
 
     @_async_retry
     async def async_get_bytes(
@@ -402,13 +522,16 @@ class HTTPConnection:
         deadline: float | None = None,
         allow_redirects: bool = True,
         validate_final_url: Callable[[str], None] | None = None,
+        max_bytes: int | None = None,
     ) -> bytes:
         async with await self.get_async_response(url, timeout=timeout, allow_redirects=allow_redirects) as r:
             r.raise_for_status()
             if validate_final_url is not None:
                 validate_final_url(str(r.real_url))
 
-            return await r.read()
+            if max_bytes is None:
+                return await r.read()
+            return await _read_capped_async(r, url, max_bytes)
 
     def get_text(self, url: str, *, timeout: float | None = None) -> str:
         with self.get_response(url, timeout=timeout) as r:

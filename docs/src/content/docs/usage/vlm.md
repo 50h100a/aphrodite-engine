@@ -114,11 +114,21 @@ print("Chat response:", chat_response)
 ```
 
 :::tip
-By default, the timeout for fetching images through http url is `10` seconds. You can override this by setting this env variable:
+Fetching an image over http(s) is bounded two ways. A single attempt gets
+`APHRODITE_IMAGE_FETCH_TIMEOUT` seconds (default `5`) and all attempts together
+get `APHRODITE_IMAGE_FETCH_DEADLINE` seconds (default `10`); the body may be at
+most `APHRODITE_IMAGE_FETCH_MAX_SIZE_MB` MiB (default `64`), enforced against
+`Content-Length` and again as the body arrives, so an oversized response is
+dropped mid-transfer rather than after it lands. A request over any of these
+gets back HTTP 422.
 
 ```bash
-export APHRODITE_IMAGE_FETCH_TIMEOUT=<timeout>
+export APHRODITE_IMAGE_FETCH_TIMEOUT=<seconds>
+export APHRODITE_IMAGE_FETCH_DEADLINE=<seconds>
+export APHRODITE_IMAGE_FETCH_MAX_SIZE_MB=<mib>   # 0 to accept any size
 ```
+
+`VIDEO` and `AUDIO` variants of all three exist, with their own defaults.
 
 :::
 

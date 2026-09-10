@@ -54,6 +54,7 @@ from aphrodite.assets.video import VideoAsset
 from aphrodite.config.cache import CacheConfig
 from aphrodite.config.model import ConvertOption, RunnerOption, _get_and_verify_dtype
 from aphrodite.connections import global_http_connection
+from aphrodite.multimodal.media.connector import media_http_connection
 from aphrodite.distributed import (
     cleanup_dist_env_and_memory,
     init_distributed_environment,
@@ -220,6 +221,9 @@ def init_test_http_connection():
     # pytest_asyncio may use a different event loop per test
     # so we need to make sure the async client is created anew
     global_http_connection.reuse_client = False
+    # Media fetches run on their own connection (it carries the address
+    # policy), so it needs the same treatment.
+    media_http_connection.reuse_client = False
 
 
 @pytest.fixture

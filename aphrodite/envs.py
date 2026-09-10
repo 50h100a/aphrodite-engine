@@ -75,6 +75,9 @@ if TYPE_CHECKING:
     APHRODITE_IMAGE_FETCH_DEADLINE: int = 10
     APHRODITE_VIDEO_FETCH_DEADLINE: int = 45
     APHRODITE_AUDIO_FETCH_DEADLINE: int = 20
+    APHRODITE_IMAGE_FETCH_MAX_SIZE_MB: int = 64
+    APHRODITE_VIDEO_FETCH_MAX_SIZE_MB: int = 512
+    APHRODITE_AUDIO_FETCH_MAX_SIZE_MB: int = 64
     APHRODITE_MEDIA_ALLOWED_SOURCES: set[str] = {"remote", "private", "file", "data"}
     APHRODITE_MEDIA_CACHE: str = ""
     APHRODITE_MEDIA_CACHE_MAX_SIZE_MB: int = 5120
@@ -897,6 +900,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "APHRODITE_VIDEO_FETCH_DEADLINE": lambda: int(os.getenv("APHRODITE_VIDEO_FETCH_DEADLINE", "45")),
     # Total wall-clock budget for fetching one audio clip. Default is 20 seconds.
     "APHRODITE_AUDIO_FETCH_DEADLINE": lambda: int(os.getenv("APHRODITE_AUDIO_FETCH_DEADLINE", "20")),
+    # Largest media body accepted from a URL, per modality, in MiB. Enforced
+    # against Content-Length where the origin supplies one and against the
+    # decoded byte count as the body streams in, so the transfer is abandoned
+    # at the limit instead of after it. The decode-side limits
+    # (APHRODITE_MAX_IMAGE_PIXELS, APHRODITE_MAX_AUDIO_DECODE_DURATION_S)
+    # bound what the payload expands to; these bound the payload itself.
+    # Set to 0 to accept a body of any size.
+    "APHRODITE_IMAGE_FETCH_MAX_SIZE_MB": lambda: int(os.getenv("APHRODITE_IMAGE_FETCH_MAX_SIZE_MB", "64")),
+    "APHRODITE_VIDEO_FETCH_MAX_SIZE_MB": lambda: int(os.getenv("APHRODITE_VIDEO_FETCH_MAX_SIZE_MB", "512")),
+    "APHRODITE_AUDIO_FETCH_MAX_SIZE_MB": lambda: int(os.getenv("APHRODITE_AUDIO_FETCH_MAX_SIZE_MB", "64")),
     # Where the server will accept media from. Comma-separated, any of:
     #   remote  -- http(s) URLs on publicly routable hosts
     #   private -- http(s) URLs on loopback, private, link-local, reserved,
@@ -1968,6 +1981,9 @@ def compile_factors() -> dict[str, object]:
         "APHRODITE_IMAGE_FETCH_DEADLINE",
         "APHRODITE_VIDEO_FETCH_DEADLINE",
         "APHRODITE_AUDIO_FETCH_DEADLINE",
+        "APHRODITE_IMAGE_FETCH_MAX_SIZE_MB",
+        "APHRODITE_VIDEO_FETCH_MAX_SIZE_MB",
+        "APHRODITE_AUDIO_FETCH_MAX_SIZE_MB",
         "APHRODITE_MEDIA_ALLOWED_SOURCES",
         "APHRODITE_MEDIA_CACHE",
         "APHRODITE_MEDIA_CACHE_MAX_SIZE_MB",

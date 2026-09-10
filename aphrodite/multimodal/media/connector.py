@@ -24,10 +24,12 @@ from PIL import Image, UnidentifiedImageError
 from urllib3.util import Url, parse_url
 
 import aphrodite.envs as envs
-from aphrodite.connections import HTTPConnection, global_http_connection
+from aphrodite.connections import HTTPConnection, ResponseTooLargeError
 from aphrodite.exceptions import APHRODITEUnprocessableEntityError
 from aphrodite.logger import init_logger
 from aphrodite.multimodal.video import get_video_loader_backend_for_processor
+from aphrodite.net_policy import AddressNotAllowedError
+from aphrodite.utils.mem_constants import MiB_bytes
 from aphrodite.utils.registry import ExtensionManager
 
 from .audio import AudioEmbeddingMediaIO, AudioMediaIO
@@ -74,6 +76,25 @@ def _wrap_media_fetch_error(
     # _load_file_url); don't flatten its message.
     if isinstance(exc, APHRODITEUnprocessableEntityError):
         return exc
+
+    if isinstance(exc, ResponseTooLargeError):
+        logger.warning("Rejected media URL %s: %s", url, exc)
+        return APHRODITEUnprocessableEntityError(
+            "Media exceeds the maximum accepted size.",
+            parameter=parameter,
+            value=url,
+        )
+
+    if isinstance(exc, AddressNotAllowedError):
+        # Logged with the address, which is the part worth seeing: a name that
+        # passed the URL check and then resolved to something non-routable is
+        # the signature of a rebinding attempt, not a typo.
+        logger.warning("Blocked media URL %s: %s", url, exc)
+        return APHRODITEUnprocessableEntityError(
+            "Media URL host is not permitted.",
+            parameter=parameter,
+            value=url,
+        )
 
     if isinstance(exc, aiohttp.ClientResponseError):
         if exc.status in (408, 429):
@@ -200,8 +221,52 @@ def _assert_media_type_matches(
     )
 
 
+def _max_bytes(size_mb: int) -> int | None:
+    """A per-modality size cap in MiB, or `None` if the operator lifted it."""
+    return size_mb * MiB_bytes if size_mb > 0 else None
+
+
 def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_unspecified or ip.is_multicast
+
+
+def _media_address_allowed(address: str) -> bool:
+    """The `remote`/`private` split, asked of a resolved address.
+
+    This is the same policy `_assert_host_allowed` applies to a URL, moved to
+    where the address is about to be dialled. The URL check resolves a name to
+    decide whether to proceed and the HTTP client then resolves it again to
+    decide where to connect; a record with a short TTL can answer those two
+    lookups differently, so the first is a pre-flight and this is the one that
+    actually constrains the socket.
+    """
+    sources = envs.APHRODITE_MEDIA_ALLOWED_SOURCES
+    remote_ok = "remote" in sources
+    private_ok = "private" in sources
+    if remote_ok and private_ok:
+        return True
+
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        # Not something we can classify. The scheme and host checks in
+        # `_validate_media_url` have already run; leave the verdict to them
+        # rather than inventing one here.
+        return True
+
+    return private_ok if _is_blocked_ip(ip) else remote_ok
+
+
+media_http_connection = HTTPConnection(address_policy=_media_address_allowed)
+"""Connection used for media fetches.
+
+Kept separate from `global_http_connection` in both directions. Media traffic
+needs the address policy, and the other users of the global connection
+(usage reporting, batch-job inputs, asset downloads) are operator-configured
+rather than caller-supplied -- applying the media policy to them would break
+legitimately internal endpoints, and sharing a pooled connection with them
+would let media reuse a socket the policy never saw.
+"""
 
 
 def _allowed_sources() -> set[str]:
@@ -406,7 +471,7 @@ class MediaConnector:
     def __init__(
         self,
         media_io_kwargs: dict[str, dict[str, Any]] | None = None,
-        connection: HTTPConnection = global_http_connection,
+        connection: HTTPConnection | None = None,
         *,
         allowed_local_media_path: str = "",
         allowed_media_domains: list[str] | None = None,
@@ -418,6 +483,9 @@ class MediaConnector:
                              to set num_frames for video, set
                              `--media-io-kwargs '{"video":{"num_frames":40}}'`
             connection: HTTP connection client to download media contents.
+                        Defaults to `media_http_connection`, which enforces
+                        `APHRODITE_MEDIA_ALLOWED_SOURCES` at connect time.
+                        Passing another connection opts out of that.
             allowed_local_media_path: A local directory to load media files from.
             allowed_media_domains: If set, only media URLs that belong to this
                                    domain can be used for multi-modal inputs.
@@ -425,7 +493,7 @@ class MediaConnector:
         super().__init__()
 
         self.media_io_kwargs: dict[str, dict[str, Any]] = media_io_kwargs if media_io_kwargs else {}
-        self.connection = connection
+        self.connection = connection if connection is not None else media_http_connection
 
         if allowed_local_media_path:
             allowed_local_media_path_ = Path(allowed_local_media_path).resolve()
@@ -556,6 +624,7 @@ class MediaConnector:
         url: str,
         media_io: MediaIO[_M],
         parameter: str = "media_url",
+        max_bytes: int | None = None,
     ) -> _M:  # type: ignore[type-var]
         # Format per RFC 2397:
         # data:[<mediatype>][;base64],<data>
@@ -574,6 +643,13 @@ class MediaConnector:
             raise NotImplementedError(msg)
 
         _assert_media_type_matches(media_type, media_io, parameter)
+
+        # Same budget an http(s) body gets, checked from the encoded length so
+        # an oversized payload is refused without allocating the decode. Four
+        # base64 characters carry three bytes; padding only makes the estimate
+        # generous, which is the right direction for a limit.
+        if max_bytes is not None and (len(data) // 4) * 3 > max_bytes:
+            raise _reject_url("Media exceeds the maximum accepted size.", "data:...", parameter)
 
         return media_io.load_base64(media_type, data)
 
@@ -670,13 +746,14 @@ class MediaConnector:
         *,
         fetch_timeout: int | None = None,
         fetch_deadline: int | None = None,
+        fetch_max_bytes: int | None = None,
         parameter: str = "media_url",
     ) -> _M:  # type: ignore[type-var]
         # Reject clearly broken URLs before opening any socket.
         _validate_media_url(url, parameter)
 
         if url[:5].lower() == "data:":
-            return self._load_data_url(url, media_io, parameter)
+            return self._load_data_url(url, media_io, parameter, fetch_max_bytes)
 
         url_spec = parse_url(url)
         scheme = (url_spec.scheme or "").lower()
@@ -696,6 +773,7 @@ class MediaConnector:
                     deadline=fetch_deadline,
                     allow_redirects=envs.APHRODITE_MEDIA_URL_ALLOW_REDIRECTS,
                     validate_final_url=self._final_url_validator(parameter),
+                    max_bytes=fetch_max_bytes,
                 )
             except Exception as e:
                 wrapped = _wrap_media_fetch_error(url, e, parameter)
@@ -728,6 +806,7 @@ class MediaConnector:
         *,
         fetch_timeout: int | None = None,
         fetch_deadline: int | None = None,
+        fetch_max_bytes: int | None = None,
         parameter: str = "media_url",
     ) -> _M:
         loop = asyncio.get_running_loop()
@@ -738,7 +817,7 @@ class MediaConnector:
 
         if url[:5].lower() == "data:":
             future: asyncio.Future[_M] = loop.run_in_executor(
-                global_thread_pool, self._load_data_url, url, media_io, parameter
+                global_thread_pool, self._load_data_url, url, media_io, parameter, fetch_max_bytes
             )
             return await future
 
@@ -761,6 +840,7 @@ class MediaConnector:
                     deadline=fetch_deadline,
                     allow_redirects=envs.APHRODITE_MEDIA_URL_ALLOW_REDIRECTS,
                     validate_final_url=self._final_url_validator(parameter),
+                    max_bytes=fetch_max_bytes,
                 )
             except Exception as e:
                 wrapped = _wrap_media_fetch_error(url, e, parameter)
@@ -802,6 +882,7 @@ class MediaConnector:
             audio_io,
             fetch_timeout=envs.APHRODITE_AUDIO_FETCH_TIMEOUT,
             fetch_deadline=envs.APHRODITE_AUDIO_FETCH_DEADLINE,
+            fetch_max_bytes=_max_bytes(envs.APHRODITE_AUDIO_FETCH_MAX_SIZE_MB),
             parameter="audio_url",
         )
 
@@ -819,6 +900,7 @@ class MediaConnector:
             audio_io,
             fetch_timeout=envs.APHRODITE_AUDIO_FETCH_TIMEOUT,
             fetch_deadline=envs.APHRODITE_AUDIO_FETCH_DEADLINE,
+            fetch_max_bytes=_max_bytes(envs.APHRODITE_AUDIO_FETCH_MAX_SIZE_MB),
             parameter="audio_url",
         )
 
@@ -843,6 +925,7 @@ class MediaConnector:
                 image_io,
                 fetch_timeout=envs.APHRODITE_IMAGE_FETCH_TIMEOUT,
                 fetch_deadline=envs.APHRODITE_IMAGE_FETCH_DEADLINE,
+                fetch_max_bytes=_max_bytes(envs.APHRODITE_IMAGE_FETCH_MAX_SIZE_MB),
                 parameter="image_url",
             )
         except UnidentifiedImageError as e:
@@ -870,6 +953,7 @@ class MediaConnector:
                 image_io,
                 fetch_timeout=envs.APHRODITE_IMAGE_FETCH_TIMEOUT,
                 fetch_deadline=envs.APHRODITE_IMAGE_FETCH_DEADLINE,
+                fetch_max_bytes=_max_bytes(envs.APHRODITE_IMAGE_FETCH_MAX_SIZE_MB),
                 parameter="image_url",
             )
         except UnidentifiedImageError as e:
@@ -899,6 +983,7 @@ class MediaConnector:
             video_io,
             fetch_timeout=envs.APHRODITE_VIDEO_FETCH_TIMEOUT,
             fetch_deadline=envs.APHRODITE_VIDEO_FETCH_DEADLINE,
+            fetch_max_bytes=_max_bytes(envs.APHRODITE_VIDEO_FETCH_MAX_SIZE_MB),
             parameter="video_url",
         )
 
@@ -929,6 +1014,7 @@ class MediaConnector:
             video_io,
             fetch_timeout=envs.APHRODITE_VIDEO_FETCH_TIMEOUT,
             fetch_deadline=envs.APHRODITE_VIDEO_FETCH_DEADLINE,
+            fetch_max_bytes=_max_bytes(envs.APHRODITE_VIDEO_FETCH_MAX_SIZE_MB),
             parameter="video_url",
         )
 
