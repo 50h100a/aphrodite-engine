@@ -152,7 +152,6 @@ class OpenAIServingKobold(GenerateBaseServing):
         n = kai_payload.n or 1
 
         if (kai_payload.temperature or 0.0) < _SAMPLING_EPS:
-            n = 1
             top_p = 1.0
             top_k = -1
 

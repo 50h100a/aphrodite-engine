@@ -623,7 +623,6 @@ class SamplingParams(
             self.top_k = 0
             self.min_p = 0.0
             self.top_a = 0.0
-            self._verify_greedy_sampling()
 
         # eos_token_id is added to this by the engine
         self._all_stop_token_ids.update(self.stop_token_ids)
@@ -754,10 +753,6 @@ class SamplingParams(
         assert isinstance(self.bad_words, list)
         if any(not bad_word for bad_word in self.bad_words):
             raise ValueError(f"bad_words cannot contain an empty string. Got bad_words={self.bad_words}")
-
-    def _verify_greedy_sampling(self) -> None:
-        if self.n > 1:
-            raise ValueError(f"n must be 1 when using greedy sampling, got {self.n}.")
 
     def update_from_generation_config(
         self,

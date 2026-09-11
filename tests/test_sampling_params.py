@@ -48,3 +48,19 @@ def test_diffusion_accepts_top_k_top_p():
 def test_non_diffusion_models_unaffected():
     params = SamplingParams(temperature=0.7, top_k=10, seed=42)
     params.verify(MockModelConfig(), None, None, None)
+
+
+@pytest.mark.parametrize("n", [1, 2, 8])
+def test_greedy_allows_n_greater_than_one(n: int):
+    """Zero temperature no longer restricts `n` to 1; the n children are
+    simply identical."""
+    params = SamplingParams(n=n, temperature=0.0)
+    assert params.n == n
+    # Zero temperature still flattens the truncation params.
+    assert (params.top_p, params.top_k, params.min_p, params.top_a) == (1.0, 0, 0.0, 0.0)
+
+
+def test_greedy_with_dynatemp_allows_n_greater_than_one():
+    """`temperature=0` plus dynatemp is not actually greedy at sample time."""
+    params = SamplingParams(n=4, temperature=0.0, dynatemp_max=2.0)
+    assert params.n == 4
