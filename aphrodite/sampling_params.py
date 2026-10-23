@@ -737,7 +737,6 @@ class SamplingParams(
             self.top_k = 0
             self.min_p = 0.0
             self.top_a = 0.0
-            self._verify_greedy_sampling()
 
         # eos_token_id is added to this by the engine
         self._all_stop_token_ids.update(self.stop_token_ids)
@@ -894,10 +893,6 @@ class SamplingParams(
                     pending.extend(value.values())
                 else:
                     pending.extend(value)
-
-    def _verify_greedy_sampling(self) -> None:
-        if self.n > 1:
-            raise AphroditeValidationError(f"n must be 1 when using greedy sampling, got {self.n}.")
 
     def update_from_generation_config(
         self,
@@ -1370,7 +1365,7 @@ class SamplingParams(
         check_json_nesting(self.structured_outputs.structural_tag, structural_tag=True)
         # Reject json_object=False early to avoid engine-side crashes
         if self.structured_outputs.json_object is False:
-            raise ValueError(
+            raise AphroditeValidationError(
                 "structured_outputs.json_object must be True if set; omit "
                 "structured_outputs to disable structured outputs"
             )
@@ -1394,7 +1389,6 @@ class SamplingParams(
 
         from aphrodite.v1.structured_output.backend_guidance import (
             GuidanceBackend,
-            has_guidance_unsupported_json_features,
             validate_guidance_grammar,
         )
         from aphrodite.v1.structured_output.backend_lm_format_enforcer import (
@@ -1404,14 +1398,49 @@ class SamplingParams(
             validate_structured_output_request_outlines,
         )
         from aphrodite.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
+        from aphrodite.v1.structured_output.schema_features import (
+            get_backends_for_request,
+            get_structural_tag_backends,
+            get_structured_outputs_schema_error,
+        )
         from aphrodite.v1.structured_output.utils import grammar_is_likely_lark
+
+        # Reject constraints that no backend can enforce while decoding, before
+        # dispatching. Otherwise we get an exception (xgrammar, guidance) or a
+        # silent omission (outlines, lm-format-enforcer). API entrypoints screen
+        # for this, this check is just-in-case for direct engine use.
+        # (Now also rejects malformed schemas here)
+        # Under APHRODITE_STRUCTURED_OUTPUT_BEST_EFFORT this edits the request
+        # instead of refusing it, so the routing question below is asked of the
+        # schema that will actually be compiled.
+        schema_error = get_structured_outputs_schema_error(self.structured_outputs)
+        if schema_error is not None:
+            raise AphroditeValidationError(schema_error)
+
+        capable = get_backends_for_request(self.structured_outputs)
+        configured = backend.split(":", 1)[0]
+        if configured != "auto" and configured not in capable:
+            tag_backends = get_structural_tag_backends(self.structured_outputs.structural_tag)
+            if configured not in tag_backends:
+                # Not a matter of degree: it cannot read the tag at all, and
+                # says so only by raising from the engine's compile thread.
+                raise AphroditeValidationError(
+                    f"The '{configured}' structured output backend cannot compile the "
+                    "structural tag this request carries, which is how a tool call "
+                    f"reaches the grammar. Backends that can: {sorted(tag_backends)}."
+                )
+            raise AphroditeValidationError(
+                f"The '{configured}' structured output backend does not enforce every "
+                "keyword in this request's JSON schema, and would decode as though the "
+                f"schema said less than it does. Backends that would: {sorted(capable)}."
+            )
 
         if backend.startswith("xgrammar"):
             # xgrammar with no fallback
             validate_xgrammar_grammar(self)
         elif backend.startswith("guidance"):
             if _is_non_tekken_mistral(tokenizer=tokenizer):
-                raise ValueError(
+                raise AphroditeValidationError(
                     "Non-tekken Mistral tokenizers are not supported for the 'guidance'"
                     " structured output backend. Please either use a more recent "
                     "Mistral model, the ['xgrammar', 'outlines'] "
@@ -1467,47 +1496,31 @@ class SamplingParams(
             # will satisfy the most use cases without having to worry about
             # this setting. We include fallback behavior here, but not with any
             # other setting where a specific backend was specified.
-            try:
-                validate_xgrammar_grammar(self)
-                self.structured_outputs._backend = "xgrammar"
-            except AphroditeValidationError:
-                # The request either failed validation
-                # or includes some jsonschema feature(s) that
-                # are not supported in xgrammar.
-
-                skip_guidance = _is_non_tekken_mistral(tokenizer)
-
-                # Check if schema has features unsupported by guidance
-                so_params = self.structured_outputs
-                if not skip_guidance and so_params.json:
-                    if isinstance(so_params.json, str):
-                        try:
-                            schema = json_mod.loads(so_params.json)
-                        except json_mod.JSONDecodeError as e:
-                            raise AphroditeValidationError("Invalid JSON grammar specification.") from e
-                    else:
-                        schema = so_params.json
-                    skip_guidance = has_guidance_unsupported_json_features(schema)
-
-                if skip_guidance:
-                    # Fall back to outlines for non-Tekken Mistral tokenizers or
-                    # schemas containing features unsupported by guidance.
-                    validate_structured_output_request_outlines(self)
-                    self.structured_outputs._backend = "outlines"
-                else:
-                    # Fall back to guidance by default.
-                    if not GuidanceBackend.is_tokenizer_supported(tokenizer):
-                        raise AphroditeValidationError(
-                            "No compatible structured output backend was found for "
-                            "this request. XGrammar rejected the constraint, and "
-                            "Guidance does not support this tokenizer. Configure a "
-                            "fast tokenizer or select a compatible backend explicitly."
-                        ) from None
-                    validate_guidance_grammar(
-                        self,
-                        tokenizer=_get_llg_tokenizer(tokenizer),
-                    )
-                    self.structured_outputs._backend = "guidance"
+            candidates = [
+                ("xgrammar", lambda: validate_xgrammar_grammar(self)),
+                ("guidance", lambda: validate_guidance_grammar(self, tokenizer=_get_llg_tokenizer(tokenizer))),
+                ("outlines", lambda: validate_structured_output_request_outlines(self)),
+            ]
+            if _is_non_tekken_mistral(tokenizer) or not GuidanceBackend.is_tokenizer_supported(tokenizer):
+                capable -= {"guidance"}
+            first_error = None
+            for name, validate in candidates:
+                if name not in capable:
+                    continue
+                try:
+                    validate()
+                except (ValueError, AphroditeValidationError) as error:
+                    first_error = first_error or error
+                    continue
+                self.structured_outputs._backend = name
+                break
+            else:
+                if first_error is not None:
+                    raise first_error
+                raise AphroditeValidationError(
+                    f"No structured output backend available under backend='auto' can enforce this schema; "
+                    f"compatible backends: {sorted(capable)}."
+                )
             # Remember that this backend was set automatically
             self.structured_outputs._backend_was_auto = True
 

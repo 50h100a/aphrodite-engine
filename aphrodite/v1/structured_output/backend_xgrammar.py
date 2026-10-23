@@ -343,9 +343,7 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
 
         # array + some constraints is unsupported by xgrammar
         # Tracking issue: https://github.com/mlc-ai/xgrammar/issues/968
-        if "array" in schema_types and any(
-            key in obj for key in ("uniqueItems", "contains", "minContains", "maxContains")
-        ):
+        if "array" in schema_types and "maxContains" in obj:
             return True
 
         # string + format with unsupported keywords

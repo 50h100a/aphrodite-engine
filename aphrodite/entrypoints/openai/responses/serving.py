@@ -478,7 +478,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 trace_headers=trace_headers,
                 session_id=session_id,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
-                reasoning_ended=True if request._grammar_from_parser else None,
+                reasoning_ended=True if request._grammar_from_parser or request._tool_exclusion_grammar else None,
             )
             generators.append(generator)
 

@@ -7,6 +7,7 @@ import shutil
 import time
 from io import BytesIO
 from tempfile import NamedTemporaryFile, TemporaryDirectory
+from unittest.mock import patch
 
 import aiohttp
 import numpy as np
@@ -17,9 +18,10 @@ import torch
 from PIL import Image, ImageChops
 
 from aphrodite.assets.base import APHRODITE_S3_BUCKET_URL
+from aphrodite.exceptions import AphroditeUnprocessableEntityError
 from aphrodite.multimodal.image import convert_image_mode
 from aphrodite.multimodal.inputs import PlaceholderRange
-from aphrodite.multimodal.media import MediaConnector
+from aphrodite.multimodal.media import AudioMediaIO, MediaConnector
 
 # Test different image extensions (JPG/PNG) and formats (gray/RGB/RGBA)
 TEST_IMAGE_ASSETS = [
@@ -152,14 +154,14 @@ async def test_fetch_image_local_files(image_url: str):
         # Check that the images are equal
         assert not ImageChops.difference(image_sync, image_async).getbbox()
 
-        with pytest.raises(ValueError, match="must be a subpath"):
+        with pytest.raises(AphroditeUnprocessableEntityError, match="outside the permitted directory"):
             await local_connector.fetch_image_async(f"file://{temp_dir}/../{os.path.basename(image_url)}")
-        with pytest.raises(RuntimeError, match="Cannot load local files"):
+        with pytest.raises(AphroditeUnprocessableEntityError, match="Local file URLs are not accepted"):
             await connector.fetch_image_async(f"file://{temp_dir}/../{os.path.basename(image_url)}")
 
-        with pytest.raises(ValueError, match="must be a subpath"):
+        with pytest.raises(AphroditeUnprocessableEntityError, match="outside the permitted directory"):
             local_connector.fetch_image(f"file://{temp_dir}/../{os.path.basename(image_url)}")
-        with pytest.raises(RuntimeError, match="Cannot load local files"):
+        with pytest.raises(AphroditeUnprocessableEntityError, match="Local file URLs are not accepted"):
             connector.fetch_image(f"file://{temp_dir}/../{os.path.basename(image_url)}")
 
 
@@ -225,21 +227,21 @@ async def test_fetch_image_data_url_with_params():
 def test_fetch_image_data_url_malformed():
     connector = MediaConnector()
 
-    with pytest.raises(ValueError, match="missing ','"):
+    with pytest.raises(AphroditeUnprocessableEntityError, match="Malformed data:"):
         connector.fetch_image("data:image/png;base64")
 
-    with pytest.raises(NotImplementedError, match="base64"):
+    with pytest.raises(AphroditeUnprocessableEntityError, match="Malformed data:"):
         connector.fetch_image("data:text/plain,hello")
 
     # ";base64" requires the ";"; here "base64" is a (bogus) media type.
-    with pytest.raises(NotImplementedError, match="base64"):
+    with pytest.raises(AphroditeUnprocessableEntityError, match="Malformed data:"):
         connector.fetch_image("data:base64,aGVsbG8=")
 
     # Strict RFC 2397 grammar: lowercase "base64", no whitespace.
-    with pytest.raises(NotImplementedError, match="base64"):
+    with pytest.raises(AphroditeUnprocessableEntityError, match="base64"):
         connector.fetch_image("data:image/png;BASE64,aGVsbG8=")
 
-    with pytest.raises(NotImplementedError, match="base64"):
+    with pytest.raises(AphroditeUnprocessableEntityError, match="base64"):
         connector.fetch_image("data:image/png; base64,aGVsbG8=")
 
 
@@ -387,10 +389,10 @@ async def test_allowed_media_domains(video_url: str, num_frames: int):
     assert metadata_sync == metadata_async
 
     disallowed_url = "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png"
-    with pytest.raises(ValueError):
+    with pytest.raises(AphroditeUnprocessableEntityError):
         _, _ = connector.fetch_video(disallowed_url)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(AphroditeUnprocessableEntityError):
         _, _ = await connector.fetch_video_async(disallowed_url)
 
 
@@ -442,10 +444,10 @@ async def test_ssrf_bypass_backslash_disallowed_domain():
         allowed_media_domains=["safe.example.org"],
     )
 
-    with pytest.raises(ValueError, match="allowed domains"):
+    with pytest.raises(AphroditeUnprocessableEntityError, match="host is not permitted"):
         connector.fetch_image(bypass_url)
 
-    with pytest.raises(ValueError, match="allowed domains"):
+    with pytest.raises(AphroditeUnprocessableEntityError, match="host is not permitted"):
         await connector.fetch_image_async(bypass_url)
 
 
@@ -557,3 +559,82 @@ def test_get_cached_bytes_file_deleted_before_read():
         connector._media_cache_path(url).unlink()
 
         assert connector._get_cached_bytes(url) is None
+
+
+def _png_data_url(media_type: str) -> str:
+    """A valid PNG payload behind an arbitrary declared media type."""
+    buffer = BytesIO()
+    Image.new("RGB", (4, 4), (255, 128, 0)).save(buffer, "PNG")
+    return f"data:{media_type};base64,{base64.b64encode(buffer.getvalue()).decode('utf-8')}"
+
+
+@pytest.mark.parametrize(
+    "media_type",
+    [
+        "image/png",
+        "image/webp",  # any image/* subtype, whatever the payload really is
+        "IMAGE/PNG",  # media types are case-insensitive
+        "application/octet-stream",  # declares nothing; decoder still validates
+        "",  # ditto: no type declared at all
+    ],
+)
+def test_fetch_image_accepts_matching_data_url_media_type(media_type: str):
+    assert MediaConnector().fetch_image(_png_data_url(media_type)).size == (4, 4)
+
+
+@pytest.mark.parametrize(
+    "media_type",
+    [
+        "audio/wav",
+        "video/mp4",
+        "text/html",
+        "application/x-msdownload",
+        "not a media type at all",
+    ],
+)
+def test_fetch_image_rejects_mismatched_data_url_media_type(media_type: str):
+    """A data: URL may not claim a type that contradicts the field it arrived on.
+
+    The payload here decodes as a perfectly good PNG -- it is the declared type
+    that is wrong, and before this check it was simply never looked at.
+    """
+    with pytest.raises(AphroditeUnprocessableEntityError) as exc_info:
+        MediaConnector().fetch_image(_png_data_url(media_type))
+
+    assert exc_info.value.parameter == "image_url"
+
+
+@pytest.mark.asyncio
+async def test_fetch_image_async_rejects_mismatched_data_url_media_type():
+    with pytest.raises(AphroditeUnprocessableEntityError):
+        await MediaConnector().fetch_image_async(_png_data_url("audio/wav"))
+
+
+def test_fetch_video_rejects_mismatched_data_url_media_type():
+    with pytest.raises(AphroditeUnprocessableEntityError) as exc_info:
+        MediaConnector().fetch_video(_png_data_url("image/png"))
+
+    assert exc_info.value.parameter == "video_url"
+
+
+def test_fetch_audio_accepts_video_data_url_media_type():
+    """`use_audio_in_video` routes a video URL through the audio loader."""
+    connector = MediaConnector()
+    audio_io = AudioMediaIO()
+
+    # Only the media-type gate is under test; decoding the payload is not.
+    with patch.object(AudioMediaIO, "load_bytes", return_value=(np.zeros(1), 16000)):
+        assert connector._load_data_url(_png_data_url("video/mp4"), audio_io, "audio_url") is not None
+
+    with pytest.raises(AphroditeUnprocessableEntityError):
+        connector._load_data_url(_png_data_url("image/png"), audio_io, "audio_url")
+
+
+def test_fetch_image_embedding_ignores_media_type():
+    """Embedding loaders are reached by paths that carry no declared type."""
+    tensor = torch.zeros(2, 2)
+    buffer = BytesIO()
+    np.save(buffer, tensor.numpy())
+    data = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+    assert torch.equal(MediaConnector().fetch_image_embedding(data), tensor)

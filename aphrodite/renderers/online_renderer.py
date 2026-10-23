@@ -760,6 +760,7 @@ class OnlineRenderer:
             should_adjust_request = (
                 parser.always_adjust_request
                 or parser.reasoning_parser_cls is not None
+                or bool(getattr(request, "tools", None))
                 or tool_choice != "none"
                 or is_mistral_grammar_eligible
             )

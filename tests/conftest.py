@@ -228,6 +228,9 @@ def init_test_http_connection():
     # pytest_asyncio may use a different event loop per test
     # so we need to make sure the async client is created anew
     global_http_connection.reuse_client = False
+    from aphrodite.multimodal.media.connector import media_http_connection
+
+    media_http_connection.reuse_client = False
 
 
 @pytest.fixture

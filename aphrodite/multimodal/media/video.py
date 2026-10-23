@@ -38,6 +38,10 @@ class VideoMediaIO(MediaIO[MediaWithBytes[tuple[DecodedFrames, dict[str, Any]]]]
     (--mm-processor-device, EPD encode-only instances).
     """
 
+    # "video/jpeg" (a sequence of JPEG frames) is handled by `load_base64`,
+    # so the whole video/* tree is in scope here.
+    accepted_media_types = frozenset({"video"})
+
     @classmethod
     def merge_kwargs(
         cls,

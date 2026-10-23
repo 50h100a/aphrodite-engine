@@ -84,7 +84,7 @@ def test_degenerate_structured_outputs_rejected(structured_outputs, match):
     for the same reason: `json.loads("")` in `compile_grammar` would otherwise
     raise JSONDecodeError and surface as a per-request engine error."""
     params = SamplingParams(structured_outputs=structured_outputs)
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(AphroditeValidationError, match=match):
         params._validate_structured_outputs(
             _StubModelConfig(is_diffusion=False),
             StructuredOutputsConfig(),
@@ -304,14 +304,14 @@ def test_unhandled_spec_is_a_validation_error(validate):
             },
             "guidance",
         ),
-        # patternProperties + properties is also unsupported by guidance.
+        # Guidance enforces patternProperties; Outlines silently drops it.
         (
             {
                 "type": "object",
                 "properties": {"a": {"type": "string"}},
                 "patternProperties": {"^a$": {"type": "string"}},
             },
-            "outlines",
+            "guidance",
         ),
     ],
 )

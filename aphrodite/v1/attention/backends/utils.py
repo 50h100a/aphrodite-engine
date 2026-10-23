@@ -407,6 +407,7 @@ def infer_global_hyperparameters(
     - `window_left`
     - `logits_soft_cap`
     - `sm_scale`
+    - `has_sinks`
 
     So this function asserts that all layers share the same values for these
     hyperparameters and returns the global values.

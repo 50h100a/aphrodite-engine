@@ -1357,7 +1357,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 "FlashInfer backend currently only supports models in which "
                 "all layers share the same values for the following "
                 "hyperparameters: `window_left`, `logits_soft_cap`, "
-                "`sm_scale`."
+                "`sm_scale`, `has_sinks`."
             )
 
         # Step 2: Initialize the output metadata

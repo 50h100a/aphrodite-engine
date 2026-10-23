@@ -19,6 +19,7 @@ import aphrodite.v1.hisparse.binding as attn_utils_module
 import aphrodite.v1.hisparse.runtime as hisparse_runtime_module
 from aphrodite.config.compilation import CompilationConfig, CUDAGraphMode
 from aphrodite.v1.attention.backend import AttentionBackend, AttentionCGSupport, MultipleOf
+from aphrodite.v1.attention.backends.utils import PerLayerParameters, infer_global_hyperparameters
 from aphrodite.v1.core.kv_cache_utils import KVCacheBlockCopy
 from aphrodite.v1.hisparse.binding import allocate_hisparse_kv_caches
 from aphrodite.v1.kv_cache_interface import (
@@ -124,6 +125,49 @@ def test_get_kv_cache_spec_tags_draft_layers(monkeypatch):
 
     specs = attn_utils.get_kv_cache_spec(config)
     assert specs["draft"].is_draft and not specs["target"].is_draft
+
+
+@pytest.mark.parametrize("draft_has_sink", [False, True])
+def test_init_attn_backend_groups_by_sink_presence(monkeypatch, draft_has_sink):
+    """GPT-OSS and DFlash share cache geometry but differ in sink presence.
+
+    Native FlashInfer prefill plans one sink policy per metadata builder.
+    Keep compatible layers together without mixing sink and sink-free layers.
+    """
+    spec = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=torch.bfloat16)
+    backend = SimpleNamespace(full_cls_name=lambda: ("test", "FlashInfer"))
+    sinks = {"target.0": True, "draft": draft_has_sink, "target.1": True}
+    layers = {
+        name: SimpleNamespace(
+            get_attn_backend=lambda: backend,
+            num_heads=64,
+            kv_cache_dtype="fp8",
+            has_sink=has_sink,
+        )
+        for name, has_sink in sinks.items()
+    }
+    monkeypatch.setattr(attn_utils, "get_shared_kv_cache_layers", lambda _: {})
+    monkeypatch.setattr(attn_utils, "get_kv_sharing_fast_prefill_eligible_layers", lambda *_: set())
+    monkeypatch.setattr(attn_utils, "get_layers_from_aphrodite_config", lambda *_: layers)
+    monkeypatch.setattr(attn_utils, "prepare_kernel_block_sizes", lambda *_: [16])
+    monkeypatch.setattr(attn_utils, "get_num_ubatches", lambda _: 1)
+    monkeypatch.setattr(attn_utils, "get_attn_cg_support", lambda *_: None)
+
+    def check_builder_params(group, **kwargs):
+        params = {name: PerLayerParameters(-1, None, 0.125, sinks[name]) for name in group.layer_names}
+        assert infer_global_hyperparameters(params).has_same_all_params
+
+    monkeypatch.setattr(AttentionGroup, "create_metadata_builders", check_builder_params)
+    config = SimpleNamespace(parallel_config=None)
+    cache = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(list(layers), spec)],
+    )
+    groups, _, block_sizes = attn_utils.init_attn_backend(cache, config, torch.device("cpu"))
+    expected = [["target.0", "draft", "target.1"]] if draft_has_sink else [["target.0", "target.1"], ["draft"]]
+    assert [group.layer_names for group in groups[0]] == expected
+    assert block_sizes == [16]
 
 
 class _FakeMetadataBuilder:

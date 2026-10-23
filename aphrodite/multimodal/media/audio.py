@@ -504,6 +504,8 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray, float]]):
     error handling.
     """
 
+    accepted_media_types = frozenset({"audio", "video"})
+
     def __init__(self, *, decoded_budget: MediaDecodedBudget | None = None, **kwargs) -> None:
         super().__init__()
         self.decoded_budget = decoded_budget

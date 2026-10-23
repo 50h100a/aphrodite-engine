@@ -262,3 +262,19 @@ def test_extra_args_preserves_custom_objects_and_shared_containers():
     params = SamplingParams(extra_args=extra_args)
     assert params.extra_args["first"][0] is custom
     assert params.extra_args["first"] is params.extra_args["second"]
+
+
+@pytest.mark.parametrize("n", [1, 2, 8])
+def test_greedy_allows_n_greater_than_one(n: int):
+    """Zero temperature no longer restricts `n` to 1; the n children are
+    simply identical."""
+    params = SamplingParams(n=n, temperature=0.0)
+    assert params.n == n
+    # Zero temperature still flattens the truncation params.
+    assert (params.top_p, params.top_k, params.min_p, params.top_a) == (1.0, 0, 0.0, 0.0)
+
+
+def test_greedy_with_dynatemp_allows_n_greater_than_one():
+    """`temperature=0` plus dynatemp is not actually greedy at sample time."""
+    params = SamplingParams(n=4, temperature=0.0, dynatemp_max=2.0)
+    assert params.n == 4

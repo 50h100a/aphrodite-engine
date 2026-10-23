@@ -71,6 +71,13 @@ if TYPE_CHECKING:
     APHRODITE_IMAGE_FETCH_TIMEOUT: int = 5
     APHRODITE_VIDEO_FETCH_TIMEOUT: int = 30
     APHRODITE_AUDIO_FETCH_TIMEOUT: int = 10
+    APHRODITE_IMAGE_FETCH_DEADLINE: int = 10
+    APHRODITE_VIDEO_FETCH_DEADLINE: int = 45
+    APHRODITE_AUDIO_FETCH_DEADLINE: int = 20
+    APHRODITE_IMAGE_FETCH_MAX_SIZE_MB: int = 64
+    APHRODITE_VIDEO_FETCH_MAX_SIZE_MB: int = 512
+    APHRODITE_AUDIO_FETCH_MAX_SIZE_MB: int = 64
+    APHRODITE_MEDIA_ALLOWED_SOURCES: set[str] = {"remote", "private", "file", "data"}
     APHRODITE_MEDIA_CACHE: str = ""
     APHRODITE_MEDIA_CACHE_MAX_SIZE_MB: int = 5120
     APHRODITE_MEDIA_CACHE_TTL_HOURS: float = 24
@@ -228,6 +235,7 @@ if TYPE_CHECKING:
     APHRODITE_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE: bool = False
     APHRODITE_XGRAMMAR_CACHE_MB: int = 0
     APHRODITE_REGEX_COMPILATION_TIMEOUT_S: int = 5
+    APHRODITE_STRUCTURED_OUTPUT_BEST_EFFORT: bool = False
     APHRODITE_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
     APHRODITE_ALLOW_INSECURE_SERIALIZATION: bool = False
     APHRODITE_DISABLE_REQUEST_ID_RANDOMIZATION: bool = False
@@ -250,6 +258,7 @@ if TYPE_CHECKING:
     APHRODITE_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
     APHRODITE_ENFORCE_STRICT_TOOL_CALLING: bool = True
     APHRODITE_BEAM_ALWAYS_CONSTRAIN_OUTPUT: bool = True
+    APHRODITE_FORCE_BOS: bool = False
     APHRODITE_MQ_MAX_CHUNK_BYTES_MB: int = 16
     APHRODITE_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300
     APHRODITE_WORKER_SHUTDOWN_TIMEOUT_SECONDS: int = 5
@@ -501,6 +510,25 @@ def env_set_with_choices(
     return _get_validated_env_set
 
 
+_MEDIA_SOURCES = ["remote", "private", "file", "data"]
+
+
+def _media_allowed_sources() -> set[str]:
+    """Resolve `APHRODITE_MEDIA_ALLOWED_SOURCES`.
+
+    Names are matched case-insensitively but compared lowercase downstream, so
+    normalise here rather than leaving the caller's spelling to be tested
+    against `"remote"`.
+    """
+    chosen = env_set_with_choices(
+        "APHRODITE_MEDIA_ALLOWED_SOURCES",
+        _MEDIA_SOURCES,
+        _MEDIA_SOURCES,
+        case_sensitive=False,
+    )()
+    return {source.lower() for source in chosen}
+
+
 def get_aphrodite_port() -> int | None:
     """Get the port from APHRODITE_PORT environment variable.
 
@@ -634,7 +662,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "APHRODITE_BATCH_INVARIANT": lambda: bool(int(os.getenv("APHRODITE_BATCH_INVARIANT", "0"))),
-    "APHRODITE_REPLICATE_EMBED": lambda: (os.getenv("APHRODITE_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")),
+    "APHRODITE_REPLICATE_EMBED": lambda: os.getenv("APHRODITE_REPLICATE_EMBED", "0").strip().lower() in ("1", "true"),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on
     # Intel XPU; the non-TD branch is dead-code-eliminated at Triton
@@ -896,6 +924,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Timeout for fetching audio when serving multimodal models
     # Default is 10 seconds
     "APHRODITE_AUDIO_FETCH_TIMEOUT": lambda: int(os.getenv("APHRODITE_AUDIO_FETCH_TIMEOUT", "10")),
+    # Total wall-clock budget for fetching one image, covering every retry
+    # attempt and the sleeps between them. Default is 10 seconds.
+    "APHRODITE_IMAGE_FETCH_DEADLINE": lambda: int(os.getenv("APHRODITE_IMAGE_FETCH_DEADLINE", "10")),
+    # Total wall-clock budget for fetching one video. Default is 45 seconds.
+    "APHRODITE_VIDEO_FETCH_DEADLINE": lambda: int(os.getenv("APHRODITE_VIDEO_FETCH_DEADLINE", "45")),
+    # Total wall-clock budget for fetching one audio clip. Default is 20 seconds.
+    "APHRODITE_AUDIO_FETCH_DEADLINE": lambda: int(os.getenv("APHRODITE_AUDIO_FETCH_DEADLINE", "20")),
+    # Largest media body accepted from a URL, per modality, in MiB. Enforced
+    # against Content-Length where the origin supplies one and against the
+    # decoded byte count as the body streams in, so the transfer is abandoned
+    # at the limit instead of after it. The decode-side limits
+    # (APHRODITE_MAX_IMAGE_PIXELS, APHRODITE_MAX_AUDIO_DECODE_DURATION_S)
+    # bound what the payload expands to; these bound the payload itself.
+    # Set to 0 to accept a body of any size.
+    "APHRODITE_IMAGE_FETCH_MAX_SIZE_MB": lambda: int(os.getenv("APHRODITE_IMAGE_FETCH_MAX_SIZE_MB", "64")),
+    "APHRODITE_VIDEO_FETCH_MAX_SIZE_MB": lambda: int(os.getenv("APHRODITE_VIDEO_FETCH_MAX_SIZE_MB", "512")),
+    "APHRODITE_AUDIO_FETCH_MAX_SIZE_MB": lambda: int(os.getenv("APHRODITE_AUDIO_FETCH_MAX_SIZE_MB", "64")),
+    # Where the server will accept media from. Comma-separated, any of:
+    #   remote  -- http(s) URLs on publicly routable hosts
+    #   private -- http(s) URLs on loopback, private, link-local, reserved,
+    #              unspecified or multicast hosts, and the names `localhost`,
+    #              `*.local` and `*.localhost`
+    #   file    -- file:// URLs (still additionally gated by
+    #              --allowed-local-media-path, which is off by default)
+    #   data    -- data: URLs carrying the payload inline
+    # All four by default, which is no policy at all. Drop `private` to harden
+    # against SSRF; leave only `data` to refuse retrieval entirely and require
+    # callers to inline their media.
+    "APHRODITE_MEDIA_ALLOWED_SOURCES": _media_allowed_sources,
     # Directory for caching media downloads (images, video, audio fetched
     # from URLs during inference). Empty string disables caching.
     "APHRODITE_MEDIA_CACHE": lambda: os.getenv("APHRODITE_MEDIA_CACHE", ""),
@@ -905,8 +962,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Time-to-live in hours for cached media files. Entries older than this
     # are evicted regardless of cache size. Default is 24 hours.
     "APHRODITE_MEDIA_CACHE_TTL_HOURS": lambda: float(os.getenv("APHRODITE_MEDIA_CACHE_TTL_HOURS", "24")),
-    # Maximum number of retries for fetching media (images, audio, video)
-    # from URLs. Each retry quadruples the timeout. Default is 3.
+    # Maximum number of attempts for fetching media (images, audio, video)
+    # from URLs. Attempts stop early once the modality's fetch deadline is
+    # spent, and deterministic failures are not retried at all. Default is 3.
     "APHRODITE_MEDIA_FETCH_MAX_RETRIES": lambda: int(os.getenv("APHRODITE_MEDIA_FETCH_MAX_RETRIES", "3")),
     # Maximum size in MB for a single remote media download. The limit is
     # enforced while streaming the response body so oversized or infinite
@@ -1091,7 +1149,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         [] if "APHRODITE_DISABLED_KERNELS" not in os.environ else os.environ["APHRODITE_DISABLED_KERNELS"].split(",")
     ),
     # Selects hw-agnostic layers for HF transformer backend
-    "APHRODITE_USE_HW_AGNOSTIC": lambda: (os.getenv("APHRODITE_USE_HW_AGNOSTIC", "False").lower() in ("true", "1")),
+    "APHRODITE_USE_HW_AGNOSTIC": lambda: os.getenv("APHRODITE_USE_HW_AGNOSTIC", "False").lower() in ("true", "1"),
     "APHRODITE_ENABLE_FLA_PACKED_RECURRENT_DECODE": lambda: bool(
         int(os.getenv("APHRODITE_ENABLE_FLA_PACKED_RECURRENT_DECODE", "1"))
     ),
@@ -1125,7 +1183,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "APHRODITE_MXFP8_EMULATION_DEQUANT_AT_LOAD": lambda: (
         os.getenv("APHRODITE_MXFP8_EMULATION_DEQUANT_AT_LOAD", "True").lower() in ("true", "1")
     ),
-    "APHRODITE_ROCM_USE_AITER": lambda: (os.getenv("APHRODITE_ROCM_USE_AITER", "False").lower() in ("true", "1")),
+    "APHRODITE_ROCM_USE_AITER": lambda: os.getenv("APHRODITE_ROCM_USE_AITER", "False").lower() in ("true", "1"),
     # Use AITER's CustomAllreduce as the custom-allreduce backend inside Aphrodite's
     # CudaCommunicator on ROCm. Also enables AITER AG/RS for DP communication.
     "APHRODITE_ROCM_USE_AITER_CUSTOM_AR": lambda: (
@@ -1143,9 +1201,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Whether to use aiter moe ops.
     # By default is enabled.
-    "APHRODITE_ROCM_USE_AITER_MOE": lambda: (
-        os.getenv("APHRODITE_ROCM_USE_AITER_MOE", "True").lower() in ("true", "1")
-    ),
+    "APHRODITE_ROCM_USE_AITER_MOE": lambda: os.getenv("APHRODITE_ROCM_USE_AITER_MOE", "True").lower() in ("true", "1"),
     # Activation dtype for the Kimi-K3 SiTU MXFP4 MoE (AITER FlyDSL SiTUv2):
     # auto (= a4w4), a4w4, a8w4 or a16w4. Legacy 1/0 mean a4w4/a16w4.
     "APHRODITE_ROCM_USE_AITER_MOE_SITUV2": env_with_choices(
@@ -1176,9 +1232,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Whether to use aiter mla ops.
     # By default is enabled.
-    "APHRODITE_ROCM_USE_AITER_MLA": lambda: (
-        os.getenv("APHRODITE_ROCM_USE_AITER_MLA", "True").lower() in ("true", "1")
-    ),
+    "APHRODITE_ROCM_USE_AITER_MLA": lambda: os.getenv("APHRODITE_ROCM_USE_AITER_MLA", "True").lower() in ("true", "1"),
     # Kernel for causal multi-token (spec-decode) verify steps under decode
     # context parallelism: "asm" uses AITER's round-robin ASM decode (gfx950),
     # "segmented" the Triton segmented MLA path. "auto" (default) takes "asm"
@@ -1205,9 +1259,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Whether to use aiter mha ops.
     # By default is enabled.
-    "APHRODITE_ROCM_USE_AITER_MHA": lambda: (
-        os.getenv("APHRODITE_ROCM_USE_AITER_MHA", "True").lower() in ("true", "1")
-    ),
+    "APHRODITE_ROCM_USE_AITER_MHA": lambda: os.getenv("APHRODITE_ROCM_USE_AITER_MHA", "True").lower() in ("true", "1"),
     # Whether sparse MLA prefill and decode run on aiter's Triton kernel, which
     # reads the KV cache as stored (bf16 or fp8, paged or flat). Used by the
     # ROCM_AITER_MLA_SPARSE backend (DeepSeek V3.2, GLM-5.x) and DeepSeek
@@ -1509,6 +1561,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # adversarial patterns cause exponential DFA state-space explosion.
     # Set to 0 to disable the timeout (not recommended in production).
     "APHRODITE_REGEX_COMPILATION_TIMEOUT_S": lambda: int(os.getenv("APHRODITE_REGEX_COMPILATION_TIMEOUT_S", "5")),
+    # Best-effort structured output. A schema using a keyword nothing can
+    # enforce while decoding -- `if`/`then`, `not`, the `dependent*` pair, and
+    # `contains`/`uniqueItems` where they sit somewhere the decode-time layer
+    # cannot keep them -- is rejected with a 400 by default, because
+    # accepting it would promise a constraint nothing applies. Set this to 1 and
+    # those keywords are instead stripped from the schema before it is compiled:
+    # the request succeeds, everything else in the schema is still enforced, and
+    # the dropped keywords are the caller's to validate afterwards. Nothing is
+    # said to the caller; the drop is logged once per keyword set on the server.
+    # Only keywords no backend enforces are affected -- a schema whose keywords
+    # are individually enforceable but have no backend in common is still a 400,
+    # since one of the two is enforceable and picking which to break is not ours.
+    "APHRODITE_STRUCTURED_OUTPUT_BEST_EFFORT": lambda: bool(
+        int(os.getenv("APHRODITE_STRUCTURED_OUTPUT_BEST_EFFORT", "0"))
+    ),
     # Control the threshold for msgspec to use 'zero copy' for
     # serialization/deserialization of tensors. Tensors below
     # this limit will be encoded into the msgpack buffer, and
@@ -1626,7 +1693,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "APHRODITE_TOOL_PARSE_REGEX_TIMEOUT_SECONDS": lambda: int(
         os.getenv("APHRODITE_TOOL_PARSE_REGEX_TIMEOUT_SECONDS", "1")
     ),
-    # Enforce function parameter schemas in structural-tag based tool calling.
+    # Enable structural-tag constraints for tool calling; --tool-strict-level
+    # selects whether function names or argument schemas are constrained.
     "APHRODITE_ENFORCE_STRICT_TOOL_CALLING": lambda: (
         os.getenv("APHRODITE_ENFORCE_STRICT_TOOL_CALLING", "True").lower() in ("true", "1")
     ),
@@ -1635,6 +1703,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "APHRODITE_BEAM_ALWAYS_CONSTRAIN_OUTPUT": lambda: (
         os.getenv("APHRODITE_BEAM_ALWAYS_CONSTRAIN_OUTPUT", "True").lower() in ("true", "1")
     ),
+    # Prepend BOS when add_special_tokens was requested but the tokenizer did
+    # not emit one. Needed for model repos whose tokenizer.json ships an empty
+    # TemplateProcessing post-processor, which silently makes add_special_tokens
+    # a no-op; BOS-trained models (Gemma) then degenerate into repetition loops.
+    # Off by default: models that intentionally omit BOS must not get one.
+    "APHRODITE_FORCE_BOS": lambda: os.getenv("APHRODITE_FORCE_BOS", "False").lower() in ("true", "1"),
     # Control the max chunk bytes (in MB) for the rpc message queue.
     # Object larger than this threshold will be broadcast to worker
     # processes via zmq.
@@ -2129,6 +2203,13 @@ def compile_factors() -> dict[str, object]:
         "APHRODITE_IMAGE_FETCH_TIMEOUT",
         "APHRODITE_VIDEO_FETCH_TIMEOUT",
         "APHRODITE_AUDIO_FETCH_TIMEOUT",
+        "APHRODITE_IMAGE_FETCH_DEADLINE",
+        "APHRODITE_VIDEO_FETCH_DEADLINE",
+        "APHRODITE_AUDIO_FETCH_DEADLINE",
+        "APHRODITE_IMAGE_FETCH_MAX_SIZE_MB",
+        "APHRODITE_VIDEO_FETCH_MAX_SIZE_MB",
+        "APHRODITE_AUDIO_FETCH_MAX_SIZE_MB",
+        "APHRODITE_MEDIA_ALLOWED_SOURCES",
         "APHRODITE_MEDIA_CACHE",
         "APHRODITE_MEDIA_CACHE_MAX_SIZE_MB",
         "APHRODITE_MEDIA_CACHE_TTL_HOURS",

@@ -50,6 +50,7 @@ from aphrodite.tokenizers import TokenizerLike
 from aphrodite.utils.async_utils import merge_async_iterators
 from aphrodite.utils.collection_utils import as_list
 from aphrodite.utils.serial_utils import numpy2base64
+from aphrodite.v1.structured_output.schema_features import get_structured_outputs_schema_error
 
 logger = init_logger(__name__)
 
@@ -173,6 +174,10 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 )
 
             request_id_item = f"{request_id}-{i}"
+
+            schema_error = get_structured_outputs_schema_error(sampling_params.structured_outputs)
+            if schema_error is not None:
+                raise AphroditeValidationError(schema_error, parameter="structured_outputs")
 
             self._log_inputs(
                 request_id_item,
@@ -381,6 +386,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                             logprob_token_ids=request.logprob_token_ids,
                             initial_text_offset=next_text_offsets[i],
                             return_as_token_id=request.return_tokens_as_token_ids,
+                            skip_special_tokens=request.skip_special_tokens,
                         )
                         # Advance by the tokens just reported, not by delta_text:
                         # text held back for stop strings lags the tokens.
@@ -546,6 +552,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                         num_output_top_logprobs=request.logprobs,
                         logprob_token_ids=request.logprob_token_ids,
                         return_as_token_id=request.return_tokens_as_token_ids,
+                        skip_special_tokens=request.skip_special_tokens,
                     )
                 else:
                     logprobs = None
@@ -620,6 +627,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
         logprob_token_ids: list[int] | None = None,
         initial_text_offset: int = 0,
         return_as_token_id: bool | None = None,
+        skip_special_tokens: bool = True,
     ) -> CompletionLogProbs:
         """Create logprobs for OpenAI Completion API."""
         out_text_offset: list[int] = []
@@ -632,6 +640,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
         should_return_as_token_id = (
             return_as_token_id if return_as_token_id is not None else self.return_tokens_as_token_ids
         )
+        hidden_ids = frozenset(getattr(tokenizer, "all_special_ids", ()) or ()) if skip_special_tokens else frozenset()
         for i, token_id in enumerate(token_ids):
             step_top_logprobs = top_logprobs[i]
             if step_top_logprobs is None:
@@ -685,6 +694,9 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     }
                 )
 
+            if token_id in hidden_ids and not should_return_as_token_id:
+                token = ""
+                out_tokens[-1] = ""
             if len(out_text_offset) == 0:
                 out_text_offset.append(initial_text_offset)
             else:

@@ -235,6 +235,10 @@ class ParserEngineToolAdapter(ToolParser):
     def finish_streaming(self) -> DeltaMessage | None:
         return self._parser_engine.finish_streaming()
 
+    @property
+    def tool_call_entry_markers(self) -> tuple[str, ...]:
+        return self._parser_engine.tool_call_entry_markers
+
 
 def make_adapters(
     parser_engine_cls: type[ParserEngine],

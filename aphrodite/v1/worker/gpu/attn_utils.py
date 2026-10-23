@@ -216,8 +216,8 @@ def init_attn_backend(
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_aphrodite_config(aphrodite_config, layer_type, layer_names)
 
-        group_map: dict[tuple[tuple[str, str], KVCacheSpec, int, str | None], AttentionGroup] = {}
-        group_order: list[tuple[tuple[str, str], KVCacheSpec, int, str | None]] = []
+        group_map: dict[tuple[tuple[str, str], KVCacheSpec, int, str | None, bool], AttentionGroup] = {}
+        group_order: list[tuple[tuple[str, str], KVCacheSpec, int, str | None, bool]] = []
 
         for layer_name in layer_names:
             attn_backend = attn_layers[layer_name].get_attn_backend()
@@ -235,7 +235,11 @@ def init_attn_backend(
             # metadata builders.
             num_heads_q = getattr(attn_layers[layer_name], "num_heads", 0)
             layer_cache_dtype = getattr(attn_layers[layer_name], "kv_cache_dtype", None)
-            key = (attn_backend.full_cls_name(), layer_kv_cache_spec, num_heads_q, layer_cache_dtype)
+            # FlashInfer plans sink-aware prefill per metadata builder. A
+            # sink-free drafter (e.g. DFlash for GPT-OSS) can share the target's
+            # cache geometry and Q-head count, but not its sink policy.
+            has_sink = getattr(attn_layers[layer_name], "has_sink", False)
+            key = (attn_backend.full_cls_name(), layer_kv_cache_spec, num_heads_q, layer_cache_dtype, has_sink)
             if key not in group_map:
                 group_map[key] = AttentionGroup(
                     attn_backend,

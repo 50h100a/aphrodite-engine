@@ -152,7 +152,6 @@ class OpenAIServingKobold(GenerateBaseServing):
         n = kai_payload.n or 1
 
         if (kai_payload.temperature or 0.0) < _SAMPLING_EPS:
-            n = 1
             top_p = 1.0
             top_k = -1
 
@@ -163,7 +162,7 @@ class OpenAIServingKobold(GenerateBaseServing):
         sampling_params = SamplingParams(
             n=n,
             repetition_penalty=kai_payload.rep_pen or 1.0,
-            temperature=kai_payload.temperature or 1.0,
+            temperature=kai_payload.temperature if kai_payload.temperature is not None else 1.0,
             smoothing_factor=kai_payload.smoothing_factor or 0.0,
             smoothing_curve=kai_payload.smoothing_curve or 1.0,
             tfs=tfs,

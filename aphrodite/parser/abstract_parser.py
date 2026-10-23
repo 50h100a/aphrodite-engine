@@ -36,6 +36,7 @@ from aphrodite.exceptions import AphroditeValidationError
 from aphrodite.logger import init_logger
 from aphrodite.parser.engine.adapters import ParserEngineToolAdapter
 from aphrodite.parser.metrics import record_tool_parser_invocation
+from aphrodite.parser.tool_call_exclusion import exclusion_grammar
 from aphrodite.parser.utils import count_history_tool_calls
 from aphrodite.reasoning.abs_reasoning_parsers import ReasoningParser
 from aphrodite.renderers.chat_utils import (
@@ -61,6 +62,25 @@ from aphrodite.tool_parsers.structural_tag_registry import (
 from aphrodite.tool_parsers.tool_strict_level import ToolStrictLevel
 
 logger = init_logger(__name__)
+
+
+def _has_reply_constraint(request: "ChatCompletionRequest | ResponsesRequest") -> bool:
+    """Whether the caller already asked for the reply to take a given shape.
+
+    A request decodes under one structured-output constraint, so this is the
+    question of whether the slot is free. `"text"` is the absence of a request,
+    not a request for free text, and does not occupy it.
+    """
+    structured_outputs = getattr(request, "structured_outputs", None)
+    if structured_outputs is not None and not structured_outputs.all_constraints_none():
+        return True
+
+    if isinstance(request, ResponsesRequest):
+        # `text.format` occupies the slot even when it says `"text"`:
+        # `extract_structured_outputs` refuses the pair outright rather than
+        # reading the format to see whether it constrains anything.
+        return getattr(request.text, "format", None) is not None
+    return getattr(request.response_format, "type", None) not in (None, "text")
 
 
 @dataclass
@@ -471,6 +491,92 @@ class DelegatingParser(Parser):
         if self._tool_parser is not None:
             request = self._apply_structural_tag(request)
             request = self._tool_parser.adjust_request(request)
+        request = self._suppress_tool_calls_when_none(request)
+        return request
+
+    def _suppress_tool_calls_when_none(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        """Stop the model emitting a tool call when the caller forbade one.
+
+        ``tool_choice="none"`` means the model may not *call* a tool, not that
+        the tools are hidden: they stay in the prompt, as OpenAI renders them,
+        so the model still knows what exists. Nothing in that prompt tells it
+        not to call, though -- the tool section actively describes the call
+        syntax -- so left unconstrained the model routinely calls anyway, and
+        the reply is then empty once the call is dropped.
+
+        Suppressing the entry markers makes the call unrepresentable rather
+        than merely unwanted, so the model spends its turn answering.
+
+        A grammar does that properly: it constrains the decoded *text*, so it
+        holds for every tokenisation of a marker and denies only the character
+        that would complete one. Where the caller has already spent the
+        request's one structured-output slot on a shape of their own, there is
+        no grammar to be had and a token-level ban stands in.
+        """
+        if request.tool_choice != "none" or not request.tools:
+            return request
+
+        tool_parser = self._tool_parser
+        if tool_parser is None:
+            return request
+
+        # Parsers that cannot describe their entry syntax go unconstrained.
+        markers = tool_parser.tool_call_entry_markers
+        if not markers:
+            return request
+
+        if self._exclude_tool_calls_grammatically(request, markers):
+            return request
+        return self._ban_tool_call_markers(request, markers)
+
+    def _exclude_tool_calls_grammatically(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+        markers: Sequence[str],
+    ) -> bool:
+        """Constrain decoding to replies that contain no tool call.
+
+        Returns False when the request already carries a constraint. A request
+        decodes under exactly one, and the caller's own is the one that has to
+        be honoured -- so the ban is the fallback, not a second grammar.
+        """
+        if request._tool_exclusion_grammar:
+            # Already ours from an earlier pass; re-reading it as a caller
+            # constraint would fall through to the ban and add a second,
+            # weaker constraint on top of a sufficient one.
+            return True
+        if _has_reply_constraint(request):
+            return False
+
+        grammar = exclusion_grammar(markers)
+        if grammar is None:
+            return False
+
+        request.structured_outputs = StructuredOutputsParams(  # type: ignore[call-arg]
+            grammar=grammar,
+        )
+        request._tool_exclusion_grammar = True
+        return True
+
+    def _ban_tool_call_markers(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+        markers: Sequence[str],
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        """Ban the markers by token id, for requests a grammar cannot cover.
+
+        Weaker than the grammar and known to be: `bad_words` resolves each
+        marker to the token sequences that spell it, so a spelling it did not
+        anticipate is not banned. It is still worth doing -- a marker that is
+        one token, which is the common case, has only one spelling.
+        """
+        if not hasattr(request, "bad_words"):
+            return request
+        bad_words = list(request.bad_words or [])
+        bad_words.extend(m for m in markers if m not in bad_words)
+        request.bad_words = bad_words
         return request
 
     def _apply_structural_tag(

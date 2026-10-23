@@ -591,6 +591,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 msg["tool_calls"] = list(tool_calls)
         return self
 
+    _tool_exclusion_grammar: bool = PrivateAttr(default=False)
+
     _grammar_from_parser: bool = PrivateAttr(default=False)
     """CAUTION: Should only be set by the parser-engine adapter's adjust_request."""
 
@@ -603,7 +605,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         """
         if not self.include_reasoning:
             return True
-        if self._grammar_from_parser:
+        if self._grammar_from_parser or self._tool_exclusion_grammar:
             # The Mistral grammar already includes an optional `think?`
             # rule that handles both reasoning and non-reasoning outputs.
             return True

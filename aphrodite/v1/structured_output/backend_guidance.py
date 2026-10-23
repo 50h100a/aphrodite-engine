@@ -22,6 +22,7 @@ from aphrodite.v1.structured_output.backend_types import (
     StructuredOutputOptions,
 )
 from aphrodite.v1.structured_output.request import get_structured_output_key
+from aphrodite.v1.structured_output.schema_features import get_json_schema_backends
 from aphrodite.v1.structured_output.utils import strip_speculative_padding
 
 if TYPE_CHECKING:
@@ -89,30 +90,12 @@ def _walk_json_for_additional_properties(data: object):
                 _walk_json_for_additional_properties(item)
 
 
-def has_guidance_unsupported_json_features(schema: dict[str, Any]) -> bool:
-    """Check if JSON schema contains features unsupported by guidance/llguidance."""
+def is_guidance_backend_supported(schema: dict[str, Any]) -> bool:
+    """Check whether guidance/llguidance can compile ``schema``.
 
-    def check_object(obj: dict[str, Any]) -> bool:
-        if not isinstance(obj, dict):
-            return False
-
-        # patternProperties is not supported by llguidance
-        if "patternProperties" in obj:
-            return True
-
-        # Recursively check all nested objects and arrays
-        for value in obj.values():
-            if isinstance(value, dict):
-                if check_object(value):
-                    return True
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict) and check_object(item):
-                        return True
-
-        return False
-
-    return check_object(schema)
+    The keyword list lives in ``schema_features`` to unify checks relying on it.
+    """
+    return "guidance" in get_json_schema_backends(schema)
 
 
 def process_for_additional_properties(
@@ -216,7 +199,11 @@ class GuidanceGrammar(StructuredOutputGrammar):
     vocab_size: int
     printed_error: bool = False
     terminated: bool = False
-    rollback_lag: int = 0
+    # Tokens reported accepted that never entered the matcher, because it had
+    # already stopped. The caller rewinds by the number of tokens it was told
+    # were accepted, so rollback has to discount these -- otherwise it rewinds
+    # past the start of the window and into text the model has already emitted.
+    unconsumed: int = 0
 
     def check_error(self):
         if not self.printed_error:
@@ -232,11 +219,16 @@ class GuidanceGrammar(StructuredOutputGrammar):
         Returns False if the parser failed to advance.
         """
         if self.ll_tokenizer.eos_token in tokens:
-            if self.ll_matcher.is_stopped() and not self.terminated:
-                self.rollback_lag = 1
             self.terminated = True
+            # Specdec may emit EOS and then some. Stop before then.
+            tokens = tokens[: tokens.index(self.ll_tokenizer.eos_token) + 1]
 
         if self.ll_matcher.is_stopped():
+            # A stopped matcher has nothing left to advance through, so these
+            # are accepted without being consumed. Count them: a draft window
+            # can land here several tokens deep, and every one of them is a
+            # token the caller will ask to be rewound.
+            self.unconsumed += len(tokens)
             return True
 
         # TODO - Add jump decoding support in the future:
@@ -274,11 +266,16 @@ class GuidanceGrammar(StructuredOutputGrammar):
         return tokens[:num_tokens]
 
     def rollback(self, num_tokens: int) -> None:
-        if num_tokens > 0:
-            self.ll_matcher.rollback(num_tokens - self.rollback_lag)
-            self.terminated = False
-            self.rollback_lag = 0
-            self.check_error()
+        if num_tokens <= 0:
+            return
+        # Rewind only what actually went in. The rest moved nothing, so
+        # rewinding for them would undo tokens from before this window.
+        consumed = max(num_tokens - self.unconsumed, 0)
+        self.unconsumed = 0
+        self.terminated = False
+        if consumed:
+            self.ll_matcher.rollback(consumed)
+        self.check_error()
 
     def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
         # this will automatically return [EOS] mask if the matcher is stopped
@@ -291,6 +288,8 @@ class GuidanceGrammar(StructuredOutputGrammar):
 
     def reset(self):
         # This method may be not needed anymore? TODO
+        self.terminated = False
+        self.unconsumed = 0
         self.ll_matcher.reset()
 
 
@@ -311,6 +310,25 @@ def serialize_guidance_grammar(
                 "whitespace_flexible": not disable_any_whitespace,
             },
         )
+
+    def _prepare_schema(
+        schema: str | dict[str, Any],
+    ) -> dict[str, Any] | bool:
+        """Wrap our schema correctly, with schema-level options and `x-guidance`."""
+        if disable_additional_properties:
+            schema = process_for_additional_properties(schema)
+        elif isinstance(schema, str):
+            schema = json.loads(schema)
+        else:
+            schema = copy.deepcopy(schema)
+        # `true`/`false` are valid schemas and take no annotations.
+        if isinstance(schema, dict):
+            guidance_opts = schema.get("x-guidance")
+            if not isinstance(guidance_opts, dict):
+                guidance_opts = {}
+                schema["x-guidance"] = guidance_opts
+            guidance_opts.setdefault("whitespace_flexible", not disable_any_whitespace)
+        return schema
 
     if request_type == StructuredOutputOptions.JSON:
         return _process_schema(grammar_spec)
@@ -333,6 +351,12 @@ def serialize_guidance_grammar(
                 s_tag = json.loads(grammar_spec)
             else:
                 s_tag = grammar_spec
+            if "structures" not in s_tag:
+                raise ValueError(
+                    "The guidance backend cannot compile this structural tag: it "
+                    "only supports the 'triggers'/'structures' form, and this one "
+                    f"is {'the nested format form' if 'format' in s_tag else 'neither'}."
+                )
             triggers: list[str] = s_tag["triggers"]
             tags: list[llguidance.StructTag] = []
             for s in s_tag["structures"]:
@@ -344,7 +368,7 @@ def serialize_guidance_grammar(
                     llguidance.StructTag(
                         trigger=trig,
                         begin=s["begin"],
-                        grammar=_process_schema(s["schema"]),
+                        grammar=_prepare_schema(s["schema"]),
                         end=s["end"],
                     )
                 )

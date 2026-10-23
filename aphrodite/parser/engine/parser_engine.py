@@ -1209,3 +1209,8 @@ class ParserEngine(Parser):
             return "{}"
         _, args = self._extract_name_and_args(raw_args)
         return args
+
+    @property
+    def tool_call_entry_markers(self) -> tuple[str, ...]:
+        """Literal strings whose appearance begins a tool call."""
+        return self.parser_engine_config.tool_call_entry_markers

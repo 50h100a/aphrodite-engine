@@ -13,12 +13,14 @@ from aphrodite.parser.engine.adapters import ParserEngineReasoningAdapter
 from aphrodite.reasoning import ReasoningParserManager
 from aphrodite.tokenizers import cached_tokenizer_from_config
 from aphrodite.utils.import_utils import LazyLoader
+from aphrodite.utils.math_utils import cdiv
 from aphrodite.v1.structured_output.backend_guidance import GuidanceBackend
 from aphrodite.v1.structured_output.backend_types import (
     StructuredOutputBackend,
     StructuredOutputGrammar,
 )
 from aphrodite.v1.structured_output.backend_xgrammar import XgrammarBackend
+from aphrodite.v1.structured_output.postconditions import maybe_wrap
 from aphrodite.v1.structured_output.utils import strip_speculative_padding
 
 if TYPE_CHECKING:
@@ -50,6 +52,9 @@ class StructuredOutputManager:
 
     def __init__(self, aphrodite_config: AphroditeConfig):
         self.backend: StructuredOutputBackend | None = None
+        self.backends: dict[str, StructuredOutputBackend] = {}
+        self._bitmask_backends: frozenset[str] = frozenset()
+        self._num_bitmask_words = cdiv(aphrodite_config.model_config.get_vocab_size(), 32)
         # We only store the class of the reasoner in the manager.
         # The parser instance is request-scoped because some reasoning parsers
         # depend on per-request chat-template kwargs.
@@ -120,60 +125,67 @@ class StructuredOutputManager:
         if TYPE_CHECKING:
             assert request.sampling_params is not None and request.sampling_params.structured_outputs is not None
 
-        # Initialize the backend the first time it is needed.
-        #
-        # NOTE: We only support a single backend. We do NOT support different
-        # backends on a per-request basis in V1 (for now, anyway...).
-        # _backend is set in Processor._validate_structured_output
-        if self.backend is None:
-            assert request.sampling_params is not None
-            backend = request.sampling_params.structured_outputs._backend
-            vocab_size = self.aphrodite_config.model_config.get_vocab_size()
-            if backend == "xgrammar":
-                self.backend = XgrammarBackend(
-                    self.aphrodite_config,
-                    tokenizer=self.tokenizer,
-                    vocab_size=vocab_size,
-                )
-            elif backend == "guidance":
-                self.backend = GuidanceBackend(
-                    self.aphrodite_config,
-                    tokenizer=self.tokenizer,
-                    vocab_size=vocab_size,
-                )
-            elif backend == "outlines":
-                from aphrodite.v1.structured_output.backend_outlines import OutlinesBackend
-
-                self.backend = OutlinesBackend(
-                    self.aphrodite_config,
-                    tokenizer=self.tokenizer,
-                    vocab_size=vocab_size,
-                )
-            elif backend == "lm-format-enforcer":
-                from aphrodite.v1.structured_output.backend_lm_format_enforcer import (  # noqa: E501
-                    LMFormatEnforcerBackend,
-                )
-
-                self.backend = LMFormatEnforcerBackend(
-                    self.aphrodite_config,
-                    tokenizer=self.tokenizer,
-                    vocab_size=vocab_size,
-                )
-            else:
-                raise ValueError(f"Unsupported structured output backend: {backend}")
+        assert request.sampling_params is not None
+        name = request.sampling_params.structured_outputs._backend
+        backend = self._get_backend(name)
+        self.backend = backend
 
         grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar
         if self._use_async_grammar_compilation:
-            grammar = self.executor.submit(self._create_grammar, request)
+            grammar = self.executor.submit(self._create_grammar, request, backend)
         else:
             try:
-                grammar = self._create_grammar(request)
+                grammar = self._create_grammar(request, backend)
             except Exception as e:
                 grammar = Future()
                 grammar.set_exception(e)
         request.structured_output_request.grammar = grammar
 
-    def _create_grammar(self, request: "Request") -> StructuredOutputGrammar:
+    def _get_backend(self, name: str) -> StructuredOutputBackend:
+        backend = self.backends.get(name)
+        if backend is None:
+            # Building one means deriving tokenizer info over the whole vocab,
+            # so they are cached and shared by every request that needs them.
+            backend = self.backends[name] = self._create_backend(name)
+        return backend
+
+    def _create_backend(self, name: str) -> StructuredOutputBackend:
+        vocab_size = self.aphrodite_config.model_config.get_vocab_size()
+        if name == "xgrammar":
+            return XgrammarBackend(
+                self.aphrodite_config,
+                tokenizer=self.tokenizer,
+                vocab_size=vocab_size,
+            )
+        if name == "guidance":
+            return GuidanceBackend(
+                self.aphrodite_config,
+                tokenizer=self.tokenizer,
+                vocab_size=vocab_size,
+            )
+        if name == "outlines":
+            from aphrodite.v1.structured_output.backend_outlines import OutlinesBackend
+
+            return OutlinesBackend(
+                self.aphrodite_config,
+                tokenizer=self.tokenizer,
+                vocab_size=vocab_size,
+            )
+        if name == "lm-format-enforcer":
+            from aphrodite.v1.structured_output.backend_lm_format_enforcer import (  # noqa: E501
+                LMFormatEnforcerBackend,
+            )
+
+            return LMFormatEnforcerBackend(
+                self.aphrodite_config,
+                tokenizer=self.tokenizer,
+                vocab_size=vocab_size,
+            )
+        raise ValueError(f"Unsupported structured output backend: {name}")
+
+    def _create_grammar(
+        self, request: "Request", backend: StructuredOutputBackend | None = None
+    ) -> StructuredOutputGrammar:
         struct_request = request.structured_output_request
         assert struct_request is not None
         # Note that the request was validated in the engine core client,
@@ -182,9 +194,18 @@ class StructuredOutputManager:
         # scheduler so it can fail only this request.
         try:
             request_type, grammar_spec = struct_request.structured_output_key
-            assert self.backend is not None
+            backend = backend or self.backend
+            assert backend is not None
             stop_token_ids = request.sampling_params.all_stop_token_ids if request.sampling_params is not None else None
-            return self.backend.compile_grammar(request_type, grammar_spec, stop_token_ids=stop_token_ids)
+            grammar = backend.compile_grammar(request_type, grammar_spec, stop_token_ids=stop_token_ids)
+            return maybe_wrap(
+                grammar,
+                request_type,
+                grammar_spec,
+                tokenizer=backend.tokenizer,
+                vocab_size=backend.vocab_size,
+                num_speculative_tokens=self.aphrodite_config.num_speculative_tokens,
+            )
         except Exception:
             logger.exception("Failed to compile grammar for request %s", request.request_id)
             raise
@@ -349,14 +370,19 @@ class StructuredOutputManager:
         # Covers both speculative decoding and diffusion LLMs (canvas_length).
         max_num_spec_tokens = self.aphrodite_config.num_speculative_tokens
 
-        if self._grammar_bitmask is None:
-            assert self.backend is not None
+        backends = self.backends or ({"default": self.backend} if self.backend is not None else {})
+        if self._grammar_bitmask is None or self._bitmask_backends != backends.keys():
+            assert backends
             max_batch_size = self.aphrodite_config.scheduler_config.max_num_seqs
-
-            # Allocate a bitmask for each token needing to be checked:
-            # one for each speculative position, and one more for the
-            # bonus token / non-speculative token.
-            self._grammar_bitmask = self.backend.allocate_token_bitmask(max_batch_size * (1 + max_num_spec_tokens))
+            num_rows = max_batch_size * (1 + max_num_spec_tokens)
+            self._grammar_bitmask = max(
+                (backend.allocate_token_bitmask(num_rows) for backend in backends.values()),
+                key=lambda mask: mask.shape[-1],
+            )
+            self._bitmask_backends = frozenset(backends)
+            assert self._grammar_bitmask.shape[-1] >= self._num_bitmask_words, (
+                "Structured output bitmask does not cover the model vocabulary"
+            )
 
         # Generate a batched bitmask for all structured output requests.
         # When speculative decoding is enabled, we need to include multiple
@@ -456,6 +482,7 @@ class StructuredOutputManager:
                     grammar.rollback(state_advancements)
 
         bitmask_tensor = self._grammar_bitmask
+        bitmask_tensor = bitmask_tensor[:, : self._num_bitmask_words].contiguous()
         if cumulative_index < bitmask_tensor.shape[0]:
             bitmask_tensor = bitmask_tensor[:cumulative_index]
 
@@ -490,6 +517,9 @@ class StructuredOutputManager:
             self.executor.shutdown(wait=True, cancel_futures=True)
         if self.fill_bitmask_parallel_threshold < self.aphrodite_config.scheduler_config.max_num_seqs:
             self.executor_for_fillmask.shutdown(wait=True, cancel_futures=True)
-        if self.backend is not None:
+        for backend in self.backends.values():
+            backend.destroy()
+        if self.backend is not None and not any(self.backend is backend for backend in self.backends.values()):
             self.backend.destroy()
-            self.backend = None
+        self.backends.clear()
+        self.backend = None

@@ -65,6 +65,7 @@ from aphrodite.entrypoints.generate.base.protocol import (
     PerRequestMetrics,
     StopParam,
     TopLogprobsParam,
+    json_schema_enforcement_waived,
     resolve_return_mm_kwargs_alias,
     validate_cache_salt,
 )
@@ -455,6 +456,8 @@ class ResponsesRequest(OpenAIBaseModel):
             max_output_tokens_param="max_output_tokens",
         )
 
+    _tool_exclusion_grammar: bool = PrivateAttr(default=False)
+
     _grammar_from_parser: bool = PrivateAttr(default=False)
     """CAUTION: Should only be set by the parser's adjust_request."""
 
@@ -484,6 +487,8 @@ class ResponsesRequest(OpenAIBaseModel):
         response_format = self.text.format
         if response_format.type == "json_object":
             return StructuredOutputsParams(json_object=True)  # type: ignore[call-arg]
+        if json_schema_enforcement_waived(response_format):
+            return StructuredOutputsParams(json_object=True)
         if response_format.type == "json_schema" and response_format.schema_ is not None:
             return StructuredOutputsParams(
                 json=response_format.schema_  # type: ignore[call-arg]

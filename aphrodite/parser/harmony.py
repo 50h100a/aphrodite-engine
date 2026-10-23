@@ -106,6 +106,8 @@ class HarmonyParser(DelegatingParser):
 
         # For error recovery
         self._current_message_tokens: list[int] = []
+        self._current_message_text = ""
+        self._derailed_at: int | None = None
 
     @property
     def _harmony_parser(self) -> StreamableParser:
@@ -123,30 +125,44 @@ class HarmonyParser(DelegatingParser):
         self._num_processed_messages += 1
         return msg
 
+    def _recover_raw_output(self) -> tuple[list[Segment], Message]:
+        """The message being parsed when the format broke, as `final` content."""
+        final_channel = "final"
+        if self._derailed_at is None:
+            text = unsent = self.model_tokenizer.decode(self._current_message_tokens)
+        else:
+            unsent = self.model_tokenizer.decode(self._current_message_tokens[self._derailed_at :])
+            text = self._current_message_text + unsent
+        segments = [
+            Segment(
+                channel=final_channel,
+                recipient=None,
+                delta=unsent,
+                completed_message=None,
+            )
+        ]
+        return segments, Message.from_role_and_content(Role.ASSISTANT, text).with_channel(final_channel)
+
     def flush(self) -> list[Segment]:
         segments: list[Segment] = []
-        try:
-            self._harmony_parser.process_eos()
-            msg = self._poll_completed_message()
-        except HarmonyError:
-            logger.warning("Harmony parser ended in a non-terminal state; returning the recovered raw output.")
-
-            final_channel = "final"
-            text = self.model_tokenizer.decode(self._current_message_tokens)
-            segments.append(
-                Segment(
-                    channel=final_channel,
-                    recipient=None,
-                    delta=text,
-                    completed_message=None,
-                )
-            )
-            msg = Message.from_role_and_content(Role.ASSISTANT, text).with_channel(final_channel)
+        msg: Message | None
+        if self._derailed_at is not None:
+            # Already reported where the parse broke; do not warn again.
+            segments, msg = self._recover_raw_output()
+        else:
+            try:
+                self._harmony_parser.process_eos()
+                msg = self._poll_completed_message()
+            except HarmonyError:
+                logger.warning("Harmony parser ended in a non-terminal state; returning the recovered raw output.")
+                segments, msg = self._recover_raw_output()
 
         # Reset to the initial assistant-parser state for the next turn.
         self._parser = None
         self._num_processed_messages = 0
         self._current_message_tokens.clear()
+        self._current_message_text = ""
+        self._derailed_at = None
 
         if msg is None:
             return segments
@@ -314,9 +330,19 @@ class HarmonyParser(DelegatingParser):
         segments: list[Segment] = []
         reasoning_token_count = 0
         for token_id in token_ids:
+            if self._derailed_at is not None:
+                self._current_message_tokens.append(token_id)
+                continue
             try:
                 self._harmony_parser.process(token_id)
             except HarmonyError:
+                # Current Harmony can resynchronize after stray control tokens.
+                # Preserve that behavior; raw recovery is for rejected text.
+                if get_encoding().is_special_token(token_id):
+                    continue
+                logger.warning("Harmony parser rejected token %d; recovering the remaining output.", token_id)
+                self._derailed_at = len(self._current_message_tokens)
+                self._current_message_tokens.append(token_id)
                 continue
             channel = self._harmony_parser.current_channel
             recipient = self._normalize_recipient(self._harmony_parser.current_recipient)
@@ -325,8 +351,10 @@ class HarmonyParser(DelegatingParser):
 
             if completed_message is not None:
                 self._current_message_tokens.clear()
+                self._current_message_text = ""
             else:
                 self._current_message_tokens.append(token_id)
+                self._current_message_text += delta
 
             if self._is_reasoning_token(token_id, channel, recipient):
                 reasoning_token_count += 1
