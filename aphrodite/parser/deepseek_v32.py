@@ -37,6 +37,7 @@ from aphrodite.parser.engine.parser_engine_config import (
     ParserState,
     Transition,
 )
+from aphrodite.tool_parsers.utils import find_tool_properties
 
 if TYPE_CHECKING:
     from aphrodite.tokenizers import TokenizerLike
@@ -80,6 +81,7 @@ def deepseek_v32_config() -> ParserEngineConfig:
                 ParserState.TOOL_NAME,
                 (EventType.TOOL_CALL_START,),
             ),
+            (ParserState.TOOL_PREAMBLE, "TOOL_END"): Transition(ParserState.CONTENT, ()),
             (ParserState.TOOL_NAME, "INVOKE_NAME_END"): Transition(
                 ParserState.TOOL_ARGS,
                 (),
@@ -136,8 +138,9 @@ class DeepSeekV32Parser(ParserEngine):
         self._arg_converter = self._convert_args
 
     def _convert_args(self, raw_args: str, partial: bool) -> str:
-        result = _dsml_arg_converter(raw_args, partial)
         if not self._tools:
-            return result
+            return _dsml_arg_converter(raw_args, partial)
         func_name = next((s.name for s in self._tool_slots if s.args == raw_args), None)
+        properties = find_tool_properties(self._tools, func_name) if func_name else None
+        result = _dsml_arg_converter(raw_args, partial, properties=properties)
         return _unwrap_wrapper_args(result, self._tools, func_name)

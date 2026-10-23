@@ -198,9 +198,9 @@ def build_logitsprocs(
                 raise ValueError(STR_SPEC_DEC_REJECTS_LOGITSPROCS)
             # PhraseScheduler retries checkpoints without speculative drafts.
             retry_processors = [cls(aphrodite_config, device, is_pin_memory) for cls in classes]
-        logger.warning("logit_bias parameter won't work with speculative decoding.")
         return LogitsProcessors(
             [
+                LogitBiasLogitsProcessor(aphrodite_config, device, is_pin_memory),
                 MinTokensLogitsProcessor(aphrodite_config, device, is_pin_memory),
                 MinPLogitsProcessor(aphrodite_config, device, is_pin_memory),
                 *retry_processors,

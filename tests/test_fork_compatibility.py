@@ -119,6 +119,20 @@ def test_completion_logprobs_hide_special_token_width_across_chunks(skip_special
     assert offsets == full.text_offset == ([0, 1, 1] if skip_special else [0, 1, 6])
 
 
+@pytest.mark.parametrize("skip_special, return_ids", [(True, False), (False, False), (True, True)])
+def test_completion_sampled_special_token_matches_its_own_top_logprob(skip_special, return_ids):
+    serving = OpenAIServingCompletion.__new__(OpenAIServingCompletion)
+    serving.return_tokens_as_token_ids = return_ids
+    tokenizer = SimpleNamespace(all_special_ids=[2, 4])
+    probabilities = {
+        2: Logprob(logprob=-1.0, rank=1, decoded_token="<eos>"),
+        4: Logprob(logprob=-2.0, rank=2, decoded_token="<other>"),
+        1: Logprob(logprob=-3.0, rank=3, decoded_token="a"),
+    }
+    result = serving._create_completion_logprobs([2], [probabilities], 2, tokenizer, skip_special_tokens=skip_special)
+    assert result.top_logprobs[0][result.tokens[0]] == result.token_logprobs[0]
+
+
 def test_force_bos_preserves_offsets_and_is_idempotent(monkeypatch):
     monkeypatch.setattr("aphrodite.envs.APHRODITE_FORCE_BOS", True)
     tokenizer = SimpleNamespace(bos_token_id=9)

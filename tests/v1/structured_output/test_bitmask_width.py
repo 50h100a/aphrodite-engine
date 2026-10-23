@@ -95,6 +95,28 @@ def test_wide_backend_is_narrowed_to_the_model_vocab(aphrodite_config):
     assert bitmask.shape[-1] == MODEL_WORDS
 
 
+@pytest.mark.parametrize("index", [0, 2])
+@pytest.mark.parametrize("extra_words", [0, 1, 8])
+def test_real_xgrammar_fills_shared_buffer_without_touching_other_rows(index, extra_words):
+    """A mocked matcher missed the fatal MythoMax mixed-backend crash."""
+    import xgrammar as xgr
+
+    from aphrodite.v1.structured_output.backend_xgrammar import XgrammarGrammar
+
+    info = xgr.TokenizerInfo(["a", "<eos>"], xgr.VocabType.RAW, vocab_size=32000, stop_token_ids=[1])
+    compiled = xgr.GrammarCompiler(info).compile_regex("a")
+    grammar = XgrammarGrammar(vocab_size=32000, matcher=xgr.GrammarMatcher(compiled), ctx=compiled)
+    mask = torch.full((3, 1000 + extra_words), -1, dtype=torch.int32)
+
+    grammar.fill_bitmask(mask, index)
+
+    assert int(mask[index, 0]) & 1  # The token spelling "a" is allowed.
+    assert not (int(mask[index, 0]) & 2)  # EOS is masked before "a".
+    assert (mask[:index] == -1).all()
+    assert (mask[index + 1 :] == -1).all()
+    assert (mask[index, 1000:] == -1).all()
+
+
 def test_mixed_backends_fill_wide_but_publish_narrow(aphrodite_config):
     """Both halves matter: guidance must still get a row wide enough to fill
     (llguidance writes through a raw pointer sized from its own vocab), while
@@ -108,6 +130,25 @@ def test_mixed_backends_fill_wide_but_publish_narrow(aphrodite_config):
 
     assert manager._grammar_bitmask.shape[-1] == WIDE_WORDS
     assert bitmask.shape[-1] == MODEL_WORDS
+
+
+def test_manager_can_fill_real_xgrammar_rows_with_a_wider_guidance_backend(aphrodite_config):
+    import xgrammar as xgr
+
+    from aphrodite.v1.structured_output.backend_xgrammar import XgrammarGrammar
+
+    info = xgr.TokenizerInfo(["a", "<eos>"], xgr.VocabType.RAW, vocab_size=VOCAB_SIZE, stop_token_ids=[1])
+    compiled = xgr.GrammarCompiler(info).compile_regex("a")
+    manager = _manager(aphrodite_config, {"xgrammar": _backend(MODEL_WORDS), "guidance": _backend(WIDE_WORDS)})
+    requests = {f"r{i}": _request() for i in range(3)}
+    for request in requests.values():
+        request.structured_output_request.grammar = XgrammarGrammar(
+            vocab_size=VOCAB_SIZE, matcher=xgr.GrammarMatcher(compiled), ctx=compiled
+        )
+    mask = manager.grammar_bitmask(requests, list(requests), {})
+    assert mask.shape == (3, MODEL_WORDS)
+    assert mask.flags.c_contiguous
+    assert all(int(row[0]) & 1 and not int(row[0]) & 2 for row in mask)
 
 
 def test_narrowing_preserves_each_rows_model_vocab_words(aphrodite_config):

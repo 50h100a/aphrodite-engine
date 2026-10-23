@@ -24,6 +24,7 @@ from aphrodite.entrypoints.generate.base.serving import (
     format_token_id_placeholder,
 )
 from aphrodite.entrypoints.openai.completion.protocol import (
+    CompactCompletionStreamResponse,
     CompletionLogProbs,
     CompletionRequest,
     CompletionResponse,
@@ -47,7 +48,7 @@ from aphrodite.outputs import RequestOutput
 from aphrodite.renderers.online_renderer import OnlineRenderer
 from aphrodite.sampling_params import BeamSearchParams, SamplingParams
 from aphrodite.tokenizers import TokenizerLike
-from aphrodite.utils.async_utils import merge_async_iterators
+from aphrodite.utils.async_utils import close_async_iterator, merge_async_iterators
 from aphrodite.utils.collection_utils import as_list
 from aphrodite.utils.serial_utils import numpy2base64
 from aphrodite.v1.structured_output.schema_features import get_structured_outputs_schema_error
@@ -261,6 +262,8 @@ class OpenAIServingCompletion(GenerateBaseServing):
             )
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
+        finally:
+            await close_async_iterator(result_generator)
 
         # When user requests streaming but we don't stream, we still need to
         # return a streaming response with a single event.
@@ -296,6 +299,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
         first_iteration = True
 
         stream_options = request.stream_options
+        compact_stream = bool(stream_options and stream_options.compact_stream)
         include_usage, include_continuous_usage = should_include_usage(stream_options, self.enable_force_include_usage)
 
         last_res: RequestOutput | None = None
@@ -308,6 +312,15 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 if first_iteration:
                     num_cached_tokens = res.num_cached_tokens
                     first_iteration = False
+                    if compact_stream:
+                        # As in the fork, batched requests report the first prompt here.
+                        lead_usage = UsageInfo(
+                            prompt_tokens=len(prompt_token_ids) if prompt_token_ids is not None else 0
+                        )
+                        if num_cached_tokens is not None:
+                            lead_usage.prompt_tokens_details = PromptTokenUsageInfo(cached_tokens=num_cached_tokens)
+                        lead_event = CompactCompletionStreamResponse(usage=lead_usage)
+                        yield f"data: {lead_event.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
 
                 prompt_text = res.prompt
                 if prompt_text is None:
@@ -429,7 +442,13 @@ class OpenAIServingCompletion(GenerateBaseServing):
                             total_tokens=prompt_tokens + completion_tokens,
                         )
 
-                    response_json = chunk.model_dump_json(exclude_unset=True)
+                    if compact_stream:
+                        compact_event = CompactCompletionStreamResponse(
+                            choices=chunk.choices, usage=UsageInfo(completion_tokens=previous_num_tokens[i])
+                        )
+                        response_json = compact_event.model_dump_json(exclude_unset=True)
+                    else:
+                        response_json = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {response_json}\n\n"
 
             total_prompt_tokens = sum(num_prompt_tokens)
@@ -443,7 +462,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
             if self.enable_prompt_tokens_details and num_cached_tokens is not None:
                 final_usage_info.prompt_tokens_details = PromptTokenUsageInfo(cached_tokens=num_cached_tokens)
 
-            if include_usage:
+            if include_usage and not compact_stream:
                 # In streaming, metrics ride on this final usage chunk, which is
                 # only emitted when usage reporting is enabled (i.e.
                 # ``stream_options.include_usage=true`` or
@@ -484,6 +503,8 @@ class OpenAIServingCompletion(GenerateBaseServing):
             logger.exception("Error in completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
+        finally:
+            await close_async_iterator(result_generator)
         yield "data: [DONE]\n\n"
 
     def request_output_to_completion_response(
@@ -681,7 +702,9 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     {
                         # Convert float("-inf") to the
                         # JSON-serializable float that OpenAI uses
-                        self._get_decoded_token(
+                        ""
+                        if top_lp[0] in hidden_ids and not should_return_as_token_id
+                        else self._get_decoded_token(
                             top_lp[1],
                             top_lp[0],
                             tokenizer,
@@ -697,6 +720,11 @@ class OpenAIServingCompletion(GenerateBaseServing):
             if token_id in hidden_ids and not should_return_as_token_id:
                 token = ""
                 out_tokens[-1] = ""
+                # Several hidden tokens can collapse to the same text key.
+                # Keep the sampled token's probability, rather than the last
+                # hidden alternative's probability, under its displayed key.
+                if out_top_logprobs[-1] is not None:
+                    out_top_logprobs[-1][token] = out_token_logprobs[-1]
             if len(out_text_offset) == 0:
                 out_text_offset.append(initial_text_offset)
             else:

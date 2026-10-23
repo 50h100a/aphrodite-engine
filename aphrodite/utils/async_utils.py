@@ -8,15 +8,28 @@ This is similar in concept to the `asyncio` module.
 import asyncio
 import contextlib
 from asyncio import FIRST_COMPLETED, AbstractEventLoop, Future, Task
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from concurrent.futures import Executor, ThreadPoolExecutor
 from functools import partial
+from inspect import isawaitable
 from typing import TYPE_CHECKING, TypeVar
 
 from typing_extensions import ParamSpec
 
 P = ParamSpec("P")
 T = TypeVar("T")
+
+
+async def close_async_iterator(iterator: AsyncIterator) -> None:
+    """Release an owned iterator when its consumer fails or disconnects.
+
+    Async iterators need not expose ``aclose``; engine result generators do.
+    """
+    close = getattr(iterator, "aclose", None)
+    if close is not None:
+        result = close()
+        if isawaitable(result):
+            await result
 
 
 def cancel_task_threadsafe(task: Task):

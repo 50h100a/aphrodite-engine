@@ -88,6 +88,38 @@ def mock_request():
 
 
 class TestNonStreaming:
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_schema_controls_typed_parameters_and_enum_padding(self, mock_tokenizer, mock_request, stream):
+        tools = [
+            _make_tool(
+                "report",
+                {
+                    "severity": {"type": "string", "enum": ["sev1", "sev2"]},
+                    "count": {"type": "integer"},
+                    "title": {"type": "string"},
+                },
+            )
+        ]
+        mock_request.tools = tools
+        parser = DeepSeekV32Parser(mock_tokenizer, tools=tools)
+        text = _func_calls(
+            _invoke(
+                "report",
+                _param("severity", "true", " \tsev2 "),
+                _param("count", "true", " 42 "),
+                _param("title", "true", " padded "),
+            )
+        )
+        if stream:
+            arguments = collect_tool_arguments(simulate_tool_streaming(parser, mock_request, list(text)))
+        else:
+            arguments = parser.extract_tool_calls(text, mock_request).tool_calls[0].function.arguments
+        assert json.loads(arguments) == {
+            "severity": "sev2",
+            "count": 42,
+            "title": " padded ",
+        }
+
     def test_no_tool_call(self, mock_tokenizer, mock_request):
         parser = DeepSeekV32Parser(mock_tokenizer)
         result = parser.extract_tool_calls("Hello world", mock_request)
@@ -179,6 +211,12 @@ class TestInitialState:
 
 
 class TestStreaming:
+    def test_empty_tool_block_does_not_swallow_following_content(self, mock_tokenizer, mock_request):
+        parser = DeepSeekV32Parser(mock_tokenizer)
+        text = DSML_FUNC_START + DSML_FUNC_END + "Hello afterwards."
+        results = simulate_tool_streaming(parser, mock_request, list(text))
+        assert collect_content(results) == "Hello afterwards."
+
     def test_split_parameter_start_is_buffered(self, mock_tokenizer, mock_request):
         chunks = [
             DSML_FUNC_START,

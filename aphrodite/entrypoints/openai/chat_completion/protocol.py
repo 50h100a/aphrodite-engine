@@ -1182,3 +1182,10 @@ class BatchChatCompletionRequest(OpenAIBaseModel):
         data = self.model_dump(exclude={"messages"}, exclude_none=True)
         data["messages"] = messages
         return ChatCompletionRequest.model_validate(data)
+
+
+class CompactChatCompletionStreamResponse(OpenAIBaseModel):
+    """Compact streaming event for ``stream_options.compact_stream``."""
+
+    choices: list[ChatCompletionResponseStreamChoice] = Field(default_factory=list)
+    usage: UsageInfo | None = None

@@ -98,6 +98,8 @@ class XgrammarBackend(StructuredOutputBackend):
         self.full_vocab_compiler = (
             self.compiler if full_vocab_tokenizer_info is None else self._create_compiler(full_vocab_tokenizer_info)
         )
+        self._tag_tokenizer_info = full_vocab_tokenizer_info or tokenizer_info
+        self._tag_compilers: dict[frozenset[int], xgr.GrammarCompiler] = {}
 
         self.num_speculative_tokens = 0
         if self.aphrodite_config.speculative_config is not None:
@@ -128,6 +130,7 @@ class XgrammarBackend(StructuredOutputBackend):
         # and will be available in next release.
         # So, remove this comment once xgrammar updates to v0.2.9
         separators = (",", ":") if self.disable_any_whitespace else None
+        matcher_stop_tokens = list(stop_token_ids) if stop_token_ids else None
         if request_type == StructuredOutputOptions.JSON:
             ctx = self.compiler.compile_json_schema(
                 grammar_spec,
@@ -151,6 +154,7 @@ class XgrammarBackend(StructuredOutputBackend):
                 grammar_spec,
             )
         elif request_type == StructuredOutputOptions.STRUCTURAL_TAG:
+            compiler, matcher_stop_tokens = self._compiler_for_structural_tag(grammar_spec, stop_token_ids)
             s_tag = json.loads(grammar_spec)
             if "structures" in s_tag:
                 # Falling back to deprecated method of compiling structural tag
@@ -162,9 +166,9 @@ class XgrammarBackend(StructuredOutputBackend):
                     )
                     for s in s_tag["structures"]
                 ]
-                ctx = self.full_vocab_compiler.compile_structural_tag(tags, s_tag["triggers"])
+                ctx = compiler.compile_structural_tag(tags, s_tag["triggers"])
             else:
-                ctx = self.full_vocab_compiler.compile_structural_tag(grammar_spec)
+                ctx = compiler.compile_structural_tag(grammar_spec)
         else:
             logger.error("Validation should have already occurred. Please file an issue.")
             raise ValueError(f"grammar is not of valid supported types. ({request_type!s})")
@@ -172,7 +176,7 @@ class XgrammarBackend(StructuredOutputBackend):
         return XgrammarGrammar(
             matcher=xgr.GrammarMatcher(
                 ctx,
-                override_stop_tokens=list(stop_token_ids) if stop_token_ids else None,
+                override_stop_tokens=matcher_stop_tokens,
                 max_rollback_tokens=self.num_speculative_tokens,
             ),
             vocab_size=self.vocab_size,
@@ -185,6 +189,57 @@ class XgrammarBackend(StructuredOutputBackend):
     def destroy(self):
         del self.compiler
         del self.full_vocab_compiler
+        self._tag_compilers.clear()
+
+    def _compiler_for_structural_tag(
+        self, grammar_spec: str, stop_token_ids: set[int] | None
+    ) -> tuple["xgr.GrammarCompiler", list[int] | None]:
+        """A tag can need EOS as a terminal, rather than a matcher stop.
+
+        Keep the JSON/special-token filtering compilers intact. Only tags that
+        name an engine stop token need a compiler and matcher with that token
+        removed from their reserved stops (e.g. Harmony's final ``<|return|>``).
+        """
+        info = self._tag_tokenizer_info
+        stops = set(info.stop_token_ids)
+        if stop_token_ids is not None:
+            stops.update(stop_token_ids)
+        else:
+            model_config = self.aphrodite_config.model_config
+            if model_config is not None:
+                try:
+                    generation_config = model_config.try_get_generation_config()
+                except Exception:
+                    logger.warning("Could not read generation config; using tokenizer stop tokens for the tag.")
+                    generation_config = {}
+                configured = generation_config.get("eos_token_id", ())
+                stops.update([configured] if isinstance(configured, int) else configured or ())
+        convert = getattr(self.tokenizer, "convert_ids_to_tokens", None)
+        terminals = {
+            token_id
+            for token_id in stops
+            if convert is not None and (text := convert(token_id)) and text in grammar_spec
+        }
+        if not terminals:
+            return self.full_vocab_compiler, list(stop_token_ids) if stop_token_ids else None
+
+        reserved = frozenset(stops - terminals)
+        compiler = self._tag_compilers.get(reserved)
+        if compiler is None:
+            # The decoded vocabulary is already normalized to bytes. RAW
+            # preserves those bytes across HF, Mistral and custom tokenizers.
+            tag_info = xgr.TokenizerInfo(
+                info.decoded_vocab,
+                vocab_type=xgr.VocabType.RAW,
+                vocab_size=info.vocab_size,
+                stop_token_ids=sorted(reserved),
+                add_prefix_space=info.add_prefix_space,
+            )
+            compiler = self._tag_compilers[reserved] = self._create_compiler(tag_info)
+        # An explicit empty override is rejected by XGrammar. With no reserved
+        # stops, inherit this compiler's empty set instead; the engine still
+        # stops when it emits the tag's EOS terminal.
+        return compiler, sorted(reserved) or None
 
     @staticmethod
     def _create_compiler(
@@ -276,6 +331,12 @@ class XgrammarGrammar(StructuredOutputGrammar):
         self._is_terminated = self.matcher.is_terminated()
 
     def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
+        # Other backends may need a wider vocabulary (e.g. added tokenizer
+        # tokens). XGrammar requires its exact width, including on shared rows.
+        num_words = (self.vocab_size + 31) // 32
+        if bitmask.shape[-1] != num_words:
+            self.matcher.fill_next_token_bitmask(bitmask[idx : idx + 1, :num_words], 0)
+            return
         self.matcher.fill_next_token_bitmask(bitmask, idx)
 
     def is_terminated(self) -> bool:

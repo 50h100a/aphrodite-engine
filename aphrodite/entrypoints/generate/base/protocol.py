@@ -287,6 +287,8 @@ def validate_structured_outputs_structural_tag(
 class StreamOptions(OpenAIBaseModel):
     include_usage: bool | None = False
     continuous_usage_stats: bool | None = False
+    compact_stream: bool | None = False
+    """Emit choices and minimal usage instead of the standard streaming envelope."""
 
 
 class FunctionDefinition(OpenAIBaseModel):

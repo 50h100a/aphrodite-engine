@@ -38,6 +38,7 @@ from aphrodite.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse,
     ChatMessage,
+    CompactChatCompletionStreamResponse,
 )
 from aphrodite.entrypoints.openai.models.serving import OpenAIServingModels
 from aphrodite.entrypoints.serve.engine.protocol import (
@@ -67,6 +68,7 @@ from aphrodite.renderers.chat_utils import (
 from aphrodite.renderers.online_renderer import OnlineRenderer
 from aphrodite.sampling_params import BeamSearchParams, SamplingParams
 from aphrodite.tokenizers import TokenizerLike
+from aphrodite.utils.async_utils import close_async_iterator
 from aphrodite.utils.collection_utils import as_list
 from aphrodite.utils.serial_utils import numpy2base64
 from aphrodite.v1.structured_output.schema_features import get_structured_outputs_schema_error
@@ -451,20 +453,25 @@ class OpenAIServingChat(GenerateBaseServing):
         chat_template_kwargs: dict[str, Any] | None = None,
         mm_token_counts: dict[str, int] | None = None,
     ) -> AsyncGenerator[str, None]:
+        chunks = self.chat_completion_stream_generator_raw(
+            request,
+            result_generator,
+            request_id,
+            model_name,
+            conversation,
+            tokenizer,
+            request_metadata,
+            chat_template_kwargs=chat_template_kwargs,
+            mm_token_counts=mm_token_counts,
+            compact_stream=bool(request.stream_options and request.stream_options.compact_stream),
+        )
         try:
-            async for chunk in self.chat_completion_stream_generator_raw(
-                request,
-                result_generator,
-                request_id,
-                model_name,
-                conversation,
-                tokenizer,
-                request_metadata,
-                chat_template_kwargs=chat_template_kwargs,
-                mm_token_counts=mm_token_counts,
-            ):
+            async for chunk in chunks:
                 if isinstance(chunk, ErrorResponse):
                     data = chunk.model_dump_json()
+                elif isinstance(chunk, CompactChatCompletionStreamResponse):
+                    is_lead = chunk.usage is not None and "prompt_tokens" in chunk.usage.model_fields_set
+                    data = chunk.model_dump_json(exclude_unset=True, exclude_none=is_lead)
                 else:
                     data = chunk.model_dump_json(exclude_unset=True, exclude_none=not chunk.choices)
                 yield f"data: {data}\n\n"
@@ -472,6 +479,8 @@ class OpenAIServingChat(GenerateBaseServing):
             logger.exception("Error serializing chat completion stream.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
+        finally:
+            await chunks.aclose()
         yield "data: [DONE]\n\n"
 
     async def chat_completion_stream_generator_raw(
@@ -485,8 +494,10 @@ class OpenAIServingChat(GenerateBaseServing):
         request_metadata: RequestResponseMetadata,
         chat_template_kwargs: dict[str, Any] | None = None,
         mm_token_counts: dict[str, int] | None = None,
-    ) -> AsyncGenerator[ChatCompletionStreamResponse | ErrorResponse, None]:
-        """Yield chat chunks or errors without serializing them into SSE frames."""
+        *,
+        compact_stream: bool = False,
+    ) -> AsyncGenerator[ChatCompletionStreamResponse | CompactChatCompletionStreamResponse | ErrorResponse, None]:
+        """Yield typed chat chunks; internal consumers retain standard chunks by default."""
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
         first_iteration = True
@@ -516,6 +527,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 parsers = [None] * num_choices
         except Exception as e:
             logger.exception("Error in parser creation.")
+            await close_async_iterator(result_generator)
             yield self.create_error_response(e)
             return
 
@@ -546,7 +558,21 @@ class OpenAIServingChat(GenerateBaseServing):
 
                     # NOTE num_choices defaults to 1 so this usually executes
                     # once per request
-                    for i in range(num_choices):
+                    if compact_stream:
+                        lead_usage = UsageInfo(prompt_tokens=num_prompt_tokens)
+                        details = _make_prompt_tokens_details(
+                            True, num_cached_tokens, num_cache_creation_tokens, mm_token_counts
+                        )
+                        if details is not None:
+                            lead_usage.prompt_tokens_details = details
+                        yield CompactChatCompletionStreamResponse(
+                            choices=[
+                                ChatCompletionResponseStreamChoice(index=i, delta=DeltaMessage(role=role))
+                                for i in range(num_choices)
+                            ],
+                            usage=lead_usage,
+                        )
+                    for i in range(0 if compact_stream else num_choices):
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
                             delta=DeltaMessage(
@@ -617,7 +643,12 @@ class OpenAIServingChat(GenerateBaseServing):
                                         ),
                                     )
 
-                                yield chunk
+                                if compact_stream:
+                                    yield CompactChatCompletionStreamResponse(
+                                        choices=[choice_data], usage=UsageInfo(completion_tokens=0)
+                                    )
+                                else:
+                                    yield chunk
                     first_iteration = False
 
                 for output in res.outputs:
@@ -661,6 +692,11 @@ class OpenAIServingChat(GenerateBaseServing):
                             prompt_token_ids=res.prompt_token_ids,
                             finished=output.finish_reason is not None,
                         )
+                        # Harmony parses tool syntax even when tool use is
+                        # disabled. Match the blocking response path: never
+                        # expose those calls or report a tool-call finish.
+                        if delta_message is not None and request.tool_choice == "none":
+                            delta_message.tool_calls = []
                         if delta_message is not None and delta_message.tool_calls:
                             tools_streamed[i] = True
 
@@ -789,7 +825,12 @@ class OpenAIServingChat(GenerateBaseServing):
                             ),
                         )
 
-                    yield chunk
+                    if compact_stream:
+                        yield CompactChatCompletionStreamResponse(
+                            choices=[choice_data], usage=UsageInfo(completion_tokens=previous_num_tokens[i])
+                        )
+                    else:
+                        yield chunk
 
             if self._include_reasoning_tokens_details and not include_continuous_usage:
                 for i, parser in enumerate(parsers):
@@ -798,7 +839,7 @@ class OpenAIServingChat(GenerateBaseServing):
 
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage
-            if include_usage:
+            if include_usage and not compact_stream:
                 completion_tokens = sum(previous_num_tokens)
                 final_usage = UsageInfo(
                     prompt_tokens=num_prompt_tokens,
@@ -877,6 +918,8 @@ class OpenAIServingChat(GenerateBaseServing):
         except Exception as e:
             logger.exception("Error in chat completion stream generator.")
             yield self.create_error_response(e)
+        finally:
+            await close_async_iterator(result_generator)
 
     async def chat_completion_full_generator(
         self,
@@ -898,6 +941,8 @@ class OpenAIServingChat(GenerateBaseServing):
                 final_res = res
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
+        finally:
+            await close_async_iterator(result_generator)
 
         if final_res is None:
             return self.create_error_response(

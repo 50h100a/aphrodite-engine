@@ -22,6 +22,7 @@ from aphrodite.triton_utils import tl, triton
 from aphrodite.utils.torch_utils import async_tensor_h2d
 from aphrodite.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
 from aphrodite.v1.sample.logits_processor.builtin import (
+    LogitBiasLogitsProcessor,
     MinPLogitsProcessor,
     MinTokensLogitsProcessor,
 )
@@ -446,7 +447,7 @@ class RejectionSampler(nn.Module):
             apply_bad_words_with_drafts(logits, bad_words_token_ids, output_token_ids, metadata.num_draft_tokens)
 
         for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
-            if isinstance(processor, MinTokensLogitsProcessor):
+            if isinstance(processor, (MinTokensLogitsProcessor, LogitBiasLogitsProcessor)):
                 logits = processor.apply_with_spec_decode(logits, metadata.num_draft_tokens)
         holder = sampling_metadata.thinking_budget_state_holder
         if holder is not None and holder.has_tracked_requests():

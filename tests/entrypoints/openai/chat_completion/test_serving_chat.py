@@ -665,6 +665,119 @@ async def _single_request_output(
     yield request_output
 
 
+class _TrackingResultGenerator:
+    def __init__(self, items, error_after_first=False):
+        self.items = iter(items)
+        self.error_after_first = error_after_first
+        self.consumed = False
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.consumed and self.error_after_first:
+            raise RuntimeError("simulated engine failure")
+        self.consumed = True
+        item = next(self.items, None)
+        if item is None:
+            raise StopAsyncIteration
+        return item
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_parser_creation_error_closes_engine_generator():
+    serving = _build_minimal_metrics_serving_chat(False)
+    serving.parser_cls = object
+    results = _TrackingResultGenerator([_make_metrics_request_output()])
+    stream = serving.chat_completion_stream_generator_raw(
+        ChatCompletionRequest(model="m", messages=[], stream=True),
+        results,
+        "r",
+        "m",
+        [],
+        None,
+        RequestResponseMetadata(request_id="r"),
+    )
+    await anext(stream)
+    assert results.closed
+    await stream.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compact", [False, True])
+async def test_client_disconnect_closes_engine_generator(compact):
+    serving = _build_minimal_metrics_serving_chat(False)
+    results = _TrackingResultGenerator([_make_metrics_request_output()])
+    stream = serving.chat_completion_stream_generator(
+        ChatCompletionRequest(model="m", messages=[], stream=True, stream_options={"compact_stream": compact}),
+        results,
+        "r",
+        "m",
+        [],
+        MagicMock(),
+        RequestResponseMetadata(request_id="r"),
+    )
+    await anext(stream)
+    await stream.aclose()
+    assert results.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [True, False])
+async def test_streaming_tool_choice_none_never_exposes_parsed_calls(raw):
+    serving = _build_minimal_metrics_serving_chat(False)
+    serving.enable_auto_tools = True
+    serving.parser_cls = MagicMock()
+    parser = MagicMock()
+    parser.parse_delta.return_value = DeltaMessage(
+        content="Kept text",
+        tool_calls=[{"index": 0, "id": "call-1", "type": "function", "function": {"name": "f", "arguments": "{}"}}],
+    )
+    serving._make_parser = lambda *args: parser
+    generate = serving.chat_completion_stream_generator_raw if raw else serving.chat_completion_stream_generator
+    chunks = [
+        chunk
+        async for chunk in generate(
+            ChatCompletionRequest(model="m", messages=[], tool_choice="none", stream=True),
+            _single_request_output(_make_metrics_request_output()),
+            "r",
+            "m",
+            [],
+            MagicMock(),
+            RequestResponseMetadata(request_id="r"),
+        )
+    ]
+    if not raw:
+        chunks = [
+            ChatCompletionStreamResponse.model_validate(json.loads(line[6:])) for line in chunks if "[DONE]" not in line
+        ]
+    choices = [choice for chunk in chunks for choice in chunk.choices]
+    assert all(not choice.delta.tool_calls for choice in choices)
+    assert "".join(choice.delta.content or "" for choice in choices) == "Kept text"
+    assert choices[-1].finish_reason == "stop"
+
+
+@pytest.mark.asyncio
+async def test_blocking_engine_failure_closes_engine_generator():
+    serving = _build_minimal_metrics_serving_chat(False)
+    results = _TrackingResultGenerator([_make_metrics_request_output()], error_after_first=True)
+    with pytest.raises(RuntimeError, match="simulated engine failure"):
+        await serving.chat_completion_full_generator(
+            ChatCompletionRequest(model="m", messages=[]),
+            results,
+            "r",
+            "m",
+            [],
+            MagicMock(),
+            RequestResponseMetadata(request_id="r"),
+        )
+    assert results.closed
+
+
 async def _stream_request_outputs(
     *request_outputs: RequestOutput,
 ) -> AsyncIterator[RequestOutput]:
@@ -769,7 +882,8 @@ async def test_streaming_serialization_failure_emits_error_and_done():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("raw", [False, True])
 @pytest.mark.parametrize("failure", ["parser", "before_first", "after_content", "generation"])
-async def test_streaming_errors_preserve_envelope(raw, failure):
+@pytest.mark.parametrize("compact", [False, True])
+async def test_streaming_errors_preserve_envelope(raw, failure, compact):
     serving = _build_minimal_metrics_serving_chat(False)
     error = GenerationError("backend failed") if failure == "generation" else ValueError("backend failed")
     if failure == "parser":
@@ -784,7 +898,12 @@ async def test_streaming_errors_preserve_envelope(raw, failure):
             yield output
         raise error
 
-    request = ChatCompletionRequest(model="test-model", messages=[{"role": "user", "content": "Test"}], stream=True)
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Test"}],
+        stream=True,
+        stream_options={"compact_stream": compact},
+    )
     method = serving.chat_completion_stream_generator_raw if raw else serving.chat_completion_stream_generator
     chunks = [
         chunk
@@ -3176,3 +3295,137 @@ async def test_non_streaming_finish_reason_matches_tool_calls(
     assert bool(choice.message.tool_calls) == (text != "Hello, how are you?"), (
         "finish_reason must reflect whether tool calls were emitted"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compact", [True, False, None])
+@pytest.mark.parametrize("include_usage,force_usage", [(False, False), (True, False), (False, True)])
+async def test_compact_chat_stream(compact, include_usage, force_usage):
+    serving = _build_minimal_metrics_serving_chat(True, force_usage)
+    serving.system_fingerprint = "fingerprint"
+    request = ChatCompletionRequest(
+        model="m",
+        messages=[{"role": "assistant", "content": "Echo"}],
+        stream=True,
+        n=2,
+        echo=True,
+        return_token_ids=True,
+        stream_options={"compact_stream": compact, "include_usage": include_usage, "continuous_usage_stats": True},
+    )
+
+    async def results():
+        for finished in [False, True]:
+            res = _make_metrics_request_output(token_ids=(100,))
+            res.num_cached_tokens = 2
+            res.num_cache_creation_tokens = 1
+            res.finished = finished
+            first = res.outputs[0]
+            first.finish_reason = "stop" if finished else None
+            second = CompletionOutput(
+                index=1,
+                text="World",
+                token_ids=[101, 102],
+                cumulative_logprob=None,
+                logprobs=None,
+                finish_reason=first.finish_reason,
+            )
+            res.outputs.append(second)
+            yield res
+
+    metadata = RequestResponseMetadata(request_id="r")
+    lines = [
+        line
+        async for line in serving.chat_completion_stream_generator(
+            request,
+            results(),
+            "r",
+            "m",
+            [{"role": "assistant", "content": "Echo"}],
+            None,
+            metadata,
+        )
+    ]
+    assert lines[-1] == "data: [DONE]\n\n"
+    events = [json.loads(line.removeprefix("data: ")) for line in lines[:-1]]
+    assert not any("error" in event for event in events)
+    if compact:
+        assert events[0] == {
+            "choices": [{"index": i, "delta": {"role": "assistant"}} for i in range(2)],
+            "usage": {"prompt_tokens": 3, "prompt_tokens_details": {"cached_tokens": 2, "created_cache_tokens": 1}},
+        }
+        assert all(set(event) <= {"choices", "usage"} for event in events)
+        assert [event["usage"] for event in events[1:]] == [{"completion_tokens": n} for n in [0, 0, 1, 2, 2, 4]]
+    else:
+        assert all(event["id"] == "r" and event["model"] == "m" for event in events)
+        assert bool(not events[-1]["choices"]) == (include_usage or force_usage)
+    choices = [choice for event in events for choice in event.get("choices", [])]
+    assert sum(choice["delta"].get("content") == "Echo" for choice in choices) == 2
+    assert sum(choice.get("finish_reason") == "stop" for choice in choices) == 2
+    assert [choice["token_ids"] for choice in choices if choice.get("token_ids")] == [[100], [101, 102]] * 2
+    assert metadata.final_usage_info.completion_tokens == 6
+    assert metadata.final_usage_info.prompt_tokens == 3
+
+
+@pytest.mark.asyncio
+async def test_compact_option_keeps_internal_chat_chunks_standard():
+    serving = _build_minimal_metrics_serving_chat(False)
+    request = ChatCompletionRequest(
+        model="m",
+        messages=[],
+        stream=True,
+        stream_options={"compact_stream": True},
+    )
+    chunks = [
+        chunk
+        async for chunk in serving.chat_completion_stream_generator_raw(
+            request,
+            _single_request_output(_make_metrics_request_output()),
+            "r",
+            "m",
+            [],
+            None,
+            RequestResponseMetadata(request_id="r"),
+        )
+    ]
+    assert all(isinstance(chunk, ChatCompletionStreamResponse) for chunk in chunks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_choice", ["auto", "none"])
+async def test_compact_chat_preserves_parser_channels(tool_choice):
+    serving = _build_minimal_metrics_serving_chat(False)
+    serving.enable_auto_tools = True
+    serving.parser_cls = MagicMock()
+    parser = MagicMock()
+    parser.parse_delta.return_value = DeltaMessage(
+        content="Answer",
+        reasoning="Reasoning",
+        tool_calls=[{"index": 0, "id": "call-1", "type": "function", "function": {"name": "f", "arguments": "{}"}}],
+    )
+    serving._make_parser = lambda *args: parser
+    request = ChatCompletionRequest(
+        model="m",
+        messages=[],
+        stream=True,
+        tool_choice=tool_choice,
+        tools=[{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}],
+        stream_options={"compact_stream": True},
+    )
+    lines = [
+        line
+        async for line in serving.chat_completion_stream_generator(
+            request,
+            _single_request_output(_make_metrics_request_output()),
+            "r",
+            "m",
+            [],
+            MagicMock(),
+            RequestResponseMetadata(request_id="r"),
+        )
+    ]
+    assert lines[-1] == "data: [DONE]\n\n"
+    choice = json.loads(lines[-2].removeprefix("data: "))["choices"][0]
+    assert choice["delta"]["content"] == "Answer"
+    assert choice["delta"]["reasoning"] == "Reasoning"
+    assert bool(choice["delta"].get("tool_calls")) == (tool_choice == "auto")
+    assert choice["finish_reason"] == ("tool_calls" if tool_choice == "auto" else "stop")
