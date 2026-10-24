@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any, TypedDict
 
 import regex as re
 
-import aphrodite.envs as envs
 from aphrodite.entrypoints.generate.base.protocol import (
     DeltaFunctionCall,
     DeltaMessage,
@@ -977,37 +976,16 @@ class HYV4ToolParser(ToolParser):
             The structural tag, or None when structural tagging does not apply.
 
         """
-        if not envs.APHRODITE_ENFORCE_STRICT_TOOL_CALLING:
-            return None
-
-        # Only constrain required / forced tool choice with the structural tag.
-        # For "auto", tool calling is optional and most requests never emit a
-        # tool call, so applying the grammar to every auto request would make
-        # the whole stream pay the output inflation and the per-token
-        # bitmask/accept overhead for a minority benefit. Skip it here so auto
-        # falls through to free generation; the HYV4 parser still reads back
-        # any tool calls the model emits.
-        tool_choice = request.tool_choice
-        if tool_choice is None or tool_choice == "auto" or getattr(tool_choice, "mode", None) == "auto":
-            return None
-
         from aphrodite.tool_parsers.structural_tag_registry import get_model_structural_tag
 
-        try:
-            return get_model_structural_tag(
-                model=self.structural_tag_model,
-                tools=request.tools,
-                tool_choice=request.tool_choice,
-                reasoning=reasoning,
-                token_suffix=self._extractor.token_suffix,
-                strict_level=strict_level,
-            )
-        except Exception:
-            logger.warning(
-                "HYV4ToolParser failed to build a structural tag; falling back to the default guided-decoding path.",
-                exc_info=True,
-            )
-            return None
+        return get_model_structural_tag(
+            model=self.structural_tag_model,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            reasoning=reasoning,
+            token_suffix=self._extractor.token_suffix,
+            strict_level=strict_level,
+        )
 
     def _mirror_state(self) -> None:
         # Alias the SAME list objects the extractor appends to, so the serving
@@ -1020,7 +998,7 @@ class HYV4ToolParser(ToolParser):
     def _is_guided(request: ChatCompletionRequest) -> bool:
         """Whether a structural tag constrains this request's decoding.
 
-        ``get_structural_tag`` only applies to required / named tool choice and
+        ``get_structural_tag`` applies to tool-enabled requests and
         the serving layer records the result on the request. A structural tag
         constrains strings rather than token ids, so the ``<tool_calls>`` marker
         can arrive split across sub-word tokens and must be detected on the

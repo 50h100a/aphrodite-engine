@@ -73,11 +73,9 @@ def _partial_tag_overlap(text: str, tag: str) -> int:
 class KimiK3ToolParser(ToolParser):
     supports_required_and_named = False
     # Enables the Aphrodite-side XTML structural tag builder
-    # (``get_kimi_k3_structural_tag`` in ``structural_tag_registry``). With
-    # ``APHRODITE_ENFORCE_STRICT_TOOL_CALLING`` on (default), ``_apply_structural_tag``
-    # constrains generation to K3's ``<|open|>tools<|sep|>`` channel for
-    # ``required`` (and ``auto`` when a tool sets ``strict``) instead of the
-    # generic JSON guided decoding, which conflicts with the XTML format.
+    # (``get_kimi_k3_structural_tag`` in ``structural_tag_registry``).
+    # Unified parsing always uses the native XTML envelope for tool requests;
+    # argument-schema strictness is resolved separately.
     structural_tag_model = "kimi_k3"
 
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
@@ -152,9 +150,8 @@ class KimiK3ToolParser(ToolParser):
             # named call (the generic JSON guided-decoding path conflicts
             # with the XTML channel format).
             raise AphroditeValidationError(
-                "Named tool choice for Kimi K3 requires strict tool calling "
-                "(APHRODITE_ENFORCE_STRICT_TOOL_CALLING) so the XTML structural "
-                "tag can force the call. Otherwise use `tool_choice` set to "
+                "Named tool choice for Kimi K3 requires the XTML structural tag "
+                "from the unified parser to force the call. Otherwise use `tool_choice` set to "
                 '"auto", "required", or "none".',
                 parameter="tool_choice",
                 value=request.tool_choice,

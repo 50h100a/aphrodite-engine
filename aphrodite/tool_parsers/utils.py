@@ -483,10 +483,23 @@ def _iter_tool_info(tools: list[Tool] | None) -> Iterator[tuple[str, dict[str, A
             yield _extract_tool_info(tool)
 
 
+def tool_parameters_are_strict(strict: bool | None, *, force_default: bool = False) -> bool:
+    """Resolve parameter enforcement without changing structural constraints.
+
+    Explicit client choices win, including ``strict=False``. The environment
+    flag and the PARAMETER floor supply defaults only for an omitted choice.
+    """
+    if strict is not None:
+        return strict
+    from aphrodite import envs
+
+    return force_default or envs.APHRODITE_ENFORCE_STRICT_TOOL_CALLING
+
+
 def _extract_constrained_tool_info(tool: Tool) -> tuple[str, dict[str, Any] | None]:
     name, params = _extract_tool_info(tool)
     strict = tool.strict if isinstance(tool, FunctionTool) else tool.function.strict
-    if strict is False:
+    if not tool_parameters_are_strict(strict):
         params = {"type": "object", "additionalProperties": True}
     return name, params
 

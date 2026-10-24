@@ -43,6 +43,7 @@ from aphrodite.tool_parsers.utils import (
     custom_tool_parameters,
     get_function_tools,
     require_function_tools,
+    tool_parameters_are_strict,
 )
 
 ToolChoice: TypeAlias = (
@@ -133,20 +134,6 @@ def get_structural_tag_tools(
     return require_function_tools(tools)
 
 
-def _tool_is_strict(tool: ChatCompletionToolsParam | ResponsesTool) -> bool:
-    if isinstance(tool, FunctionTool):
-        return tool.strict is True
-    if isinstance(tool, ChatCompletionToolsParam):
-        return tool.function.strict is True
-    return False
-
-
-def _any_tool_strict(
-    tools: Sequence[ChatCompletionToolsParam | ResponsesTool],
-) -> bool:
-    return any(_tool_is_strict(tool) for tool in tools)
-
-
 def _with_tool_strict(
     tool: ChatCompletionToolsParam | ResponsesTool,
     strict: bool,
@@ -164,17 +151,27 @@ def resolve_tool_strictness(
     tool_choice: ToolChoice,
     strict_level: ToolStrictLevel,
 ) -> Sequence[ChatCompletionToolsParam | ResponsesTool] | None:
-    """Decide whether a structural tag applies and pin each tool's ``strict``.
+    """Keep the call envelope constrained and resolve argument-schema defaults.
 
-    A tool without an explicit ``strict`` is treated as non-strict: its call
-    envelope is still constrained, but its arguments stay free unless the
-    server level is PARAMETER. ``None`` means no structural tag.
+    The environment switch controls omitted parameter strictness only. Client
+    ``strict=False`` always opts out, including at the PARAMETER floor.
     """
-    if tool_choice == "auto" and strict_level == ToolStrictLevel.AUTO and not _any_tool_strict(tools):
-        return None
-    return [
-        _with_tool_strict(tool, strict_level >= ToolStrictLevel.PARAMETER or _tool_is_strict(tool)) for tool in tools
-    ]
+    del tool_choice  # Tool choice is enforced by the structural-tag builder.
+    result = []
+    for tool in tools:
+        if isinstance(tool, FunctionTool):
+            strict = tool.strict
+        elif isinstance(tool, ChatCompletionToolsParam):
+            strict = tool.function.strict
+        else:
+            result.append(tool)
+            continue
+        result.append(
+            _with_tool_strict(
+                tool, tool_parameters_are_strict(strict, force_default=strict_level >= ToolStrictLevel.PARAMETER)
+            )
+        )
+    return result
 
 
 def get_model_structural_tag(

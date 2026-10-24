@@ -127,13 +127,12 @@ class BaseFrontendArgs:
     into OpenAI API format, the name register in this plugin can be used in
     `--tool-call-parser`."""
     tool_strict_level: ToolStrictLevelName | None = None
-    """Server-side floor for structural-tag based tool calling, applied on top
-    of the per-tool `strict` field. `auto` follows the request's tool choice
-    and per-tool strictness; `function` constrains the
-    tool-call envelope (markup and function name) for every request with
-    tools; `parameter` additionally pins argument schemas, as if every tool
-    were `strict: true`. When unset, the tool parser's default level applies,
-    which is `auto` for most parsers."""
+    """Structural tool-call constraints are always available. `auto` and
+    `function` preserve the native envelope and resolve parameter strictness
+    from the client or APHRODITE_ENFORCE_STRICT_TOOL_CALLING. `parameter`
+    defaults omitted strictness to true. Explicit `strict: false` opts out
+    of parameter enforcement at every level. When unset, the parser's default
+    level applies."""
     tool_server: str | None = None
     """Comma-separated list of host:port pairs (IPv4, IPv6, or hostname).
     Examples: 127.0.0.1:8000, [::1]:8000, localhost:1234. Or `demo` for

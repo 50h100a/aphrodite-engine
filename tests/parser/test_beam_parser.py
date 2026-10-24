@@ -550,7 +550,7 @@ def test_automatic_choice_lets_calls_name_undeclared_tools(strict, tool_choice, 
     ],
 )
 def test_automatic_calls_enforce_declared_arguments_beside_any_other_name(name, body, accepted):
-    find = _tool("find", {"q": {"type": "string"}})
+    find = _tool("find", {"q": {"type": "string"}}, strict=False)
     find.function.parameters["minProperties"] = 1
     req = adjust(chat_request([*TOOLS, find]))
 
@@ -571,13 +571,15 @@ def test_value_ends_before_an_opener_on_the_next_line():
 def test_always_constrained_output_can_be_disabled(monkeypatch):
     monkeypatch.setenv("APHRODITE_BEAM_ALWAYS_CONSTRAIN_OUTPUT", "0")
 
-    assert adjust(chat_request(TOOLS)).structured_outputs is None
+    assert adjust(chat_request(TOOLS)).structured_outputs is not None
+    assert adjust(ChatCompletionRequest(model="beam", messages=[])).structured_outputs is None
 
 
-def test_strict_tools_the_template_cannot_hold_leave_automatic_choice_unconstrained():
+def test_strict_tools_the_template_cannot_hold_are_rejected():
     dotted = _tool("set_code", {"code": {"type": "string", "pattern": "^a.b$"}}, strict=True)
 
-    assert adjust(chat_request([dotted])).structured_outputs is None
+    with pytest.raises(AphroditeValidationError, match="cannot enforce tool constraints"):
+        adjust(chat_request([dotted]))
 
 
 def test_generic_parser_does_not_derive_the_template_grammar():

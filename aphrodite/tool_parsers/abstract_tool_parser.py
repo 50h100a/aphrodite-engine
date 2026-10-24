@@ -13,7 +13,6 @@ from openai.types.responses import (
 )
 from openai.types.responses.function_tool import FunctionTool
 
-import aphrodite.envs as envs
 from aphrodite.entrypoints.generate.base.protocol import (
     DeltaMessage,
     ExtractedToolCallInformation,
@@ -60,14 +59,13 @@ class ToolParser:
     # their parsed tool-call syntax matches a builtin xgrammar format.
     structural_tag_model: str | None = None
     # Strict level applied when the operator leaves ``--tool-strict-level``
-    # unset. Operator flags override it, and
-    # ``APHRODITE_ENFORCE_STRICT_TOOL_CALLING=0`` still disables structural tags.
+    # unset. Structural-tag availability is independent of parameter strictness.
     default_tool_strict_level: ToolStrictLevel = ToolStrictLevel.AUTO
     engine_based_streaming: bool = False
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
-        if cls.structural_tag_model is not None and envs.APHRODITE_ENFORCE_STRICT_TOOL_CALLING:
+        if cls.structural_tag_model is not None:
             cls.supports_required_and_named = False
 
     def __init__(
@@ -190,8 +188,6 @@ class ToolParser:
         strict_level: ToolStrictLevel = ToolStrictLevel.AUTO,
     ):
         if self.structural_tag_model is None:
-            return None
-        if not envs.APHRODITE_ENFORCE_STRICT_TOOL_CALLING:
             return None
         from aphrodite.tool_parsers.structural_tag_registry import get_model_structural_tag
 

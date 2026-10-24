@@ -80,3 +80,22 @@ def test_named_custom_choice_allowed_with_structural_tag():
 def test_named_custom_choice_rejected_without_structural_tag():
     with pytest.raises(AphroditeValidationError):
         _parser().adjust_request(_custom_request(with_tag=False))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("responses", [False, True])
+def test_unified_named_choice_keeps_native_tag_without_parameter_enforcement(monkeypatch, enabled, responses):
+    from aphrodite import envs
+    from aphrodite.parser.abstract_parser import DelegatingParser
+    from aphrodite.tool_parsers.kimi_k3_tool_parser import KimiK3ToolParser
+
+    monkeypatch.setattr(envs, "APHRODITE_ENFORCE_STRICT_TOOL_CALLING", enabled)
+
+    class NativeParser(DelegatingParser):
+        tool_parser_cls = KimiK3ToolParser
+
+    request = _custom_request(False) if responses else _request(False)
+    out = NativeParser(_DummyTokenizer(), tools=request.tools).adjust_request(request)
+    assert out.structured_outputs is not None
+    assert out.structured_outputs.structural_tag is not None
+    assert out.skip_special_tokens is False

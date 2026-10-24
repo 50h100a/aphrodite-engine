@@ -68,6 +68,13 @@ from aphrodite.tool_parsers.structural_tag_registry import (
 from aphrodite.tool_parsers.tool_strict_level import ToolStrictLevel
 
 
+@pytest.fixture(autouse=True)
+def parameter_default_off(monkeypatch):
+    # These fixtures exercise unconstrained arguments unless a test explicitly
+    # selects the new environment default or a strict client tool.
+    monkeypatch.setattr(envs, "APHRODITE_ENFORCE_STRICT_TOOL_CALLING", False)
+
+
 @pytest.fixture
 def sample_tools() -> list[ChatCompletionToolsParam]:
     return [
@@ -125,7 +132,7 @@ def test_deepseek_v41_named_choice_emits_one_call(sample_tools):
     )
     assert _is_grammar_accept_string(grammar, "\n\n<｜DSML｜ calls>\n" + call + "</｜DSML｜ calls>")
     assert not _is_grammar_accept_string(grammar, "\n\n<｜DSML｜ calls>\n" + call * 2 + "</｜DSML｜ calls>")
-    assert get_model_structural_tag("deepseek_v4_1", sample_tools, "auto", reasoning=False) is None
+    assert get_model_structural_tag("deepseek_v4_1", sample_tools, "auto", reasoning=False) is not None
 
 
 @pytest.mark.parametrize("choice", ["auto", "required", "get_weather"])
@@ -286,7 +293,7 @@ def test_glm47_default_level_allows_builtin_only_tools(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """GLM-4.7's default FUNCTION level must not reject builtin-only tools."""
-    monkeypatch.setattr(envs, "APHRODITE_ENFORCE_STRICT_TOOL_CALLING", True)
+    monkeypatch.setattr(envs, "APHRODITE_ENFORCE_STRICT_TOOL_CALLING", False)
 
     class TestParser(DelegatingParser):
         tool_parser_cls = Glm47MoeModelToolParser
@@ -591,15 +598,15 @@ def test_kimi_k3_registered_as_aphrodite_builtin():
     assert KimiK3ToolParser.structural_tag_model == "kimi_k3"
 
 
-def test_kimi_k3_auto_without_strict_is_unconstrained():
-    # auto + no strict tool => no structural tag (matches the strict gate).
+def test_kimi_k3_auto_without_strict_keeps_envelope():
+    # The envelope remains available with free-form arguments.
     tag = get_model_structural_tag(
         model="kimi_k3",
         tools=_k3_tools_by_name(),
         tool_choice="auto",
         reasoning=False,
     )
-    assert tag is None
+    assert tag is not None
 
 
 @pytest.mark.parametrize(
@@ -923,13 +930,12 @@ def test_native_format_parser_skips_json_schema_constraint_responses(
 
 
 @pytest.mark.parametrize("tool_choice", ["required", _NAMED_CHAT_TOOL_CHOICE])
-def test_glm47_without_strict_tool_calling_skips_json_schema_constraint(
+def test_glm47_parameter_flag_off_keeps_native_constraint(
     monkeypatch: pytest.MonkeyPatch,
     sample_tools: list[ChatCompletionToolsParam],
     tool_choice,
 ):
-    # With strict tool calling off, no structural tag is attached, so GLM-4.7
-    # must decode its native XML instead of a JSON tool-call list.
+    # Parameter enforcement can be off while native XML stays constrained.
     monkeypatch.setattr(envs, "APHRODITE_ENFORCE_STRICT_TOOL_CALLING", False)
 
     class TestParser(DelegatingParser):
@@ -947,7 +953,8 @@ def test_glm47_without_strict_tool_calling_skips_json_schema_constraint(
 
     out = parser.adjust_request(request)
 
-    assert out.structured_outputs is None
+    assert out.structured_outputs is not None
+    assert out.structured_outputs.structural_tag is not None
     assert out.skip_special_tokens is False
 
 
@@ -1040,7 +1047,7 @@ def test_xgrammar_function_parameters_are_preserved(
 
 
 @pytest.mark.parametrize("model", sorted(XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS))
-def test_auto_tool_choice_skips_structural_tag_without_strict(
+def test_auto_tool_choice_keeps_structural_tag_without_strict(
     model: str,
     sample_tools: list[ChatCompletionToolsParam],
 ):
@@ -1051,7 +1058,8 @@ def test_auto_tool_choice_skips_structural_tag_without_strict(
         reasoning=False,
     )
 
-    assert tag is None
+    assert tag is not None
+    assert not _pins_argument_schema(tag)
 
 
 def test_get_function_parameters_relaxes_function_strict_false():
@@ -1214,20 +1222,14 @@ def _dumped(tag: StructuralTag) -> str:
 def test_tool_strict_level_auto_is_the_default(
     sample_tools: list[ChatCompletionToolsParam],
 ):
-    """Auto + no strict tool gets no tag unless the operator raises the floor."""
-    assert (
-        get_model_structural_tag(
-            model="deepseek_v4",
-            tools=sample_tools,
-            tool_choice="auto",
-            reasoning=False,
-        )
-        is None
-    )
+    """Auto always provides the envelope, with optional parameter enforcement."""
+    tag = get_model_structural_tag("deepseek_v4", sample_tools, "auto", False)
+    assert tag is not None
+    assert not _pins_argument_schema(tag)
 
 
 @pytest.mark.parametrize("model", sorted(SUPPORTED_STRUCTURAL_TAG_MODELS))
-def test_tool_strict_level_function_lifts_auto_gate(
+def test_tool_strict_level_function_keeps_auto_envelope(
     model: str,
     sample_tools: list[ChatCompletionToolsParam],
 ):
@@ -1375,7 +1377,7 @@ def test_forced_tool_choice_pins_schema_only_for_strict_tools(
     assert floored is not None and _pins_argument_schema(floored)
 
 
-def test_tool_strict_level_parameter_overrides_client_strict_false():
+def test_tool_strict_level_parameter_respects_client_strict_false():
     tools = [
         ChatCompletionToolsParam(
             type="function",
@@ -1395,7 +1397,7 @@ def test_tool_strict_level_parameter_overrides_client_strict_false():
     )
 
     assert tag is not None
-    assert _pins_argument_schema(tag)
+    assert not _pins_argument_schema(tag)
 
 
 def test_tool_strict_level_from_name():
@@ -1451,7 +1453,7 @@ def _glm47_call(name: str, *args: str) -> str:
 
 
 def _glm47_shallow_grammar(tool_choice, tools=None, reasoning: bool = False, *, auto: bool = False):
-    # auto needs the FUNCTION level to lift the non-strict auto gate.
+    # FUNCTION keeps the same native envelope for optional calls.
     tag = get_model_structural_tag(
         model="glm_4_7",
         tools=tools if tools is not None else _glm47_tools(),
@@ -1703,7 +1705,7 @@ def test_glm47_strict_only_matches_xgrammar_builtin(tool_choice: str, reasoning:
 def test_glm47_parameter_level_pins_schemas_like_the_builtin(
     sample_tools: list[ChatCompletionToolsParam],
 ):
-    # The operator floor overrides per-tool strictness: every tool is pinned.
+    # The operator floor pins tools whose strictness was omitted.
     ours = get_model_structural_tag(
         model="glm_4_7",
         tools=sample_tools,
@@ -1752,7 +1754,7 @@ def test_glm47_mixed_tools_dispatch_per_tool(
     assert tags[1]["content"]["type"] != "json_schema"
 
 
-def _glm47_parser(tools, monkeypatch: pytest.MonkeyPatch, *, strict_calling: bool = True) -> Glm47MoeModelToolParser:
+def _glm47_parser(tools, monkeypatch: pytest.MonkeyPatch, *, strict_calling: bool = False) -> Glm47MoeModelToolParser:
     monkeypatch.setattr(envs, "APHRODITE_ENFORCE_STRICT_TOOL_CALLING", strict_calling)
     return Glm47MoeModelToolParser(MagicMock(), tools=tools)
 
@@ -1761,7 +1763,7 @@ def _glm47_parser(tools, monkeypatch: pytest.MonkeyPatch, *, strict_calling: boo
     ("tool_choice", "tools"),
     [("auto", "plain"), ("required", "plain"), ("required", "strict")],
 )
-def test_glm47_get_structural_tag_disabled_when_flag_off(
+def test_glm47_get_structural_tag_preserved_when_parameter_flag_off(
     monkeypatch: pytest.MonkeyPatch,
     sample_tools: list[ChatCompletionToolsParam],
     sample_tools_strict: list[ChatCompletionToolsParam],
@@ -1776,7 +1778,7 @@ def test_glm47_get_structural_tag_disabled_when_flag_off(
         tool_choice=tool_choice,
     )
 
-    assert parser.get_structural_tag(request) is None
+    assert parser.get_structural_tag(request) is not None
 
 
 def test_glm47_default_strict_level_constrains_auto(
@@ -1784,8 +1786,8 @@ def test_glm47_default_strict_level_constrains_auto(
     sample_tools: list[ChatCompletionToolsParam],
 ):
     # --tool-strict-level auto: the parser's FUNCTION default lifts the
-    # non-strict auto gate.
-    monkeypatch.setattr(envs, "APHRODITE_ENFORCE_STRICT_TOOL_CALLING", True)
+    # optional tool-call envelope.
+    monkeypatch.setattr(envs, "APHRODITE_ENFORCE_STRICT_TOOL_CALLING", False)
 
     class TestParser(DelegatingParser):
         tool_parser_cls = Glm47MoeModelToolParser
@@ -1813,7 +1815,7 @@ def test_glm47_default_strict_level_constrains_auto(
 def test_glm47_responses_request_attaches_shallow_tag(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setattr(envs, "APHRODITE_ENFORCE_STRICT_TOOL_CALLING", True)
+    monkeypatch.setattr(envs, "APHRODITE_ENFORCE_STRICT_TOOL_CALLING", False)
 
     class TestParser(DelegatingParser):
         tool_parser_cls = Glm47MoeModelToolParser
@@ -1853,7 +1855,7 @@ def test_glm47_operator_level_overrides_parser_default(
     monkeypatch: pytest.MonkeyPatch,
     sample_tools: list[ChatCompletionToolsParam],
 ):
-    monkeypatch.setattr(envs, "APHRODITE_ENFORCE_STRICT_TOOL_CALLING", True)
+    monkeypatch.setattr(envs, "APHRODITE_ENFORCE_STRICT_TOOL_CALLING", False)
 
     class TestParser(DelegatingParser):
         tool_parser_cls = Glm47MoeModelToolParser
@@ -1875,14 +1877,14 @@ def test_glm47_operator_level_overrides_parser_default(
     assert content["json_schema"] == sample_tools[0].function.parameters
 
 
-@pytest.mark.parametrize(("tool_strict_level", "constrained"), [(None, True), ("auto", False)])
+@pytest.mark.parametrize(("tool_strict_level", "constrained"), [(None, True), ("auto", True)])
 def test_glm47_default_level_applies_only_when_the_level_is_unset(
     monkeypatch: pytest.MonkeyPatch,
     sample_tools: list[ChatCompletionToolsParam],
     tool_strict_level: str | None,
     constrained: bool,
 ):
-    monkeypatch.setattr(envs, "APHRODITE_ENFORCE_STRICT_TOOL_CALLING", True)
+    monkeypatch.setattr(envs, "APHRODITE_ENFORCE_STRICT_TOOL_CALLING", False)
     parser_cls = ParserManager.get_parser(
         tool_parser_name="glm47",
         enable_auto_tools=True,
@@ -1905,7 +1907,7 @@ def test_glm47_required_with_non_strict_tools_attaches_shallow_tag(
     monkeypatch: pytest.MonkeyPatch,
     sample_tools: list[ChatCompletionToolsParam],
 ):
-    monkeypatch.setattr(envs, "APHRODITE_ENFORCE_STRICT_TOOL_CALLING", True)
+    monkeypatch.setattr(envs, "APHRODITE_ENFORCE_STRICT_TOOL_CALLING", False)
 
     class TestParser(DelegatingParser):
         tool_parser_cls = Glm47MoeModelToolParser
@@ -2030,7 +2032,7 @@ def _tool_calling_grammar(
 @pytest.mark.parametrize("policy", ["auto", "required"])
 @pytest.mark.parametrize("tool_parser,prefix,call,suffix", _SINGLE_CALL_CASES, ids=_SINGLE_CALL_IDS)
 def test_parallel_tool_calls_false_limits_grammar_to_one_call(sample_tools, tool_parser, prefix, call, suffix, policy):
-    # Tools are not strict, so auto gets a grammar only because of the limit.
+    # Non-strict arguments retain a grammar that enforces the call limit.
     request = ChatCompletionRequest(
         model="m",
         messages=[],
@@ -2057,17 +2059,18 @@ def test_parallel_tool_calls_default_keeps_grammar_unlimited(sample_tools, tool_
             tool_choice=policy,
         )
 
-    assert _tool_calling_grammar(tool_parser, sample_tools, request("auto")) is None
+    auto_grammar = _tool_calling_grammar(tool_parser, sample_tools, request("auto"))
+    assert auto_grammar is not None
+    assert _is_grammar_accept_string(auto_grammar, prefix + call * 2 + suffix)
     grammar = _tool_calling_grammar(tool_parser, sample_tools, request("required"))
     assert grammar is not None
     assert _is_grammar_accept_string(grammar, prefix + call * 2 + suffix)
 
 
-def test_parallel_tool_calls_false_does_not_enable_calls_with_response_format(
+def test_parallel_tool_calls_false_preserves_response_format_and_limits_calls(
     sample_tools,
 ):
-    # With the flag unset, auto + response_format + non-strict tools is
-    # format-only. Setting the flag to false must not make tool calls possible.
+    # Both reply formatting and optional tool calls retain their constraints.
     request = ChatCompletionRequest(
         model="m",
         messages=[],
@@ -2080,7 +2083,12 @@ def test_parallel_tool_calls_false_does_not_enable_calls_with_response_format(
         },
     )
 
-    assert _tool_calling_grammar("hermes", sample_tools, request) is None
+    grammar = _tool_calling_grammar("hermes", sample_tools, request)
+    assert grammar is not None
+    assert _is_grammar_accept_string(grammar, "{}")
+    call = _SINGLE_CALL_CASES[1][2]
+    assert _is_grammar_accept_string(grammar, call)
+    assert not _is_grammar_accept_string(grammar, call * 2)
 
 
 def test_responses_parallel_tool_calls_false_limits_grammar_to_one_call():

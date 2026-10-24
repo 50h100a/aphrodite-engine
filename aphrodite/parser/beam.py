@@ -154,7 +154,7 @@ class BeamParser(ResponseTemplateParser):
         # model from calling them.
         tools_forbidden = bool(request.tools) and request.tool_choice == "none" and TOOL_FIELD in fields
         constrained_tools = None
-        if tools_enabled and (forced or envs.APHRODITE_ENFORCE_STRICT_TOOL_CALLING):
+        if tools_enabled:
             assert self._tool_parser is not None
             strict_level = self.tool_strict_level
             if strict_level is None:
@@ -224,5 +224,7 @@ class BeamParser(ResponseTemplateParser):
                 parameter="tool_choice",
             )
         if tag is None and constrained_tools is not None:
-            logger.warning_once("response_template parsing cannot enforce strict tools for this request.")
+            raise AphroditeValidationError(
+                "response_template parsing cannot enforce tool constraints for this request", parameter="tools"
+            )
         return tag
