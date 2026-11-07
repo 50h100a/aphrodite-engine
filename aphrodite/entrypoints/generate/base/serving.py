@@ -30,6 +30,7 @@ from aphrodite.inputs import EngineInput
 from aphrodite.logger import init_logger
 from aphrodite.logprobs import Logprob, PromptLogprobs
 from aphrodite.lora.request import LoRARequest
+from aphrodite.sampling_params import BeamSearchParams, SamplingParams
 from aphrodite.tokenizers import TokenizerLike
 from aphrodite.tokenizers.detokenizer_utils import convert_ids_list_to_tokens
 from aphrodite.v1.metrics.stats import RequestStateStats
@@ -177,6 +178,20 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
         self.engine_client.check_admission(n)
+
+    def _validate_structured_outputs(self, params: SamplingParams | BeamSearchParams) -> None:
+        """Validate and select the decoder before a streaming response starts.
+
+        Use the engine's validation on the final parser-generated constraint:
+        creating its async generator does not execute input validation yet.
+        """
+        if not isinstance(params, SamplingParams) or params.structured_outputs is None:
+            return
+        params._validate_structured_outputs(
+            self.model_config,
+            self.engine_client.aphrodite_config.structured_outputs_config,
+            self.renderer.get_tokenizer(),
+        )
 
     def create_streaming_error_response(
         self,

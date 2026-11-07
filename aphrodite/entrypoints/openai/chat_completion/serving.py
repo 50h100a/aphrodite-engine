@@ -53,7 +53,7 @@ from aphrodite.entrypoints.serve.utils.tool_calls_utils import (
     maybe_filter_parallel_tool_calls,
     resolve_finish_reason,
 )
-from aphrodite.exceptions import AphroditeValidationError, GenerationError
+from aphrodite.exceptions import GenerationError
 from aphrodite.inputs import EngineInput, MultiModalPlaceholders
 from aphrodite.logger import init_logger
 from aphrodite.logprobs import Logprob
@@ -71,7 +71,6 @@ from aphrodite.tokenizers import TokenizerLike
 from aphrodite.utils.async_utils import close_async_iterator
 from aphrodite.utils.collection_utils import as_list
 from aphrodite.utils.serial_utils import numpy2base64
-from aphrodite.v1.structured_output.schema_features import get_structured_outputs_schema_error
 
 logger = init_logger(__name__)
 
@@ -342,9 +341,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     self.default_sampling_params,
                 )
 
-            schema_error = get_structured_outputs_schema_error(sampling_params.structured_outputs)
-            if schema_error is not None:
-                raise AphroditeValidationError(schema_error, parameter="structured_outputs")
+            self._validate_structured_outputs(sampling_params)
 
             self._log_inputs(
                 sub_request_id,

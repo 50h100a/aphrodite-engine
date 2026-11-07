@@ -89,12 +89,12 @@ def mock_request():
 
 class TestNonStreaming:
     @pytest.mark.parametrize("stream", [False, True])
-    def test_schema_controls_typed_parameters_and_enum_padding(self, mock_tokenizer, mock_request, stream):
+    def test_native_typed_parameters_preserve_enum_whitespace(self, mock_tokenizer, mock_request, stream):
         tools = [
             _make_tool(
                 "report",
                 {
-                    "severity": {"type": "string", "enum": ["sev1", "sev2"]},
+                    "severity": {"type": "string", "enum": ["sev1", " \tsev2 "]},
                     "count": {"type": "integer"},
                     "title": {"type": "string"},
                 },
@@ -106,7 +106,7 @@ class TestNonStreaming:
             _invoke(
                 "report",
                 _param("severity", "true", " \tsev2 "),
-                _param("count", "true", " 42 "),
+                _param("count", "false", " 42 "),
                 _param("title", "true", " padded "),
             )
         )
@@ -115,7 +115,7 @@ class TestNonStreaming:
         else:
             arguments = parser.extract_tool_calls(text, mock_request).tool_calls[0].function.arguments
         assert json.loads(arguments) == {
-            "severity": "sev2",
+            "severity": " \tsev2 ",
             "count": 42,
             "title": " padded ",
         }

@@ -501,6 +501,13 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
 
     so_params = sampling_params.structured_outputs
 
+    from aphrodite.v1.structured_output.schema_features import iter_request_json_schemas
+    from aphrodite.v1.structured_output.xgrammar_schema import get_xgrammar_schema_error
+
+    for schema in iter_request_json_schemas(so_params):
+        if error := get_xgrammar_schema_error(schema):
+            raise AphroditeValidationError(f"XGrammar cannot enforce this JSON schema: {error}")
+
     if so_params.regex is not None:
         # A NUL byte is never meaningful in a regex pattern and is not handled
         # by xgrammar's native regex converter. Reject it here, before the

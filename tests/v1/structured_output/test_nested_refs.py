@@ -246,14 +246,13 @@ class TestToolPropertyResolution:
         assert properties["color"]["enum"] == ["red", "green"]
         assert extract_types_from_schema(properties["inner"]) == ["object"]
 
-    def test_an_enum_behind_a_pointer_gets_its_padding_stripped(self):
-        """The grammar lets a model indent a value; the schema says whether the
-        indentation is part of it. An enum member's cannot be -- but only if the
-        enum is visible, and behind a `$ref` it was not, so the padding was
-        handed to the caller as part of the value."""
-        properties = find_tool_properties([chat_tool("f", self.PYDANTIC)], "f")
+    def test_an_enum_behind_a_pointer_preserves_significant_whitespace(self):
+        schema = copy.deepcopy(self.PYDANTIC)
+        value = "\n\tred\n  "
+        schema["$defs"]["Color"]["enum"] = [value]
+        properties = find_tool_properties([chat_tool("f", schema)], "f")
 
-        assert _dsml_param_value("color", "true", "\n\tred\n  ", properties) == "red"
+        assert _dsml_param_value("color", "true", value, properties) == value
 
     def test_the_tool_s_own_root_may_be_a_pointer(self):
         parameters = {

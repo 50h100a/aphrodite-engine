@@ -51,7 +51,6 @@ from aphrodite.tokenizers import TokenizerLike
 from aphrodite.utils.async_utils import close_async_iterator, merge_async_iterators
 from aphrodite.utils.collection_utils import as_list
 from aphrodite.utils.serial_utils import numpy2base64
-from aphrodite.v1.structured_output.schema_features import get_structured_outputs_schema_error
 
 logger = init_logger(__name__)
 
@@ -176,9 +175,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
 
             request_id_item = f"{request_id}-{i}"
 
-            schema_error = get_structured_outputs_schema_error(sampling_params.structured_outputs)
-            if schema_error is not None:
-                raise AphroditeValidationError(schema_error, parameter="structured_outputs")
+            self._validate_structured_outputs(sampling_params)
 
             self._log_inputs(
                 request_id_item,

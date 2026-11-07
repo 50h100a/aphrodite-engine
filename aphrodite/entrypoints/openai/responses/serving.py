@@ -465,6 +465,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                             )
                         ),
                     )
+            self._validate_structured_outputs(sampling_params)
             generator = self._generate_with_builtin_tools(
                 request_id=request.request_id,
                 engine_input=engine_input,
