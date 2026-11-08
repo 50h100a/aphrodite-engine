@@ -504,6 +504,11 @@ def _extract_constrained_tool_info(tool: Tool) -> tuple[str, dict[str, Any] | No
     return name, params
 
 
+def find_tool_parameters(tools: list[Tool] | None, tool_name: str) -> dict[str, Any] | None:
+    """Return the full, unmodified parameters schema, including reference context."""
+    return next((params for name, params in _iter_tool_info(tools) if name == tool_name), None)
+
+
 def find_tool_properties(
     tools: list[Tool] | None,
     tool_name: str,

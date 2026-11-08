@@ -1331,8 +1331,14 @@ def test_absent_strict_is_not_pinned_next_to_a_strict_tool(model: str):
 
     assert tag is not None
     dumped = _dumped(tag)
-    assert '"city"' in dumped
-    assert '"query"' not in dumped
+    assert '"city"' in dumped or "<parameter=city>" in dumped
+    assert '"query"' not in dumped and "<parameter=query>" not in dumped
+    if model in {"qwen_3_5", "qwen_3_coder"}:
+        grammar = Grammar.from_structural_tag(tag)
+        call = "<tool_call>\n<function={}>\n<parameter={}>\nanything\n</parameter>\n</function>\n</tool_call>"
+        assert _is_grammar_accept_string(grammar, call.format("get_weather", "city"))
+        assert not _is_grammar_accept_string(grammar, call.format("get_weather", "other"))
+        assert _is_grammar_accept_string(grammar, call.format("search", "other"))
 
 
 @pytest.mark.parametrize(

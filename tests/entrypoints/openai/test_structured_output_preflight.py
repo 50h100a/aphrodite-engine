@@ -24,7 +24,7 @@ from tests.parser.engine.conftest import make_mock_tokenizer
 pytestmark = pytest.mark.cpu_test
 
 
-def serving_app(route):
+def serving_app(route, parser_name="deepseek_v41"):
     cls = OpenAIServingChat if route == "chat" else OpenAIServingResponses
     serving = cls.__new__(cls)
     tokenizer = make_mock_tokenizer({})
@@ -53,7 +53,7 @@ def serving_app(route):
     serving.online_renderer = SimpleNamespace(
         validate_chat_template=Mock(return_value=None), trust_request_chat_template=True
     )
-    parser_cls = ParserManager.get_parser(tool_parser_name="deepseek_v41", enable_auto_tools=True)
+    parser_cls = ParserManager.get_parser(tool_parser_name=parser_name, enable_auto_tools=True)
 
     async def render(request, *args, **kwargs):
         # Exercise actual native tool-grammar injection after request parsing.
@@ -93,6 +93,7 @@ def request_body(route, prop, choice, stream, strict=True):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("parser_name", ["deepseek_v41", "qwen3_xml"])
 @pytest.mark.parametrize("route", ["chat", "responses"])
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("choice", ["auto", "required", "named"])
@@ -108,8 +109,8 @@ def request_body(route, prop, choice, stream, strict=True):
         {"type": "string", "pattern": "^[a-z]+$", "minLength": 3},
     ],
 )
-async def test_invalid_or_unsupported_generated_grammar_returns_http_400(route, stream, choice, prop):
-    app, serving, _ = serving_app(route)
+async def test_invalid_or_unsupported_generated_grammar_returns_http_400(parser_name, route, stream, choice, prop):
+    app, serving, _ = serving_app(route, parser_name)
     path = "/v1/chat/completions" if route == "chat" else "/v1/responses"
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post(path, json=request_body(route, prop, choice, stream))
@@ -120,10 +121,11 @@ async def test_invalid_or_unsupported_generated_grammar_returns_http_400(route, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("parser_name", ["deepseek_v41", "qwen3_xml"])
 @pytest.mark.parametrize("route", ["chat", "responses"])
 @pytest.mark.parametrize("strict", [True, False])
-async def test_valid_constraints_and_explicit_opt_out_pass_preflight(route, strict):
-    _, serving, render = serving_app(route)
+async def test_valid_constraints_and_explicit_opt_out_pass_preflight(parser_name, route, strict):
+    _, serving, render = serving_app(route, parser_name)
     prop = {"type": "string", "enum": [" stable "]} if strict else {"type": "string", "minLength": "five"}
     body = request_body(route, prop, "required", True, strict=strict)
     request = ChatCompletionRequest(**body) if route == "chat" else ResponsesRequest(**body)
@@ -131,3 +133,53 @@ async def test_valid_constraints_and_explicit_opt_out_pass_preflight(route, stri
     params = request.to_sampling_params(128, {})
     serving._validate_structured_outputs(params)
     assert params.structured_outputs._backend == "xgrammar"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["chat", "responses"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("choice", ["auto", "required", "named"])
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "object", "properties": {"value": {"const": 2}}, "required": ["value"], "additionalProperties": False},
+        {
+            "type": "object",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {"a": {"const": "A"}},
+                    "required": ["a"],
+                    "additionalProperties": False,
+                },
+                {"type": "object", "properties": {"b": {"const": 2}}, "required": ["b"], "additionalProperties": False},
+            ],
+        },
+        {
+            "$ref": "#/$defs/root",
+            "$defs": {
+                "root": {
+                    "type": "object",
+                    "properties": {"value": {"const": "\r\n"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                }
+            },
+        },
+        {"type": "object", "additionalProperties": {"type": "string", "minLength": 3, "maxLength": 5}},
+    ],
+)
+async def test_qwen_composed_constraints_pass_real_api_preflight(route, stream, choice, schema):
+    from copy import deepcopy
+
+    _, serving, render = serving_app(route, "qwen3_xml")
+    original = deepcopy(schema)
+    body = request_body(route, {"type": "string"}, choice, stream)
+    function = body["tools"][0]["function"] if route == "chat" else body["tools"][0]
+    function["parameters"] = schema
+    request = ChatCompletionRequest(**body) if route == "chat" else ResponsesRequest(**body)
+    await render(request)
+    params = request.to_sampling_params(128, {})
+    serving._validate_structured_outputs(params)
+    assert params.structured_outputs._backend == "xgrammar"
+    assert schema == original

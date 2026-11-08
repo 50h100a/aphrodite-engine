@@ -20,8 +20,11 @@ import functools
 import json
 from typing import TYPE_CHECKING
 
+import jsonschema
 import regex as re
+from referencing.exceptions import Unresolvable
 
+from aphrodite.exceptions import AphroditeValidationError
 from aphrodite.parser.engine.events import EventType
 from aphrodite.parser.engine.parser_engine import ParserEngine
 from aphrodite.parser.engine.parser_engine_config import (
@@ -30,6 +33,8 @@ from aphrodite.parser.engine.parser_engine_config import (
     ParserState,
     Transition,
 )
+from aphrodite.tool_parsers.qwen_xml import QwenXMLSchema
+from aphrodite.tool_parsers.utils import find_tool_parameters
 
 if TYPE_CHECKING:
     from aphrodite.entrypoints.openai.chat_completion.protocol import (
@@ -331,6 +336,44 @@ class Qwen3Parser(ParserEngine):
             tools,
             **kwargs,
         )
+        self._xml_schemas: dict[str, QwenXMLSchema | None] = {}
+
+    def _xml_schema(self, name: str) -> QwenXMLSchema | None:
+        if name not in self._xml_schemas:
+            schema = find_tool_parameters(self._tools, name)
+            try:
+                codec = QwenXMLSchema(schema) if schema else None
+                if codec is not None:
+                    # Resolve the streaming hints once as well. An opted-out
+                    # schema may be well formed but contain an unusable ref.
+                    _ = codec.string_keys
+                self._xml_schemas[name] = codec
+            except (AphroditeValidationError, jsonschema.SchemaError, ValueError, TypeError, KeyError):
+                # An explicit strict=false tool may carry an unenforceable
+                # schema. It remains a hint, not an admission requirement.
+                self._xml_schemas[name] = None
+        return self._xml_schemas[name]
+
+    def _fix_arg_types(self, args_json: str, func_name: str) -> str:
+        schema = self._xml_schema(func_name)
+        if schema is None:
+            return super()._fix_arg_types(args_json, func_name)
+        try:
+            values = json.loads(args_json)
+            return json.dumps(schema.decode(values), ensure_ascii=False)
+        except (Unresolvable, ValueError, TypeError, KeyError):
+            return args_json
+
+    def _compute_arg_delta(self, idx: int, raw_delta: str) -> str | None:
+        slot = self._tool_slots[idx]
+        schema = self._xml_schema(slot.name)
+        if schema is not None:
+            # A later discriminator may change the type of an earlier slot.
+            # Keep the complete correlated object until the call closes.
+            if schema.needs_complete_object:
+                return None
+            slot.string_keys = schema.string_keys
+        return super()._compute_arg_delta(idx, raw_delta)
 
     def extract_reasoning(
         self,

@@ -219,12 +219,17 @@ def get_model_structural_tag(
             f"tokens and cannot apply token_suffix={token_suffix!r}"
         )
 
-    return get_xgrammar_model_structural_tag(
+    tag = get_xgrammar_model_structural_tag(
         model=model,
         tools=dumped_tools,
         tool_choice=dumped_tool_choice,
         reasoning=reasoning,
     )
+    if model in {"qwen_3_5", "qwen_3_coder"}:
+        from aphrodite.tool_parsers.qwen_xml import replace_qwen_parameter_formats
+
+        replace_qwen_parameter_formats(tag)
+    return tag
 
 
 _TOOL_CALL_LIST_FORMATS = (
