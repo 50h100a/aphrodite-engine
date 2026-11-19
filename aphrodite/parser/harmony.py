@@ -43,6 +43,7 @@ from aphrodite.logger import init_logger
 from aphrodite.parser.abstract_parser import DelegatingParser, structured_outputs_to_format
 from aphrodite.reasoning.gptoss_reasoning_parser import GptOssReasoningParser
 from aphrodite.renderers.chat_utils import make_tool_call_id
+from aphrodite.sampling_params import StructuredOutputsParams
 from aphrodite.tool_parsers.gptoss_tool_parser import GptOssToolParser
 from aphrodite.tool_parsers.structural_tag_registry import (
     SimplifiedToolChoice,
@@ -402,6 +403,15 @@ class HarmonyParser(DelegatingParser):
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
         request = _adjust_output_format(request)
+        if request.tool_choice == "none" and request.extract_structured_outputs() is None:
+            # Harmony has no single tool-entry token: recipients can precede
+            # or follow the channel. Constrain the headers themselves.
+            tag = _assemble_tag(
+                allow_analysis=True,
+                allow_commentary=True,
+                content=TagFormat(begin=_FINAL_BEGIN.format(constrain=""), content=_ANY_CONTENT, end=_END_TAG),
+            )
+            request.structured_outputs = StructuredOutputsParams(structural_tag=tag.model_dump_json())
         return super().adjust_request(request)
 
     @staticmethod
@@ -538,19 +548,12 @@ def _adjust_output_format(
         return request
 
     if isinstance(final_content, JSONSchemaFormat):
-        content = OrFormat(
-            elements=[
-                TagFormat(
-                    begin=_FINAL_BEGIN.format(constrain=constrain),
-                    content=final_content,
-                    end=_END_TAG,
-                )
-                for constrain in _JSON_CONSTRAINS
-            ]
-        )
+        from aphrodite.v1.structured_output.harmony import make_harmony_json_tag
+
+        structural_tag = make_harmony_json_tag(final_content.json_schema)
     else:
         content = TagFormat(begin=_FINAL_BEGIN.format(constrain=""), content=final_content, end=_END_TAG)
-    structural_tag = _assemble_tag(allow_analysis=True, allow_commentary=False, content=content)
+        structural_tag = _assemble_tag(allow_analysis=True, allow_commentary=False, content=content)
 
     request.structured_outputs = replace(
         params,

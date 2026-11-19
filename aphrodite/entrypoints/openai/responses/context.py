@@ -784,6 +784,8 @@ class HarmonyContext(ConversationContext):
         return self._messages
 
     def need_builtin_tool_call(self) -> bool:
+        if self.request is not None and self.request.tool_choice == "none":
+            return False
         last_msg = self.messages[-1]
         recipient = last_msg.recipient
         if recipient is None:

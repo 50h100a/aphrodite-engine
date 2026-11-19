@@ -39,6 +39,7 @@ import jsonschema.validators
 import aphrodite.envs as envs
 from aphrodite.logger import init_logger
 from aphrodite.v1.structured_output import postconditions
+from aphrodite.v1.structured_output.harmony import harmony_json_schema
 
 logger = init_logger(__name__)
 
@@ -606,8 +607,10 @@ def get_json_schema_backends_for_request(structured_outputs: Any) -> frozenset[s
     backends = JSON_SCHEMA_BACKENDS
     if (schema := getattr(structured_outputs, "json", None)) is not None:
         backends &= get_json_schema_backends(schema)
-    for schema in iter_structural_tag_schemas(getattr(structured_outputs, "structural_tag", None)):
-        backends &= get_json_schema_backends(schema, postconditions_available=False)
+    tag = getattr(structured_outputs, "structural_tag", None)
+    available = harmony_json_schema(tag) is not None
+    for schema in iter_structural_tag_schemas(tag):
+        backends &= get_json_schema_backends(schema, postconditions_available=available)
     return backends
 
 
@@ -746,9 +749,12 @@ def get_structured_outputs_schema_error(structured_outputs: Any) -> str | None:
     # The same schema can be enforceable as a response format and refused as a
     # tool, so each is asked by the route it arrived on.
     tag = getattr(structured_outputs, "structural_tag", None)
-    tag_schemas = {id(schema) for schema in iter_structural_tag_schemas(tag)}
-    for schema in schemas:
-        available = id(schema) not in tag_schemas
+    harmony_final = harmony_json_schema(tag) is not None
+    has_plain_json = getattr(structured_outputs, "json", None) is not None
+    for index, schema in enumerate(schemas):
+        # Parsing a serialized tag produces fresh schema objects on every
+        # walk; identity cannot distinguish the plain-JSON and tag routes.
+        available = harmony_final or (index == 0 and has_plain_json)
         if unenforceable := get_unenforceable_json_schema_keys(schema, postconditions_available=available):
             return unenforceable_keys_message(unenforceable, get_unenforceable_reasons(schema) if available else None)
     for schema in schemas:

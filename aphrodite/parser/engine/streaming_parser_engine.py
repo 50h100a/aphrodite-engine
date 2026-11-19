@@ -179,6 +179,7 @@ class StreamingParserEngine:
         self._args_brace_depth: int = 0
         self._args_in_string: bool = False
         self._args_escape_next: bool = False
+        self._in_arg_value = False
 
     def _reset_array_state(self) -> None:
         # State for ``tool_call_body_array``: whether the opening ``[`` has been
@@ -378,6 +379,14 @@ class StreamingParserEngine:
         return markers
 
     def _on_terminal(self, terminal: str, value: str, token_count: int = 0) -> list[SemanticEvent]:
+        if self.state == ParserState.TOOL_ARGS and self.config.tool_arg_value_delimiters:
+            begin, end = self.config.tool_arg_value_delimiters
+            if terminal == begin:
+                self._in_arg_value = True
+            elif terminal == end:
+                self._in_arg_value = False
+            elif self._in_arg_value:
+                return self._emit_for_state(value, token_count)
         key = (self.state, terminal)
         transition = self.config.transitions.get(key)
 
@@ -531,6 +540,8 @@ class StreamingParserEngine:
             )
 
         if self.state == ParserState.TOOL_ARGS:
+            if previous_state != ParserState.TOOL_ARGS:
+                self._in_arg_value = False
             self._args_brace_depth = 0
             self._args_in_string = False
             self._args_escape_next = False

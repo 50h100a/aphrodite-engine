@@ -157,6 +157,55 @@ def test_harmony_analysis_still_closes_on_end(backend, tokenizer):
     assert allowed[END]
 
 
+@pytest.mark.parametrize("unique", [False, True])
+def test_harmony_final_postconditions_with_real_tokenizer(backend, tokenizer, unique):
+    from aphrodite.v1.structured_output.harmony import make_harmony_json_tag
+    from aphrodite.v1.structured_output.postconditions import PostconditionGrammar, maybe_wrap
+
+    schema = (
+        {"type": "array", "items": {"enum": [1, 2]}, "uniqueItems": True}
+        if unique
+        else {"type": "array", "items": {"type": "integer"}, "contains": {"const": 7}}
+    )
+    spec = make_harmony_json_tag(schema).model_dump_json()
+    inner = backend.compile_grammar(StructuredOutputOptions.STRUCTURAL_TAG, spec, stop_token_ids=set(ENGINE_EOS_IDS))
+    grammar = maybe_wrap(inner, StructuredOutputOptions.STRUCTURAL_TAG, spec, tokenizer, VOCAB_SIZE)
+    assert isinstance(grammar, PostconditionGrammar)
+    prefix = (
+        "<|channel|>analysis<|message|>Quoted <|channel|>final json<|message|>[7]"
+        "<|end|><|start|>assistant<|channel|>final <|constrain|>json<|message|>"
+    )
+    allowed = _walk(backend, grammar, tokenizer, prefix + ("[1," if unique else "[1"))
+    refused = "1" if unique else "]"
+    (token,) = tokenizer.encode(refused, add_special_tokens=False)
+    assert not allowed[token]
+    assert grammar.validate_tokens([token]) == []
+    completion = "2]" if unique else ",7]"
+    allowed = _walk(backend, grammar, tokenizer, completion)
+    assert allowed[RETURN]
+    assert grammar.accept_tokens("test", [RETURN])
+
+
+def test_harmony_none_with_real_tokenizer(backend, tokenizer):
+    from aphrodite.parser import ParserManager
+
+    request = ChatCompletionRequest(model="offline", messages=[], tools=TOOLS, tool_choice="none")
+    cls = ParserManager.get_parser(
+        tool_parser_name="openai",
+        reasoning_parser_name="openai_gptoss",
+        is_harmony=True,
+        enable_auto_tools=True,
+        model_name=MODEL,
+    )
+    cls(tokenizer, request.tools).adjust_request(request)
+    spec = request.structured_outputs.structural_tag
+    grammar = backend.compile_grammar(StructuredOutputOptions.STRUCTURAL_TAG, spec, stop_token_ids=set(ENGINE_EOS_IDS))
+    allowed = _walk(backend, grammar, tokenizer, REPLY_PREFIX)
+    assert allowed[RETURN]
+    grammar.reset()
+    assert not grammar.accept_tokens("test", tokenizer.encode(TOOL_CALL_PREFIX, add_special_tokens=False))
+
+
 def test_json_schema_still_terminates_on_eos(backend, tokenizer):
     """The other half of the split, and the reason it has to be a split.
 

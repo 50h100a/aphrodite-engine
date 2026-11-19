@@ -161,6 +161,7 @@ def qwen3_config(
 ) -> ParserEngineConfig:
     return ParserEngineConfig(
         name=name,
+        tool_arg_value_delimiters=("PARAM_START", "PARAM_END"),
         initial_state=ParserState.REASONING if thinking else ParserState.CONTENT,
         wait_for_reasoning=thinking,
         turn_boundary_tokens=turn_boundary_tokens,

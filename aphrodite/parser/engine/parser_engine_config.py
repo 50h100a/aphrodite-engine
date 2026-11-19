@@ -86,6 +86,10 @@ class ParserEngineConfig:
 
     tool_args_json: bool = True
 
+    # XML-like values may contain outer call delimiters literally. Between
+    # these terminals, only the value delimiters themselves are structural.
+    tool_arg_value_delimiters: tuple[str, str] | None = None
+
     # The tool region body is a single JSON array of ``{"name", "arguments"}``
     # objects (one marker → N calls, no closing terminal). The engine splits
     # the array into one tool call per element; the array's ``]`` ends the

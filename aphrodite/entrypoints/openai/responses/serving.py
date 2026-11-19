@@ -735,6 +735,8 @@ class OpenAIServingResponses(GenerateBaseServing):
             streamed = iter(context.streamed_items_by_message)
             next_streamed = next(streamed, None)
             for i, msg in enumerate(harmony_msgs):
+                if request.tool_choice == "none" and msg.recipient is not None:
+                    continue
                 items = harmony_to_response_output(
                     msg,
                     context.function_tool_names,
@@ -1210,6 +1212,11 @@ class OpenAIServingResponses(GenerateBaseServing):
             self._raise_if_error(ctx.finish_reason, request.request_id)
 
             for segment in ctx.last_append_segments:
+                if request.tool_choice == "none" and (
+                    segment.recipient is not None
+                    or (segment.completed_message is not None and segment.completed_message.recipient is not None)
+                ):
+                    continue
                 if segment.delta:
                     for event in emit_content_delta_events(segment, state, ctx.function_tool_names):
                         yield _increment_sequence_number_and_return(event)

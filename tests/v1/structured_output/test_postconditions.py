@@ -628,6 +628,84 @@ def test_a_structural_tag_is_never_wrapped():
     assert maybe_wrap(inner, StructuredOutputOptions.STRUCTURAL_TAG, spec, None, VOCAB_SIZE) is inner
 
 
+def harmony_grammar(schema=None, extra=()):
+    from types import SimpleNamespace
+
+    from aphrodite.v1.structured_output.harmony import make_harmony_json_tag
+
+    profile = _VocabProfile(PROFILE.token_bytes + list(extra))
+    tokenizer = SimpleNamespace(_harmony_postcondition_profile=profile)
+    grammar = maybe_wrap(
+        _PermitEverything(),
+        StructuredOutputOptions.STRUCTURAL_TAG,
+        make_harmony_json_tag(schema or CONTAINS_SEVEN).model_dump_json(),
+        tokenizer,
+        len(profile.token_bytes),
+    )
+    assert isinstance(grammar, PostconditionGrammar)
+    return grammar
+
+
+@pytest.mark.parametrize("constrain", [" json", " <|constrain|>json"])
+def test_harmony_ignores_analysis_and_enforces_final_contains(constrain):
+    grammar = harmony_grammar()
+    fake = "<|channel|>final json<|message|>[7]"
+    emit(grammar, f"<|channel|>analysis<|message|>Quoted: {fake} [1,1].<|end|><|start|>assistant")
+    emit(grammar, f"<|channel|>final{constrain}<|message|>[1")
+    assert "]" not in allowed(grammar)
+    assert grammar.validate_tokens(list(b",2]")) == list(b",2")
+    assert "]" not in allowed(grammar)
+    emit(grammar, ",7]")
+    grammar.reset()
+    emit(grammar, f"<|channel|>final{constrain}<|message|>[1")
+    assert "]" not in allowed(grammar)
+
+
+def test_harmony_unique_and_rollback_across_body_boundary():
+    schema = {"type": "array", "items": {"enum": [1, 2]}, "uniqueItems": True}
+    grammar = harmony_grammar(schema)
+    header = "<|channel|>final json<|message|>"
+    emit(grammar, header + "[1,")
+    assert "1" not in allowed(grammar)
+    assert "2" in allowed(grammar)
+    grammar.rollback(3)
+    emit(grammar, "[2,")
+    assert "2" not in allowed(grammar)
+    grammar.rollback(len(header) + 3)  # Beyond the retained snapshot window.
+    emit(grammar, header + "[1,")
+    assert "1" not in allowed(grammar)
+
+
+def test_harmony_tokens_can_span_header_and_json_without_bypassing_vetoes():
+    bad = b"<|channel|>final json<|message|>[1]"
+    good = b"<|channel|>final json<|message|>[7]"
+    grammar = harmony_grammar(extra=(bad, good))
+    assert grammar.validate_tokens([VOCAB_SIZE]) == []
+    assert not grammar.accept_tokens("r", [VOCAB_SIZE])
+    assert grammar.validate_tokens([VOCAB_SIZE + 1]) == [VOCAB_SIZE + 1]
+    assert grammar.accept_tokens("r", [VOCAB_SIZE + 1])
+    grammar.rollback(1)
+    emit(grammar, "<|channel|>final json<|message")
+    # A token finishing only a suffix of the delimiter must also be checked.
+    grammar = harmony_grammar(extra=(b"|>[1]", b"|>[7]"))
+    emit(grammar, "<|channel|>final json<|message")
+    assert not grammar.accept_tokens("r", [VOCAB_SIZE])
+    assert grammar.accept_tokens("r", [VOCAB_SIZE + 1])
+
+
+def test_harmony_recognition_rejects_tool_or_changed_envelopes():
+    from aphrodite.v1.structured_output.harmony import harmony_json_schema, make_harmony_json_tag
+
+    spec = make_harmony_json_tag(CONTAINS_SEVEN).model_dump()
+    assert harmony_json_schema(spec) == CONTAINS_SEVEN
+    spec["format"]["elements"][1]["elements"][1]["content"]["json_schema"] = {"type": "string"}
+    assert harmony_json_schema(spec) is None
+    assert (
+        maybe_wrap(_PermitEverything(), StructuredOutputOptions.STRUCTURAL_TAG, spec, None, VOCAB_SIZE).__class__
+        is _PermitEverything
+    )
+
+
 # ---------------------------------------------------------------------------
 # Wiring: the layer only helps if requests actually reach it.
 # ---------------------------------------------------------------------------

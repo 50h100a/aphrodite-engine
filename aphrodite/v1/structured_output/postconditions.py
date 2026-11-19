@@ -1114,11 +1114,21 @@ def _token_bytes(tokenizer: TokenizerLike, vocab_size: int) -> list[bytes]:
     return table
 
 
-def _vocab_profile(tokenizer: TokenizerLike, vocab_size: int) -> _VocabProfile:
-    profile = getattr(tokenizer, "_postcondition_profile", None)
+def _vocab_profile(tokenizer: TokenizerLike, vocab_size: int, harmony: bool = False) -> _VocabProfile:
+    attr = "_harmony_postcondition_profile" if harmony else "_postcondition_profile"
+    profile = getattr(tokenizer, attr, None)
     if profile is None or len(profile.token_bytes) != vocab_size:
-        profile = _VocabProfile(_token_bytes(tokenizer, vocab_size))
-        tokenizer._postcondition_profile = profile  # type: ignore[attr-defined]
+        table = _token_bytes(tokenizer, vocab_size)
+        if harmony:
+            # JSON scanners normally ignore special tokens. Here the envelope
+            # delimiters must move the scanner into/out of reasoning first.
+            vocab = tokenizer.get_vocab()
+            for marker in ("<|channel|>", "<|message|>", "<|end|>", "<|start|>", "<|constrain|>"):
+                token = vocab.get(marker)
+                if token is not None and token < vocab_size:
+                    table[token] = marker.encode()
+        profile = _VocabProfile(table)
+        setattr(tokenizer, attr, profile)
     return profile
 
 
@@ -1527,6 +1537,89 @@ class _Document:
 # ---------------------------------------------------------------------------
 
 
+class _HarmonyDocument:
+    """Route the canonical Harmony envelope into one final JSON document.
+
+    Markers quoted inside analysis never become headers. Snapshots include
+    both routing and JSON state, including tokens straddling the body boundary.
+    The backend remains responsible for the envelope's syntax.
+    """
+
+    _MESSAGE = b"<|message|>"
+    _END = b"<|end|>"
+
+    def __init__(self, schema, analysis, validator, profile):
+        self.buf = bytearray()
+        self.document = _Document(schema, analysis, validator)
+        self.mode = "header"
+        self.pending = b""
+        # A token can enter the JSON body only by finishing <|message|>.
+        # Retain those candidates once, rather than scanning the vocabulary
+        # at every reasoning token.
+        candidates = getattr(profile, "harmony_boundary_tokens", None)
+        if candidates is None:
+            suffixes = tuple(self._MESSAGE[i:] for i in range(1, len(self._MESSAGE)))
+            candidates = tuple(
+                (token, text)
+                for token, text in enumerate(profile.token_bytes)
+                if self._MESSAGE in text or text.startswith(suffixes)
+            )
+            profile.harmony_boundary_tokens = candidates
+        self.candidates = candidates
+        self.bytes_profile = _VocabProfile([bytes([i]) for i in range(256)])
+        self._boundary_vetoes = {}
+
+    def snapshot(self):
+        return len(self.buf), self.mode, self.pending, self.document.snapshot()
+
+    def restore(self, state):
+        length, self.mode, self.pending, document = state
+        del self.buf[length:]
+        self.document.restore(document)
+
+    def feed(self, data):
+        self.buf.extend(data)
+        self._feed(data)
+
+    def _feed(self, data, validate=False):
+        for byte in data:
+            if self.mode == "json":
+                if validate and _is_vetoed(self.document.vetoed_tokens(self.bytes_profile), byte, self.bytes_profile):
+                    return False
+                self.document.feed(bytes([byte]))
+            elif self.mode == "header":
+                self.pending += bytes([byte])
+                if self.pending.endswith(self._MESSAGE):
+                    self.mode = "json" if b"<|channel|>final" in self.pending else "analysis"
+                    self.pending = b""
+            else:
+                self.pending += bytes([byte])
+                if self.pending == self._END:
+                    self.mode, self.pending = "header", b""
+                else:
+                    # Only an end-marker prefix needs to survive this byte.
+                    while self.pending and not self._END.startswith(self.pending):
+                        self.pending = self.pending[1:]
+        return True
+
+    def vetoed_tokens(self, profile):
+        if self.mode == "json":
+            return self.document.vetoed_tokens(profile)
+        key = self.mode, self.pending
+        if key not in self._boundary_vetoes:
+            snapshot = self.snapshot()
+            refused = set()
+            for token, text in self.candidates:
+                if not self._feed(text, validate=True):
+                    refused.add(token)
+                self.restore(snapshot)
+            group = frozenset(refused)
+            if len(self._boundary_vetoes) > 64:
+                self._boundary_vetoes.clear()
+            self._boundary_vetoes[key] = _Vetoes(("harmony", group), (group,), ()) if group else None
+        return self._boundary_vetoes[key]
+
+
 class PostconditionGrammar(StructuredOutputGrammar):
     """A backend grammar plus the vetoes that backend cannot express.
 
@@ -1542,6 +1635,7 @@ class PostconditionGrammar(StructuredOutputGrammar):
         profile: _VocabProfile,
         vocab_size: int,
         max_rollback: int,
+        harmony: bool = False,
     ):
         self.inner = inner
         self.schema = schema
@@ -1550,7 +1644,8 @@ class PostconditionGrammar(StructuredOutputGrammar):
         self.vocab_size = vocab_size
         self.num_words = (vocab_size + 31) // 32
         self._validator = jsonschema.validators.validator_for(schema)(schema)
-        self._document = _Document(schema, analysis, self._validator)
+        self.harmony = harmony
+        self._document = self._new_document()
         # One entry per token advanced through, newest last, capped at
         # `max_rollback`. Rollback is exact rather than replayed so its cost
         # scales with the speculative window rather than the output.
@@ -1619,11 +1714,16 @@ class PostconditionGrammar(StructuredOutputGrammar):
 
     def reset(self):
         self.inner.reset()
-        self._document = _Document(self.schema, self.analysis, self._validator)
+        self._document = self._new_document()
         self._undo.clear()
         self._lengths.clear()
 
     # -- internals ---------------------------------------------------------
+
+    def _new_document(self):
+        if self.harmony:
+            return _HarmonyDocument(self.schema, self.analysis, self._validator, self.profile)
+        return _Document(self.schema, self.analysis, self._validator)
 
     def _advance(self, token: int) -> None:
         self._undo.append(self._document.snapshot())
@@ -1660,7 +1760,7 @@ class PostconditionGrammar(StructuredOutputGrammar):
         text = bytes(self._document.buf[: self._lengths[keep - 1]]) if keep > 0 else b""
         del self._lengths[keep if keep > 0 else 0 :]
         self._undo.clear()
-        self._document = _Document(self.schema, self.analysis, self._validator)
+        self._document = self._new_document()
         if text:
             self._document.feed(text)
 
@@ -1705,10 +1805,12 @@ def maybe_wrap(
 ) -> StructuredOutputGrammar:
     """Wrap `grammar` if its schema carries an obligation this layer can keep,
     and return it untouched otherwise."""
-    if request_type != StructuredOutputOptions.JSON:
-        # Structural tags are refused at arrival for these keywords instead:
-        # finding the schema body inside the tag's own trigger/begin/end output
-        # would need a second scanner.
+    harmony = request_type == StructuredOutputOptions.STRUCTURAL_TAG
+    if harmony:
+        from aphrodite.v1.structured_output.harmony import harmony_json_schema
+
+        grammar_spec = harmony_json_schema(grammar_spec)
+    elif request_type != StructuredOutputOptions.JSON:
         return grammar
 
     schema = grammar_spec
@@ -1733,7 +1835,7 @@ def maybe_wrap(
         )
         return grammar
 
-    profile = _vocab_profile(tokenizer, vocab_size)
+    profile = _vocab_profile(tokenizer, vocab_size, harmony=harmony)
     # Every veto here assumes the model can spell its way around one, byte by
     # byte if it has to: the detour past a refused `]` is a `,`, and the detour
     # past an item that would repeat is the next byte of one that would not.
@@ -1756,4 +1858,5 @@ def maybe_wrap(
         profile=profile,
         vocab_size=vocab_size,
         max_rollback=max(num_speculative_tokens + 8, 16),
+        harmony=harmony,
     )

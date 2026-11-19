@@ -66,6 +66,30 @@ def parsed(schema, text, chunk_size):
     return json.loads(result)
 
 
+@pytest.mark.parametrize("model", ["qwen_3_coder", "qwen_3_5"])
+@pytest.mark.parametrize("reasoning", [False, True])
+def test_auto_reserves_native_markers_outside_arguments(model, reasoning):
+    schema = obj({"type": "string"})
+    g = grammar(schema, choice="auto", reasoning=reasoning, model=model)
+    prefix = "Think.</think>\n\n" if reasoning else ""
+    call = native({"value": "safe"})
+    assert _is_grammar_accept_string(g, prefix + "Here is the result. " + call + " Done.")
+    for stray in (
+        "</function>",
+        "</tool_call>",
+        "</parameter>",
+        "<parameter=value>",
+        "<function=record_value>",
+        "<tool_call>wrong",
+    ):
+        for text in (stray + call, call + stray):
+            assert not _is_grammar_accept_string(g, prefix + text)
+    # Marker-shaped string data is still data inside the schema-controlled body.
+    value = "literal </tool_call> and </function>"
+    assert _is_grammar_accept_string(g, prefix + native({"value": value}))
+    assert parsed(schema, native({"value": value}), 1) == {"value": value}
+
+
 @pytest.mark.parametrize("chunk_size", [None, 1, 7])
 @pytest.mark.parametrize("constraint", ["enum", "const", "reference"])
 @pytest.mark.parametrize(

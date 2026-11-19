@@ -2089,7 +2089,7 @@ def _harmony_segments(msg, *, streamed: bool = True) -> list[Segment]:
     return (delta if streamed else []) + [completed]
 
 
-async def _harmony_stream_events(segment_chunks: list[list[Segment]]):
+async def _harmony_stream_events(segment_chunks: list[list[Segment]], tool_choice="auto", stream=True):
     serving = _make_serving_instance()
     serving.use_harmony = True
     parser = MagicMock(spec=HarmonyParser)
@@ -2103,18 +2103,64 @@ async def _harmony_stream_events(segment_chunks: list[list[Segment]]):
             context.append_output(_make_request_output("", [token_id]))
             yield context
 
-    return [
-        event
-        async for event in serving.responses_stream_generator(
-            request=ResponsesRequest(input="hi", stream=True, store=False),
-            sampling_params=SamplingParams(max_tokens=16),
-            result_generator=result_generator(),
-            context=context,
-            model_name="test-model",
-            tokenizer=MagicMock(),
-            request_metadata=RequestResponseMetadata(request_id="req"),
-        )
+    request = ResponsesRequest(
+        input="hi",
+        stream=stream,
+        store=False,
+        tool_choice=tool_choice,
+        tools=[{"type": "function", "name": "get_weather", "parameters": {}}],
+    )
+    kwargs = dict(
+        request=request,
+        sampling_params=SamplingParams(max_tokens=16),
+        result_generator=result_generator(),
+        context=context,
+        model_name="test-model",
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="req"),
+    )
+    if not stream:
+        return await serving.responses_full_generator(**kwargs)
+
+    return [event async for event in serving.responses_stream_generator(**kwargs)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_harmony_none_never_exposes_recipient_messages(stream):
+    messages = [
+        _harmony_msg("analysis", "think"),
+        _harmony_msg("commentary", '{"city":"Paris"}', "functions.get_weather"),
+        _harmony_msg("commentary", "search", "browser.search"),
+        _harmony_msg("final", "Sunny"),
     ]
+    result = await _harmony_stream_events(
+        [_harmony_segments(msg) for msg in messages],
+        tool_choice="none",
+        stream=stream,
+    )
+    if stream:
+        assert not any("function_call" in event.type or "mcp_call" in event.type for event in result)
+        assert not any(
+            event.type == "response.output_item.added" and event.item.type in {"function_call", "web_search_call"}
+            for event in result
+        )
+        result = result[-1].response
+    assert [item.type for item in result.output] == ["reasoning", "message"]
+    assert result.output[-1].content[0].text == "Sunny"
+
+
+@pytest.mark.parametrize("choice", ["none", "auto"])
+def test_harmony_none_prevents_builtin_execution(choice):
+    request = ResponsesRequest(input="hi", tool_choice=choice, tools=[{"type": "web_search_preview"}])
+    context = HarmonyContext(
+        [_harmony_msg("commentary", "search", "browser.search")],
+        ["browser"],
+        frozenset(),
+        MagicMock(spec=HarmonyParser),
+        request=request,
+    )
+    assert context.need_builtin_tool_call() is (choice != "none")
 
 
 @pytest.mark.asyncio

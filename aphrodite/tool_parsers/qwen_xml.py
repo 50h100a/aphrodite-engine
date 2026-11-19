@@ -29,6 +29,7 @@ from xgrammar.structural_tag import (
     SequenceFormat,
     StarFormat,
     TagFormat,
+    TriggeredTagsFormat,
 )
 
 from aphrodite.exceptions import AphroditeValidationError
@@ -397,6 +398,22 @@ def replace_qwen_parameter_formats(tag):
     """Retain stock call/choice/reasoning envelopes, replacing parameter lists."""
 
     def visit(node):
+        if isinstance(node, TriggeredTagsFormat) and "<tool_call>\n<function=" in node.triggers:
+            # Commit to the native call on its opener, rather than allowing a
+            # malformed call prefix or unmatched closers as ordinary prose.
+            node.triggers = ["<tool_call>"]
+            node.excludes = list(
+                dict.fromkeys(
+                    [
+                        *(node.excludes or []),
+                        "</tool_call>",
+                        "<function=",
+                        "</function>",
+                        "<parameter=",
+                        "</parameter>",
+                    ]
+                )
+            )
         if isinstance(node, JSONSchemaFormat) and node.style == "qwen_xml":
             schema = node.json_schema
             screen = SimpleNamespace(structural_tag={"format": {"type": "json_schema", "json_schema": schema}})

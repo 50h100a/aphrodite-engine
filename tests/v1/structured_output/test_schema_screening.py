@@ -86,7 +86,18 @@ def test_both_routes_give_the_same_verdict():
     as_reply = get_structured_outputs_schema_error(FakeStructuredOutputs(json=UNENFORCEABLE))
     as_tool = get_structured_outputs_schema_error(FakeStructuredOutputs(structural_tag=_legacy_tag(UNENFORCEABLE)))
 
-    assert as_reply == as_tool
+    # Both routes reject the keyword. Their reasons differ: the JSON route
+    # supports a finite domain, whereas arbitrary tool tags have no scanner.
+    assert as_reply is not None and as_tool is not None
+    assert "uniqueItems" in as_reply and "uniqueItems" in as_tool
+
+
+@pytest.mark.parametrize("wrap", [_legacy_tag, _nested_tag])
+def test_serialized_tool_tags_do_not_acquire_final_json_postconditions(wrap):
+    schema = {"type": "array", "contains": {"const": 7}}
+    for tag in (json.loads(wrap(schema)), wrap(schema)):
+        error = get_structured_outputs_schema_error(FakeStructuredOutputs(structural_tag=tag))
+        assert error is not None and "contains" in error
 
 
 def test_malformed_schema_is_caught_through_a_tool():
