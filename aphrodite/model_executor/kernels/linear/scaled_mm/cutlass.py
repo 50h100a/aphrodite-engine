@@ -9,6 +9,9 @@ import torch
 from aphrodite import _custom_ops as ops
 from aphrodite.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from aphrodite.model_executor.layers.quantization.utils import replace_parameter
+from aphrodite.model_executor.layers.quantization.utils.fp8_utils import (
+    _upcast_e8m0_to_fp32,
+)
 from aphrodite.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     QuantKey,
@@ -290,6 +293,18 @@ class CutlassFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
                 "Supports only dynamic per token group activation quantization with group_shape=(1,128).",
             )
         return True, None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        params = self._get_layer_params(layer)
+        if params.block_scale.dtype in (torch.float8_e8m0fnu, torch.uint8):
+            # CUTLASS requires FP32 scales, while DeepSeek checkpoints can
+            # store exponent-only UE8M0 scales. Convert once at load time.
+            replace_parameter(
+                layer,
+                params.block_scale_attr,
+                _upcast_e8m0_to_fp32(params.block_scale).contiguous(),
+            )
 
     def apply_block_scaled_mm(
         self,

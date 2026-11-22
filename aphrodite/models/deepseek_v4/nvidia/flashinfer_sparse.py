@@ -47,11 +47,34 @@ _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _flashinfer_dsv4_workspace_by_device: dict[torch.device, torch.Tensor] = {}
 
 
-def _get_flashinfer_dsv4_workspace(device: torch.device) -> torch.Tensor:
+def _sm120_dsv4_workspace_bytes(config: AphroditeConfig, num_heads: int) -> int:
+    # FlashInfer SM120 offers decode plans for up to 64 query tokens. Their
+    # scratch holds a BF16 partial value vector and FP32 LSE per 64-key split,
+    # plus a final FP32 LSE per query/head. Prefill needs only the final LSE.
+    tokens = config.scheduler_config.max_num_batched_tokens
+    decode_tokens = min(tokens, 64)
+    scratch_heads = num_heads if num_heads == 8 else (num_heads + 15) // 16 * 16
+    hf_config = config.model_config.hf_text_config
+    swa_topk = _required_sm120_sparse_topk(config, hf_config.sliding_window)
+    # C128 index buffers round their maximum compressed context to 128 keys.
+    c128_topk = (config.model_config.max_model_len + 128 * 128 - 1) // (128 * 128) * 128
+    extra_topk = max(hf_config.index_topk, c128_topk)
+    splits = (swa_topk + 63) // 64 + (extra_topk + 63) // 64
+    scratch_bytes = decode_tokens * scratch_heads * splits * (512 * 2 + 4)
+    lse_bytes = tokens * num_heads * 4
+    # Account for alignment between the three workspace views.
+    return max(_FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE, scratch_bytes + lse_bytes + 32)
+
+
+def _get_flashinfer_dsv4_workspace(
+    device: torch.device, min_bytes: int = _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE
+) -> torch.Tensor:
     workspace = _flashinfer_dsv4_workspace_by_device.get(device)
-    if workspace is None:
+    if workspace is None or workspace.numel() < min_bytes:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Reserve the DeepSeek V4 FlashInfer workspace before CUDA graph capture.")
         workspace = torch.zeros(
-            _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE,
+            min_bytes,
             dtype=torch.uint8,
             device=device,
         )
@@ -583,9 +606,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     swa_backend_cls = DeepseekSparseSWAFlashInferBackend
     use_fp8_ds_mla_layout: ClassVar[bool] = True
 
-    @staticmethod
-    def _get_workspace(device: torch.device) -> torch.Tensor:
-        return _get_flashinfer_dsv4_workspace(device)
+    def _get_workspace(self, device: torch.device) -> torch.Tensor:
+        return _get_flashinfer_dsv4_workspace(device, self._workspace_bytes)
 
     @staticmethod
     def _as_sparse_cache(kv_cache: torch.Tensor) -> torch.Tensor:
@@ -628,6 +650,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 "Install a FlashInfer build containing "
                 "flashinfer-ai/flashinfer#4380."
             )
+        self._workspace_bytes = _sm120_dsv4_workspace_bytes(aphrodite_config, self.padded_heads)
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
         # Per-tensor FP8 cache path scales.
         if self.kv_cache_torch_dtype != torch.float8_e4m3fn:
